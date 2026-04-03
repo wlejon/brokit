@@ -32,7 +32,7 @@ struct FetchRequest {
     std::string url;
 
     // Request body for POST etc.
-    std::string requestBody;
+    std::vector<uint8_t> requestBody;
     struct curl_slist* requestHeaders = nullptr;
 
     // Streaming support
@@ -804,13 +804,36 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
         }
         JS_FreeValue(ctx, headersVal);
 
-        // body
+        // body — accept string, ArrayBuffer, or TypedArray
         JSValue bodyVal = JS_GetPropertyStr(ctx, argv[1], "body");
         if (JS_IsString(bodyVal)) {
             const char* body = JS_ToCString(ctx, bodyVal);
             if (body) {
-                req->requestBody = body;
+                size_t len = strlen(body);
+                req->requestBody.assign(
+                    reinterpret_cast<const uint8_t*>(body),
+                    reinterpret_cast<const uint8_t*>(body) + len);
                 JS_FreeCString(ctx, body);
+            }
+        } else if (!JS_IsUndefined(bodyVal) && !JS_IsNull(bodyVal)) {
+            // Try TypedArray first, then ArrayBuffer
+            size_t byte_offset = 0, byte_len = 0, bpe = 0;
+            JSValue buf = JS_GetTypedArrayBuffer(ctx, bodyVal, &byte_offset, &byte_len, &bpe);
+            if (!JS_IsException(buf)) {
+                size_t abLen = 0;
+                uint8_t* ptr = JS_GetArrayBuffer(ctx, &abLen, buf);
+                if (ptr) {
+                    req->requestBody.assign(ptr + byte_offset, ptr + byte_offset + byte_len);
+                }
+                JS_FreeValue(ctx, buf);
+            } else {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                // Try plain ArrayBuffer
+                size_t abLen = 0;
+                uint8_t* ptr = JS_GetArrayBuffer(ctx, &abLen, bodyVal);
+                if (ptr) {
+                    req->requestBody.assign(ptr, ptr + abLen);
+                }
             }
         }
         JS_FreeValue(ctx, bodyVal);
@@ -820,7 +843,7 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
         }
 
         if (!req->requestBody.empty()) {
-            curl_easy_setopt(req->easy, CURLOPT_POSTFIELDS, req->requestBody.c_str());
+            curl_easy_setopt(req->easy, CURLOPT_POSTFIELDS, req->requestBody.data());
             curl_easy_setopt(req->easy, CURLOPT_POSTFIELDSIZE,
                              static_cast<long>(req->requestBody.size()));
         }

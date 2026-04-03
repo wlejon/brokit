@@ -30,6 +30,10 @@ void installAll(JSContext* ctx)
     installEventSource(ctx);
     installFormData(ctx);
     installFetchClasses(ctx);
+    installBase64(ctx);
+    installNavigator(ctx);
+    installEventTarget(ctx);
+    installMessageChannel(ctx);
 }
 
 } // namespace brokit::api

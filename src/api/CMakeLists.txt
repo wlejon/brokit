@@ -41,6 +41,10 @@ embed_js(websocket.js       js_websocket)
 embed_js(eventsource.js     js_eventsource)
 embed_js(formdata.js        js_formdata)
 embed_js(fetch_classes.js   js_fetch_classes)
+embed_js(base64.js          js_base64)
+embed_js(navigator.js       js_navigator)
+embed_js(event_target.js    js_event_target)
+embed_js(message_channel.js js_message_channel)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -72,6 +76,10 @@ add_library(brokit_api STATIC
     eventsource.cpp
     formdata.cpp
     fetch_classes.cpp
+    base64.cpp
+    navigator.cpp
+    event_target.cpp
+    message_channel.cpp
     ${GENERATED_HEADERS}
 )
 target_include_directories(brokit_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

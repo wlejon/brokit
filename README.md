@@ -32,6 +32,11 @@ Built as a dependency for [bro](https://github.com/wlejon/bro).
 | **WebSocket** | Native curl WebSocket, text + binary frames, auto-pong |
 | **localStorage / sessionStorage** | localStorage with JSON file persistence, sessionStorage in-memory |
 | **IndexedDB** | SQLite-backed. open/deleteDatabase, transactions, object stores with put/add/get/delete/clear/getAll/count, version upgrades |
+| **atob / btoa** | Base64 encode/decode with full Latin1 support |
+| **Event / CustomEvent** | Event constructor with bubbles/cancelable/composed, CustomEvent with detail |
+| **EventTarget** | addEventListener/removeEventListener/dispatchEvent, once option, handleEvent interface |
+| **MessageChannel / MessagePort** | Paired ports with postMessage, start/close, message queuing, MessageEvent |
+| **navigator** | userAgent, language, languages, onLine, platform, hardwareConcurrency |
 
 ### System (Node.js-style)
 
@@ -59,7 +64,7 @@ Dependencies (all bundled):
 
 ## Test
 
-830 tests across 24 test files.
+904 tests across 28 test files.
 
 ```bash
 # Windows (MSVC)
