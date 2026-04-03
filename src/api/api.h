@@ -25,5 +25,6 @@ void installProcess(JSContext* ctx);
 void installOS(JSContext* ctx);
 void installPath(JSContext* ctx);
 void installFetch(JSContext* ctx);
+void installFS(JSContext* ctx);
 
 } // namespace brokit::api
