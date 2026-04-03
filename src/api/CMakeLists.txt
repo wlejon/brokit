@@ -33,6 +33,7 @@ embed_js(treewalker.js      js_treewalker)
 embed_js(url_object.js      js_url_object)
 embed_js(path.js            js_path)
 embed_js(fs.js              js_fs)
+embed_js(child_process.js   js_child_process)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,7 @@ add_library(brokit_api STATIC
     path.cpp
     fetch.cpp
     fs.cpp
+    child_process.cpp
     ${GENERATED_HEADERS}
 )
 target_include_directories(brokit_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

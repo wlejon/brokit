@@ -19,6 +19,7 @@ void installAll(JSContext* ctx)
     installPath(ctx);
     installFetch(ctx);
     installFS(ctx);
+    installChildProcess(ctx);
 }
 
 } // namespace brokit::api
