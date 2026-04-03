@@ -1,0 +1,13 @@
+<Configuration>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>D:\projects\brokit</HostFolder>
+      <SandboxFolder>C:\brokit</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <MemoryInMB>4096</MemoryInMB>
+  <LogonCommand>
+    <Command>C:\brokit\sandbox_start.cmd</Command>
+  </LogonCommand>
+</Configuration>
