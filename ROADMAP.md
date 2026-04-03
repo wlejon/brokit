@@ -10,9 +10,9 @@ The API surface borrows from established standards:
 
 The driving use case is running complex web applications inside bro — specifically, getting pi-mono's web-ui (Lit-based AI chat interface) functional, and eventually building a custom coding agent UI within bro's rendering system.
 
-## Current State (v0.1)
+## Current State (v0.2)
 
-All implemented, all tests passing (132/132):
+All implemented, all tests passing (229/229):
 
 | API | Notes |
 |-----|-------|
@@ -23,12 +23,16 @@ All implemented, all tests passing (132/132):
 | crypto | randomUUID (v4), getRandomValues (BCryptGenRandom on Windows, /dev/urandom on Linux) |
 | TextEncoder/TextDecoder | Native C++ UTF-8 encode/decode |
 | TreeWalker/NodeFilter | Full traversal (nextNode, previousNode, firstChild, lastChild, nextSibling, previousSibling), SHOW_* flags, custom filter functions |
+| AbortController/AbortSignal | abort(), addEventListener, throwIfAborted(), static abort/timeout/any factories, DOMException |
+| structuredClone | Deep clone of primitives, objects, arrays, Date, RegExp, Map, Set, ArrayBuffer, TypedArrays, Error; circular ref support; throws on functions/symbols |
+| Blob/File | Native C++ opaque storage; Blob constructor from strings/ArrayBuffers/TypedArrays/Blobs; size/type getters, slice(), text(), arrayBuffer() (Promise-returning); File adds name/lastModified |
 
 Infrastructure:
 - CMake build matching bro/htmlayout patterns
 - Static CRT on Windows (runs in Windows Sandbox without vcruntime DLLs)
 - JS test harness with assert/assertEqual helpers
 - sandbox.wsb for safe testing of native code
+- JS polyfills in standalone `src/api/js/*.js` files, embedded into C++ headers at build time via `cmake/embed_js.cmake`
 
 ## Tier 1 — Unblock Lit and framework rendering
 
@@ -36,11 +40,11 @@ These APIs are required for Lit (the web component framework pi-mono uses) and m
 
 | API | Why | Complexity |
 |-----|-----|-----------|
-| **Blob / File** | File handling, image previews, clipboard, download URLs | Medium |
+| ~~**Blob / File**~~ | ~~File handling, image previews, clipboard, download URLs~~ | ~~Medium~~ — **done (v0.2)** |
 | **URL.createObjectURL / revokeObjectURL** | Blob URLs for images, downloads, iframes | Medium |
 | **ResizeObserver** | Responsive layouts — ChatPanel uses it for breakpoints | Small |
-| **AbortController / AbortSignal** | Fetch cancellation, cleanup patterns — used everywhere | Small |
-| **structuredClone** | Deep copy of objects — used by state management | Small |
+| ~~**AbortController / AbortSignal**~~ | ~~Fetch cancellation, cleanup patterns — used everywhere~~ | ~~Small~~ — **done (v0.2)** |
+| ~~**structuredClone**~~ | ~~Deep copy of objects — used by state management~~ | ~~Small~~ — **done (v0.2)** |
 
 ## Tier 2 — Network and streaming
 
