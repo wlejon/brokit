@@ -10,9 +10,9 @@ The API surface borrows from established standards:
 
 The driving use case is running complex web applications inside bro — specifically, getting pi-mono's web-ui (Lit-based AI chat interface) functional, and eventually building a custom coding agent UI within bro's rendering system.
 
-## Current State (v0.3)
+## Current State (v0.4)
 
-All implemented, all tests passing (304/304):
+All implemented, all tests passing (441/441):
 
 | API | Notes |
 |-----|-------|
@@ -27,10 +27,13 @@ All implemented, all tests passing (304/304):
 | AbortController/AbortSignal | abort(), addEventListener, throwIfAborted(), static abort/timeout/any factories, DOMException |
 | structuredClone | Deep clone of primitives, objects, arrays, Date, RegExp, Map, Set, ArrayBuffer, TypedArrays, Error; circular ref support; throws on functions/symbols |
 | Blob/File | Native C++ opaque storage; Blob constructor from strings/ArrayBuffers/TypedArrays/Blobs; size/type getters, slice(), text(), arrayBuffer() (Promise-returning); File adds name/lastModified |
-| fetch | Real HTTP via libcurl (curl 8.19.0). Non-blocking curl_multi integration. Returns Promise\<Response\> with status, ok, headers, text(), json(), arrayBuffer(), blob(). GET/POST/PUT/PATCH, custom headers, request body. Windows native TLS (Schannel) |
+| fetch | Real HTTP via libcurl (curl 8.19.0). Non-blocking curl_multi integration. **True streaming**: Promise resolves after headers, response.body is ReadableStream with incremental chunk delivery. GET/POST/PUT/PATCH, custom headers, request body. Windows native TLS (Schannel) |
+| ReadableStream | Full implementation: constructor with underlying source (start/pull/cancel), ReadableStreamDefaultReader, Controller, tee(), pipeThrough(), pipeTo(), Symbol.asyncIterator, ReadableStream.from(), TextDecoderStream |
 | process | process.env (Proxy-based read/write/delete), process.cwd(), process.exit(), process.platform |
 | os | platform(), type(), arch(), homedir(), tmpdir(), hostname(), EOL |
 | path | join, resolve, dirname, basename, extname, parse, format, isAbsolute, normalize, sep, delimiter |
+| fs | readFileSync/writeFileSync/appendFileSync (string + Uint8Array), statSync/lstatSync (isFile/isDirectory/isSymbolicLink), readdirSync (withFileTypes), existsSync, mkdirSync (recursive), rmSync (recursive+force), rmdirSync, unlinkSync, renameSync, copyFileSync, chmodSync, realpathSync. Async callback+Promise wrappers, fs.promises namespace. Node.js-style error codes (ENOENT, EACCES, etc.) |
+| child_process | execSync, exec (callback+Promise), execFileSync, execFile, spawnSync. Cross-platform (CreateProcess/fork+exec), stdout/stderr capture, stdin input, cwd, timeout, maxBuffer, encoding options. Node.js-style error properties |
 
 Infrastructure:
 - CMake build matching bro/htmlayout patterns
@@ -59,7 +62,7 @@ Real HTTP fetch is the single biggest unlock. Without it, no app can talk to an 
 | API | Why | Complexity |
 |-----|-----|-----------|
 | ~~**fetch (real HTTP)**~~ | ~~REST APIs, LLM provider calls, asset loading~~ | ~~Large~~ — **done (v0.3)** via libcurl |
-| **ReadableStream** | Streaming responses (SSE, LLM token streaming) | Large — full async streams |
+| ~~**ReadableStream**~~ | ~~Streaming responses (SSE, LLM token streaming)~~ | ~~Large~~ — **done (v0.4)** with true streaming fetch |
 | **WritableStream / TransformStream** | Stream pipeline composition | Medium |
 | **EventSource (SSE)** | Server-Sent Events — common LLM streaming pattern | Medium (builds on fetch + ReadableStream) |
 | **WebSocket** | Bidirectional real-time communication | Medium |
@@ -79,8 +82,8 @@ These make bro a real application runtime, not just a browser. They're what woul
 
 | API | Why | Complexity |
 |-----|-----|-----------|
-| **fs (read/write/stat/readdir)** | File system access — coding agent tools, app data | Medium |
-| **child_process (exec/spawn)** | Run shell commands — coding agent bash tool | Medium |
+| ~~**fs (read/write/stat/readdir)**~~ | ~~File system access — coding agent tools, app data~~ | ~~Medium~~ — **done (v0.4)** |
+| ~~**child_process (exec/spawn)**~~ | ~~Run shell commands — coding agent bash tool~~ | ~~Medium~~ — **done (v0.4)** |
 | ~~**path**~~ | ~~Cross-platform path manipulation~~ | ~~Small~~ — **done (v0.3)** |
 | ~~**os**~~ | ~~Platform info, homedir, tmpdir~~ | ~~Small~~ — **done (v0.3)** |
 | ~~**process.env**~~ | ~~Environment variables — API keys, config~~ | ~~Small~~ — **done (v0.3)** |
