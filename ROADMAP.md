@@ -10,9 +10,9 @@ The API surface borrows from established standards:
 
 The driving use case is running complex web applications inside bro — specifically, getting pi-mono's web-ui (Lit-based AI chat interface) functional, and eventually building a custom coding agent UI within bro's rendering system.
 
-## Current State (v0.2)
+## Current State (v0.3)
 
-All implemented, all tests passing (229/229):
+All implemented, all tests passing (304/304):
 
 | API | Notes |
 |-----|-------|
@@ -20,12 +20,17 @@ All implemented, all tests passing (229/229):
 | console | log/warn/error/debug/info/assert/time/timeEnd/timeLog |
 | timers | setTimeout, setInterval, clearTimeout, clearInterval, queueMicrotask, performance.now |
 | URL | Full WHATWG URL constructor with parsing, resolution, path normalization; URLSearchParams with iterators |
+| URL.createObjectURL | Blob URL registry with createObjectURL/revokeObjectURL |
 | crypto | randomUUID (v4), getRandomValues (BCryptGenRandom on Windows, /dev/urandom on Linux) |
 | TextEncoder/TextDecoder | Native C++ UTF-8 encode/decode |
 | TreeWalker/NodeFilter | Full traversal (nextNode, previousNode, firstChild, lastChild, nextSibling, previousSibling), SHOW_* flags, custom filter functions |
 | AbortController/AbortSignal | abort(), addEventListener, throwIfAborted(), static abort/timeout/any factories, DOMException |
 | structuredClone | Deep clone of primitives, objects, arrays, Date, RegExp, Map, Set, ArrayBuffer, TypedArrays, Error; circular ref support; throws on functions/symbols |
 | Blob/File | Native C++ opaque storage; Blob constructor from strings/ArrayBuffers/TypedArrays/Blobs; size/type getters, slice(), text(), arrayBuffer() (Promise-returning); File adds name/lastModified |
+| fetch | Real HTTP via libcurl (curl 8.19.0). Non-blocking curl_multi integration. Returns Promise\<Response\> with status, ok, headers, text(), json(), arrayBuffer(), blob(). GET/POST/PUT/PATCH, custom headers, request body. Windows native TLS (Schannel) |
+| process | process.env (Proxy-based read/write/delete), process.cwd(), process.exit(), process.platform |
+| os | platform(), type(), arch(), homedir(), tmpdir(), hostname(), EOL |
+| path | join, resolve, dirname, basename, extname, parse, format, isAbsolute, normalize, sep, delimiter |
 
 Infrastructure:
 - CMake build matching bro/htmlayout patterns
@@ -33,6 +38,7 @@ Infrastructure:
 - JS test harness with assert/assertEqual helpers
 - sandbox.wsb for safe testing of native code
 - JS polyfills in standalone `src/api/js/*.js` files, embedded into C++ headers at build time via `cmake/embed_js.cmake`
+- libcurl 8.19.0 as git submodule (static, Schannel TLS, minimal protocol set)
 
 ## Tier 1 — Unblock Lit and framework rendering
 
@@ -41,7 +47,7 @@ These APIs are required for Lit (the web component framework pi-mono uses) and m
 | API | Why | Complexity |
 |-----|-----|-----------|
 | ~~**Blob / File**~~ | ~~File handling, image previews, clipboard, download URLs~~ | ~~Medium~~ — **done (v0.2)** |
-| **URL.createObjectURL / revokeObjectURL** | Blob URLs for images, downloads, iframes | Medium |
+| ~~**URL.createObjectURL / revokeObjectURL**~~ | ~~Blob URLs for images, downloads, iframes~~ | ~~Medium~~ — **done (v0.3)** |
 | **ResizeObserver** | Responsive layouts — ChatPanel uses it for breakpoints | Small |
 | ~~**AbortController / AbortSignal**~~ | ~~Fetch cancellation, cleanup patterns — used everywhere~~ | ~~Small~~ — **done (v0.2)** |
 | ~~**structuredClone**~~ | ~~Deep copy of objects — used by state management~~ | ~~Small~~ — **done (v0.2)** |
@@ -52,7 +58,7 @@ Real HTTP fetch is the single biggest unlock. Without it, no app can talk to an 
 
 | API | Why | Complexity |
 |-----|-----|-----------|
-| **fetch (real HTTP)** | REST APIs, LLM provider calls, asset loading | Large — needs async HTTP client (libcurl or similar) |
+| ~~**fetch (real HTTP)**~~ | ~~REST APIs, LLM provider calls, asset loading~~ | ~~Large~~ — **done (v0.3)** via libcurl |
 | **ReadableStream** | Streaming responses (SSE, LLM token streaming) | Large — full async streams |
 | **WritableStream / TransformStream** | Stream pipeline composition | Medium |
 | **EventSource (SSE)** | Server-Sent Events — common LLM streaming pattern | Medium (builds on fetch + ReadableStream) |
@@ -75,9 +81,9 @@ These make bro a real application runtime, not just a browser. They're what woul
 |-----|-----|-----------|
 | **fs (read/write/stat/readdir)** | File system access — coding agent tools, app data | Medium |
 | **child_process (exec/spawn)** | Run shell commands — coding agent bash tool | Medium |
-| **path** | Cross-platform path manipulation | Small |
-| **os** | Platform info, homedir, tmpdir | Small |
-| **process.env** | Environment variables — API keys, config | Small |
+| ~~**path**~~ | ~~Cross-platform path manipulation~~ | ~~Small~~ — **done (v0.3)** |
+| ~~**os**~~ | ~~Platform info, homedir, tmpdir~~ | ~~Small~~ — **done (v0.3)** |
+| ~~**process.env**~~ | ~~Environment variables — API keys, config~~ | ~~Small~~ — **done (v0.3)** |
 
 ## Tier 5 — Advanced browser APIs
 
