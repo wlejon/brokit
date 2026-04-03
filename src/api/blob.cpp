@@ -399,8 +399,6 @@ static JSValue js_file_type(JSContext* ctx, JSValueConst this_val)
     return JS_NewString(ctx, data->blob.type.c_str());
 }
 
-// File inherits Blob's slice/text/arrayBuffer — implemented via JS polyfill wiring below
-
 void installBlob(JSContext* ctx)
 {
     // Register Blob class
@@ -449,7 +447,10 @@ void installBlob(JSContext* ctx)
     if (fileClassId == 0) JS_NewClassID(rt, &fileClassId);
     JS_NewClass(rt, fileClassId, &fileClassDef);
 
-    JSValue fileProto = JS_NewObject(ctx);
+    // File prototype inherits from Blob prototype (File extends Blob)
+    blobProto = JS_GetClassProto(ctx, blobClassId);
+    JSValue fileProto = JS_NewObjectProto(ctx, blobProto);
+    JS_FreeValue(ctx, blobProto);
 
     // File getters: name, lastModified, size, type
     JSAtom nameAtom = JS_NewAtom(ctx, "name");
@@ -484,7 +485,6 @@ void installBlob(JSContext* ctx)
     JS_SetPropertyStr(ctx, fileCtor, "prototype", JS_DupValue(ctx, fileProto));
     JS_SetPropertyStr(ctx, fileProto, "constructor", JS_DupValue(ctx, fileCtor));
 
-    // File inherits Blob's slice/text/arrayBuffer via JS polyfill below
     JS_FreeValue(ctx, fileProto);
     JS_SetPropertyStr(ctx, global, "File", fileCtor);
     JS_FreeValue(ctx, global);

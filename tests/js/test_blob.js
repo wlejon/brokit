@@ -87,3 +87,8 @@ assertEqual(f3.type, 'image/jpeg', 'binary File type');
 var threwOnFile = false;
 try { new File(['data']); } catch(e) { threwOnFile = true; }
 assertEqual(threwOnFile, true, 'File requires name argument');
+
+// --- File extends Blob ---
+assert(f instanceof File, 'File instanceof File');
+assert(f instanceof Blob, 'File instanceof Blob');
+assert(!(new Blob() instanceof File), 'Blob not instanceof File');

@@ -12,7 +12,7 @@ The driving use case is running complex web applications inside bro — specific
 
 ## Current State (v0.5)
 
-All implemented, all tests passing (703/703):
+All implemented, all tests passing (765/765):
 
 | API | Notes |
 |-----|-------|
@@ -41,6 +41,7 @@ All implemented, all tests passing (703/703):
 | WebSocket | Native curl WebSocket (CONNECT_ONLY + curl_ws_recv/send), JS class with open/message/error/close events, text + binary frames, auto-pong |
 | localStorage / sessionStorage | localStorage with JSON file persistence, sessionStorage in-memory only. Standard Web Storage API (getItem/setItem/removeItem/clear/key/length) |
 | IndexedDB | SQLite-backed (amalgamation). IDBFactory.open/deleteDatabase, IDBDatabase, IDBTransaction, IDBObjectStore (put/add/get/delete/clear/getAll/getAllKeys/count), version upgrades |
+| FormData | JS polyfill. append/set/get/getAll/has/delete/forEach, entries/keys/values iterators, Blob→File wrapping with filename |
 
 Infrastructure:
 - CMake build matching bro/htmlayout patterns
@@ -103,7 +104,7 @@ Nice-to-haves that improve compatibility with the broader web ecosystem.
 |-----|-----|-----------|
 | **MutationObserver** (full) | bro has a stub — frameworks need real mutation callbacks | Medium |
 | **IntersectionObserver** | Lazy loading, infinite scroll | Medium |
-| **FormData** | Form submission, file uploads | Small |
+| ~~**FormData**~~ | ~~Form submission, file uploads~~ | ~~Small~~ — **done (v0.5)** JS polyfill |
 | **DOMParser** | Parse HTML/XML strings into documents | Medium |
 | **Worker / SharedWorker** | Background computation, multi-threading | Very large |
 

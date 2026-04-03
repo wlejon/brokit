@@ -28,6 +28,7 @@ void installAll(JSContext* ctx)
     installWebSocket(ctx);
     installWebSocketJS(ctx);
     installEventSource(ctx);
+    installFormData(ctx);
 }
 
 } // namespace brokit::api
