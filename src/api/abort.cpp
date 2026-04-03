@@ -1,14 +1,14 @@
 #include "api/api.h"
 #include "runtime/runtime.h"
-#include "timers.js.h"
+#include "abort.js.h"
 
 #include <cstring>
 
 namespace brokit::api {
 
-void installTimers(JSContext* ctx)
+void installAbortController(JSContext* ctx)
 {
-    JSValue r = JS_Eval(ctx, js_timers, strlen(js_timers), "<timers>", JS_EVAL_TYPE_GLOBAL);
+    JSValue r = JS_Eval(ctx, js_abort, strlen(js_abort), "<abort>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(r)) {
         Runtime::checkException(ctx, r);
     }

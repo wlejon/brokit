@@ -1,5 +1,6 @@
 #include "api/api.h"
 #include "runtime/runtime.h"
+#include "encoding.js.h"
 
 #include <cstring>
 #include <string>
@@ -78,33 +79,6 @@ static JSValue js_textdecoder_decode(JSContext* ctx, JSValueConst,
 
 void installEncoding(JSContext* ctx)
 {
-    const char* polyfill = R"JS(
-(function() {
-    globalThis.TextEncoder = function TextEncoder() {
-        this.encoding = 'utf-8';
-    };
-    TextEncoder.prototype.encode = function(str) {
-        return globalThis.__brokit_textencoder_encode(str || '');
-    };
-    TextEncoder.prototype.encodeInto = function(str, dest) {
-        var encoded = this.encode(str);
-        var len = Math.min(encoded.length, dest.length);
-        for (var i = 0; i < len; i++) dest[i] = encoded[i];
-        return { read: str.length, written: len };
-    };
-
-    globalThis.TextDecoder = function TextDecoder(encoding) {
-        this.encoding = (encoding || 'utf-8').toLowerCase();
-        this.fatal = false;
-        this.ignoreBOM = false;
-    };
-    TextDecoder.prototype.decode = function(input) {
-        if (!input) return '';
-        return globalThis.__brokit_textdecoder_decode(input);
-    };
-})();
-)JS";
-
     JSValue global = JS_GetGlobalObject(ctx);
 
     JS_SetPropertyStr(ctx, global, "__brokit_textencoder_encode",
@@ -114,7 +88,7 @@ void installEncoding(JSContext* ctx)
 
     JS_FreeValue(ctx, global);
 
-    JSValue r = JS_Eval(ctx, polyfill, strlen(polyfill), "<encoding>", JS_EVAL_TYPE_GLOBAL);
+    JSValue r = JS_Eval(ctx, js_encoding, strlen(js_encoding), "<encoding>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(r)) {
         Runtime::checkException(ctx, r);
     }

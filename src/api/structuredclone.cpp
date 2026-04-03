@@ -1,14 +1,15 @@
 #include "api/api.h"
 #include "runtime/runtime.h"
-#include "timers.js.h"
+#include "structuredclone.js.h"
 
 #include <cstring>
 
 namespace brokit::api {
 
-void installTimers(JSContext* ctx)
+void installStructuredClone(JSContext* ctx)
 {
-    JSValue r = JS_Eval(ctx, js_timers, strlen(js_timers), "<timers>", JS_EVAL_TYPE_GLOBAL);
+    JSValue r = JS_Eval(ctx, js_structuredclone, strlen(js_structuredclone),
+                        "<structuredClone>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(r)) {
         Runtime::checkException(ctx, r);
     }

@@ -1,5 +1,6 @@
 #include "api/api.h"
 #include "runtime/runtime.h"
+#include "console_time.js.h"
 
 #include <cstring>
 #include <string>
@@ -66,40 +67,11 @@ void installConsole(JSContext* ctx)
     JS_SetPropertyStr(ctx, console, "debug", JS_NewCFunction(ctx, js_console_debug, "debug", 1));
     JS_SetPropertyStr(ctx, console, "assert",JS_NewCFunction(ctx, js_console_assert,"assert",2));
 
-    // console.time / console.timeEnd as JS polyfill (uses performance.now if available)
-    const char* timePolyfill = R"JS(
-(function(c) {
-    var timers = {};
-    c.time = function(label) {
-        label = label || 'default';
-        timers[label] = Date.now();
-    };
-    c.timeEnd = function(label) {
-        label = label || 'default';
-        var start = timers[label];
-        if (start === undefined) {
-            c.warn('Timer "' + label + '" does not exist');
-            return;
-        }
-        var elapsed = Date.now() - start;
-        delete timers[label];
-        c.log(label + ': ' + elapsed + 'ms');
-    };
-    c.timeLog = function(label) {
-        label = label || 'default';
-        var start = timers[label];
-        if (start === undefined) {
-            c.warn('Timer "' + label + '" does not exist');
-            return;
-        }
-        c.log(label + ': ' + (Date.now() - start) + 'ms');
-    };
-})(console);
-)JS";
-
     JS_SetPropertyStr(ctx, global, "console", console);
 
-    JSValue r = JS_Eval(ctx, timePolyfill, strlen(timePolyfill), "<console>", JS_EVAL_TYPE_GLOBAL);
+    // console.time / timeEnd / timeLog as JS polyfill
+    JSValue r = JS_Eval(ctx, js_console_time, strlen(js_console_time),
+                        "<console>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeValue(ctx, r);
     JS_FreeValue(ctx, global);
 }

@@ -10,6 +10,9 @@ void installAll(JSContext* ctx)
     installCrypto(ctx);
     installEncoding(ctx);
     installTreeWalker(ctx);
+    installAbortController(ctx);
+    installStructuredClone(ctx);
+    installBlob(ctx);
 }
 
 } // namespace brokit::api
