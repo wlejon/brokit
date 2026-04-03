@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 extern "C" {
 #include "quickjs.h"
 }
@@ -28,5 +30,10 @@ void installReadableStream(JSContext* ctx);
 void installFetch(JSContext* ctx);
 void installFS(JSContext* ctx);
 void installChildProcess(JSContext* ctx);
+
+/// Add a base path for local file fetch resolution.
+/// Paths are searched in overlay order (last added = checked first).
+/// Call after installFetch() or installAll().
+void addFetchBasePath(JSContext* ctx, const std::string& path);
 
 } // namespace brokit::api

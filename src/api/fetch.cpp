@@ -6,6 +6,8 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <fstream>
+#include <algorithm>
 
 #include <curl/curl.h>
 
@@ -53,6 +55,194 @@ static CURLM* g_multi = nullptr;
 static std::vector<FetchRequest*> g_pending;        // active curl handles
 static std::unordered_map<int, FetchRequest*> g_streams; // stream ID -> request
 static int g_nextStreamId = 1;
+
+// ---------------------------------------------------------------------------
+// Per-context fetch base path stack (last added = checked first)
+// ---------------------------------------------------------------------------
+static const char* kFetchBasePathsKey = "__brokit_fetch_base_paths";
+
+static std::vector<std::string> getBasePaths(JSContext* ctx)
+{
+    std::vector<std::string> paths;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue arr = JS_GetPropertyStr(ctx, global, kFetchBasePathsKey);
+    if (JS_IsArray(arr)) {
+        JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
+        int32_t len = 0;
+        JS_ToInt32(ctx, &len, lenVal);
+        JS_FreeValue(ctx, lenVal);
+        for (int32_t i = 0; i < len; i++) {
+            JSValue elem = JS_GetPropertyUint32(ctx, arr, i);
+            const char* s = JS_ToCString(ctx, elem);
+            if (s) { paths.emplace_back(s); JS_FreeCString(ctx, s); }
+            JS_FreeValue(ctx, elem);
+        }
+    }
+    JS_FreeValue(ctx, arr);
+    JS_FreeValue(ctx, global);
+    return paths;
+}
+
+// ---------------------------------------------------------------------------
+// Local file helpers
+// ---------------------------------------------------------------------------
+static bool isHttpUrl(const std::string& url)
+{
+    return url.size() > 7 &&
+           (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0);
+}
+
+static std::string detectMimeType(const std::string& path)
+{
+    auto dot = path.rfind('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+    std::string ext = path.substr(dot + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+
+    if (ext == "html" || ext == "htm") return "text/html; charset=utf-8";
+    if (ext == "css")  return "text/css; charset=utf-8";
+    if (ext == "js" || ext == "mjs") return "application/javascript; charset=utf-8";
+    if (ext == "json") return "application/json; charset=utf-8";
+    if (ext == "png")  return "image/png";
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "gif")  return "image/gif";
+    if (ext == "svg")  return "image/svg+xml";
+    if (ext == "webp") return "image/webp";
+    if (ext == "woff") return "font/woff";
+    if (ext == "woff2") return "font/woff2";
+    if (ext == "ttf")  return "font/ttf";
+    if (ext == "otf")  return "font/otf";
+    if (ext == "txt")  return "text/plain; charset=utf-8";
+    if (ext == "xml")  return "application/xml";
+    if (ext == "wasm") return "application/wasm";
+    return "application/octet-stream";
+}
+
+static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
+{
+    // Strip leading ./
+    std::string clean = url;
+    if (clean.size() >= 2 && clean[0] == '.' && clean[1] == '/')
+        clean = clean.substr(2);
+
+    // Already absolute? (Windows drive letter or Unix root)
+    if (clean.size() >= 2 && clean[1] == ':') return clean;
+    if (!clean.empty() && (clean[0] == '/' || clean[0] == '\\')) {
+        // Absolute path — still search base paths (treat as relative to roots)
+        clean = clean.substr(1);
+    }
+
+    // Search base paths (last added first = overlay)
+    auto paths = getBasePaths(ctx);
+    for (int i = static_cast<int>(paths.size()) - 1; i >= 0; i--) {
+        std::string candidate = paths[i];
+        if (!candidate.empty() && candidate.back() != '/' && candidate.back() != '\\')
+            candidate += '/';
+        candidate += clean;
+        std::ifstream test(candidate, std::ios::binary);
+        if (test.good()) return candidate;
+    }
+
+    // Fallback: return as-is (will fail to open)
+    return clean;
+}
+
+// Forward declaration — defined later in the file
+static JSValue buildHeaders(JSContext* ctx, FetchRequest* req);
+
+// Build a Response for a local file read
+static JSValue buildFileResponse(JSContext* ctx, const std::string& url,
+                                  const std::string& resolvedPath)
+{
+    std::ifstream file(resolvedPath, std::ios::in | std::ios::binary | std::ios::ate);
+    if (!file) {
+        // 404 — resolve promise with a not-ok Response (matches browser behavior)
+        JSValue resp = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 404));
+        JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, "Not Found"));
+        JS_SetPropertyStr(ctx, resp, "ok", JS_FALSE);
+        JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
+
+        // Empty headers
+        FetchRequest emptyReq;
+        JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, &emptyReq));
+
+        // Body methods that reject
+        const char* notFoundBody = R"JS(
+(function(resp) {
+    resp.bodyUsed = false;
+    resp.body = null;
+    resp.text = function() { return Promise.resolve(''); };
+    resp.json = function() { return Promise.reject(new SyntaxError('Not Found')); };
+    resp.arrayBuffer = function() { return Promise.resolve(new ArrayBuffer(0)); };
+    resp.blob = function() { return Promise.resolve(new Blob([])); };
+    resp.clone = function() { return Object.assign(Object.create(null), resp); };
+})
+)JS";
+        JSValue fn = JS_Eval(ctx, notFoundBody, strlen(notFoundBody), "<fetch-404>", JS_EVAL_TYPE_GLOBAL);
+        JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, 1, &resp);
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, fn);
+        return resp;
+    }
+
+    auto size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    file.read(reinterpret_cast<char*>(data.data()), size);
+
+    JSValue resp = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 200));
+    JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, "OK"));
+    JS_SetPropertyStr(ctx, resp, "ok", JS_TRUE);
+    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
+
+    // Build headers with content-type and content-length
+    std::string mime = detectMimeType(resolvedPath);
+    // We build a fake header list to reuse buildHeaders
+    FetchRequest fakeReq;
+    fakeReq.headers.push_back("content-type: " + mime);
+    fakeReq.headers.push_back("content-length: " + std::to_string(data.size()));
+    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, &fakeReq));
+
+    JSValue bodyAB = JS_NewArrayBufferCopy(ctx, data.data(), data.size());
+    JS_SetPropertyStr(ctx, resp, "__body", bodyAB);
+
+    const char* bodyMethods = R"JS(
+(function(resp) {
+    resp.bodyUsed = false;
+    resp.body = null;
+    resp.text = function() {
+        resp.bodyUsed = true;
+        return Promise.resolve(new TextDecoder().decode(new Uint8Array(this.__body)));
+    };
+    resp.json = function() {
+        return this.text().then(function(t) { return JSON.parse(t); });
+    };
+    resp.arrayBuffer = function() {
+        resp.bodyUsed = true;
+        return Promise.resolve(this.__body.slice(0));
+    };
+    resp.blob = function() {
+        var ct = resp.headers.get('content-type') || '';
+        resp.bodyUsed = true;
+        return Promise.resolve(new Blob([new Uint8Array(this.__body)], { type: ct }));
+    };
+    resp.clone = function() {
+        var r = Object.assign(Object.create(null), this);
+        r.__body = this.__body.slice(0);
+        return r;
+    };
+})
+)JS";
+    JSValue fn = JS_Eval(ctx, bodyMethods, strlen(bodyMethods), "<fetch-file-body>", JS_EVAL_TYPE_GLOBAL);
+    JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, 1, &resp);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, fn);
+
+    return resp;
+}
 
 static size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
@@ -523,11 +713,32 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
 
     const char* urlStr = JS_ToCString(ctx, argv[0]);
     if (!urlStr) return JS_EXCEPTION;
+    std::string url(urlStr);
+    JS_FreeCString(ctx, urlStr);
 
+    // Local file fetch — anything that isn't http:// or https://
+    if (!isHttpUrl(url)) {
+        std::string resolved = resolveLocalPath(ctx, url);
+        JSValue response = buildFileResponse(ctx, url, resolved);
+        // Wrap in a resolved Promise to match fetch() API
+        JSValue resolving[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, resolving);
+        if (JS_IsException(promise)) {
+            JS_FreeValue(ctx, response);
+            return promise;
+        }
+        JSValue ret = JS_Call(ctx, resolving[0], JS_UNDEFINED, 1, &response);
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, response);
+        JS_FreeValue(ctx, resolving[0]);
+        JS_FreeValue(ctx, resolving[1]);
+        return promise;
+    }
+
+    // HTTP fetch via libcurl
     auto* req = new FetchRequest();
     req->ctx = ctx;
-    req->url = urlStr;
-    JS_FreeCString(ctx, urlStr);
+    req->url = url;
 
     // Assign stream ID and register
     req->streamId = g_nextStreamId++;
@@ -655,6 +866,9 @@ void installFetch(JSContext* ctx)
 
     JSValue global = JS_GetGlobalObject(ctx);
 
+    // Initialize the base path array
+    JS_SetPropertyStr(ctx, global, kFetchBasePathsKey, JS_NewArray(ctx));
+
     JS_SetPropertyStr(ctx, global, "fetch",
                       JS_NewCFunction(ctx, js_fetch, "fetch", 2));
     JS_SetPropertyStr(ctx, global, "__brokit_fetch_tick",
@@ -666,6 +880,25 @@ void installFetch(JSContext* ctx)
     JS_SetPropertyStr(ctx, global, "__brokit_fetch_stream_wait",
                       JS_NewCFunction(ctx, js_fetch_stream_wait, "__brokit_fetch_stream_wait", 2));
 
+    JS_FreeValue(ctx, global);
+}
+
+void addFetchBasePath(JSContext* ctx, const std::string& path)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue arr = JS_GetPropertyStr(ctx, global, kFetchBasePathsKey);
+    if (!JS_IsArray(arr)) {
+        // installFetch not called yet — create the array
+        JS_FreeValue(ctx, arr);
+        arr = JS_NewArray(ctx);
+        JS_SetPropertyStr(ctx, global, kFetchBasePathsKey, JS_DupValue(ctx, arr));
+    }
+    JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
+    int32_t len = 0;
+    JS_ToInt32(ctx, &len, lenVal);
+    JS_FreeValue(ctx, lenVal);
+    JS_SetPropertyUint32(ctx, arr, len, JS_NewString(ctx, path.c_str()));
+    JS_FreeValue(ctx, arr);
     JS_FreeValue(ctx, global);
 }
 
