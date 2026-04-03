@@ -42,6 +42,7 @@ void installWebSocket(JSContext* ctx);
 void installWebSocketJS(JSContext* ctx);
 void installEventSource(JSContext* ctx);
 void installFormData(JSContext* ctx);
+void installFetchClasses(JSContext* ctx);
 
 /// Add a base path for local file fetch resolution.
 /// Paths are searched in overlay order (last added = checked first).

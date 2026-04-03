@@ -20,8 +20,11 @@ Built as a dependency for [bro](https://github.com/wlejon/bro).
 | **AbortController / AbortSignal** | abort(), throwIfAborted(), static abort/timeout/any factories, DOMException |
 | **structuredClone** | Deep clone with circular reference support |
 | **Blob / File** | Native C++ opaque storage; slice(), text(), arrayBuffer(); File adds name/lastModified |
-| **FormData** | append/set/get/getAll/has/delete/forEach, iterators, Blob-to-File wrapping |
-| **fetch** | Real HTTP via libcurl. True streaming: response.body is a ReadableStream. GET/POST/PUT/PATCH, custom headers, request body. Native TLS (Schannel on Windows) |
+| **FormData** | append/set/get/getAll/has/delete/forEach, iterators, Blob-to-File wrapping, multipart/form-data serialization for fetch |
+| **Headers** | Case-insensitive, append/set/get/has/delete/forEach, iterators |
+| **Request** | Constructor from URL or Request, method/headers/body, clone() |
+| **Response** | Constructor, text/json/arrayBuffer/blob/clone, static error/redirect/json factories |
+| **fetch** | Real HTTP via libcurl. True streaming: response.body is a ReadableStream. GET/POST/PUT/PATCH. Headers/Request/Response classes, FormData/Blob/ArrayBuffer/URLSearchParams body. Native TLS (Schannel on Windows) |
 | **ReadableStream** | Full spec: underlying source, reader, controller, tee(), pipeThrough(), pipeTo(), async iteration, ReadableStream.from(), TextDecoderStream |
 | **WritableStream** | Full spec: underlying sink, writer, queue-based write processing |
 | **TransformStream** | Custom transform/flush/start, identity default, TextEncoderStream |
@@ -56,7 +59,7 @@ Dependencies (all bundled):
 
 ## Test
 
-768 tests across 23 test files.
+830 tests across 24 test files.
 
 ```bash
 # Windows (MSVC)
