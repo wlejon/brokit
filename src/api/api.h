@@ -20,5 +20,10 @@ void installTreeWalker(JSContext* ctx);
 void installAbortController(JSContext* ctx);
 void installStructuredClone(JSContext* ctx);
 void installBlob(JSContext* ctx);
+void installURLObject(JSContext* ctx);
+void installProcess(JSContext* ctx);
+void installOS(JSContext* ctx);
+void installPath(JSContext* ctx);
+void installFetch(JSContext* ctx);
 
 } // namespace brokit::api

@@ -1,0 +1,155 @@
+#include "api/api.h"
+#include "runtime/runtime.h"
+
+#include <cstdlib>
+#include <cstring>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace brokit::api {
+
+// process.env.KEY — read an environment variable
+static JSValue js_env_get(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_UNDEFINED;
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_EXCEPTION;
+
+    const char* val = getenv(key);
+    JS_FreeCString(ctx, key);
+
+    if (!val) return JS_UNDEFINED;
+    return JS_NewString(ctx, val);
+}
+
+// process.env.KEY = value — set an environment variable
+static JSValue js_env_set(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 2) return JS_UNDEFINED;
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_EXCEPTION;
+    const char* val = JS_ToCString(ctx, argv[1]);
+    if (!val) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+
+#ifdef _WIN32
+    SetEnvironmentVariableA(key, val);
+    // Also update CRT environ
+    _putenv_s(key, val);
+#else
+    setenv(key, val, 1);
+#endif
+
+    JS_FreeCString(ctx, key);
+    JS_FreeCString(ctx, val);
+    return JS_UNDEFINED;
+}
+
+// process.env.KEY delete — unset an environment variable
+static JSValue js_env_delete(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_UNDEFINED;
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_EXCEPTION;
+
+#ifdef _WIN32
+    SetEnvironmentVariableA(key, nullptr);
+    _putenv_s(key, "");
+#else
+    unsetenv(key);
+#endif
+
+    JS_FreeCString(ctx, key);
+    return JS_UNDEFINED;
+}
+
+// process.cwd()
+static JSValue js_process_cwd(JSContext* ctx, JSValueConst, int, JSValueConst*)
+{
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD len = GetCurrentDirectoryA(MAX_PATH, buf);
+    if (len == 0) return JS_ThrowInternalError(ctx, "process.cwd: failed");
+    return JS_NewStringLen(ctx, buf, len);
+#else
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) return JS_ThrowInternalError(ctx, "process.cwd: failed");
+    return JS_NewString(ctx, buf);
+#endif
+}
+
+// process.exit(code?)
+static JSValue js_process_exit(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    int code = 0;
+    if (argc > 0) JS_ToInt32(ctx, &code, argv[0]);
+    exit(code);
+    return JS_UNDEFINED; // unreachable
+}
+
+void installProcess(JSContext* ctx)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue process = JS_NewObject(ctx);
+
+    // Native helpers for the env Proxy
+    JS_SetPropertyStr(ctx, global, "__brokit_env_get",
+                      JS_NewCFunction(ctx, js_env_get, "__brokit_env_get", 1));
+    JS_SetPropertyStr(ctx, global, "__brokit_env_set",
+                      JS_NewCFunction(ctx, js_env_set, "__brokit_env_set", 2));
+    JS_SetPropertyStr(ctx, global, "__brokit_env_delete",
+                      JS_NewCFunction(ctx, js_env_delete, "__brokit_env_delete", 1));
+
+    // process.cwd, process.exit
+    JS_SetPropertyStr(ctx, process, "cwd",
+                      JS_NewCFunction(ctx, js_process_cwd, "cwd", 0));
+    JS_SetPropertyStr(ctx, process, "exit",
+                      JS_NewCFunction(ctx, js_process_exit, "exit", 1));
+
+    // process.platform
+#ifdef _WIN32
+    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "win32"));
+#elif defined(__linux__)
+    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "linux"));
+#elif defined(__APPLE__)
+    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "darwin"));
+#else
+    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "unknown"));
+#endif
+
+    JS_SetPropertyStr(ctx, global, "process", process);
+    JS_FreeValue(ctx, global);
+
+    // Install process.env as a Proxy for dynamic property access
+    const char* envProxy = R"JS(
+(function() {
+    var handler = {
+        get: function(target, prop) {
+            if (typeof prop !== 'string') return undefined;
+            return globalThis.__brokit_env_get(prop);
+        },
+        set: function(target, prop, value) {
+            globalThis.__brokit_env_set(prop, String(value));
+            return true;
+        },
+        deleteProperty: function(target, prop) {
+            globalThis.__brokit_env_delete(prop);
+            return true;
+        },
+        has: function(target, prop) {
+            return globalThis.__brokit_env_get(prop) !== undefined;
+        }
+    };
+    process.env = new Proxy({}, handler);
+})();
+)JS";
+
+    JSValue r = JS_Eval(ctx, envProxy, strlen(envProxy), "<process>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(r)) {
+        Runtime::checkException(ctx, r);
+    }
+    JS_FreeValue(ctx, r);
+}
+
+} // namespace brokit::api

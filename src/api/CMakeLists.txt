@@ -30,6 +30,8 @@ embed_js(console_time.js    js_console_time)
 embed_js(url.js             js_url)
 embed_js(encoding.js        js_encoding)
 embed_js(treewalker.js      js_treewalker)
+embed_js(url_object.js      js_url_object)
+embed_js(path.js            js_path)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -44,9 +46,15 @@ add_library(brokit_api STATIC
     abort.cpp
     structuredclone.cpp
     blob.cpp
+    url_object.cpp
+    process.cpp
+    os.cpp
+    path.cpp
+    fetch.cpp
     ${GENERATED_HEADERS}
 )
 target_include_directories(brokit_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_include_directories(brokit_api PRIVATE ${GEN_DIR})
 target_link_libraries(brokit_api PUBLIC brokit_runtime)
+target_link_libraries(brokit_api PUBLIC libcurl_static)
 target_include_directories(brokit_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party/quickjs)

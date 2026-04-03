@@ -13,6 +13,11 @@ void installAll(JSContext* ctx)
     installAbortController(ctx);
     installStructuredClone(ctx);
     installBlob(ctx);
+    installURLObject(ctx);
+    installProcess(ctx);
+    installOS(ctx);
+    installPath(ctx);
+    installFetch(ctx);
 }
 
 } // namespace brokit::api
