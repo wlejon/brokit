@@ -35,6 +35,7 @@ embed_js(path.js            js_path)
 embed_js(readable_stream.js js_readable_stream)
 embed_js(fs.js              js_fs)
 embed_js(child_process.js   js_child_process)
+embed_js(eventsource.js     js_eventsource)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -57,6 +58,7 @@ add_library(brokit_api STATIC
     fetch.cpp
     fs.cpp
     child_process.cpp
+    eventsource.cpp
     ${GENERATED_HEADERS}
 )
 target_include_directories(brokit_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

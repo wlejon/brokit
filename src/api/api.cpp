@@ -21,6 +21,7 @@ void installAll(JSContext* ctx)
     installFetch(ctx);
     installFS(ctx);
     installChildProcess(ctx);
+    installEventSource(ctx);
 }
 
 } // namespace brokit::api
