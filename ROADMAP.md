@@ -48,7 +48,7 @@ These APIs are required for Lit (the web component framework pi-mono uses) and m
 |-----|-----|-----------|
 | ~~**Blob / File**~~ | ~~File handling, image previews, clipboard, download URLs~~ | ~~Medium~~ — **done (v0.2)** |
 | ~~**URL.createObjectURL / revokeObjectURL**~~ | ~~Blob URLs for images, downloads, iframes~~ | ~~Medium~~ — **done (v0.3)** |
-| **ResizeObserver** | Responsive layouts — ChatPanel uses it for breakpoints | Small |
+| ~~**ResizeObserver**~~ | ~~Responsive layouts — ChatPanel uses it for breakpoints~~ | ~~Small~~ — **done (v0.3, in bro)** — DOM-dependent, lives in bro's dom_bindings |
 | ~~**AbortController / AbortSignal**~~ | ~~Fetch cancellation, cleanup patterns — used everywhere~~ | ~~Small~~ — **done (v0.2)** |
 | ~~**structuredClone**~~ | ~~Deep copy of objects — used by state management~~ | ~~Small~~ — **done (v0.2)** |
 
