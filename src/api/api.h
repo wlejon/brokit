@@ -30,6 +30,7 @@ void installReadableStream(JSContext* ctx);
 void installFetch(JSContext* ctx);
 void installFS(JSContext* ctx);
 void installChildProcess(JSContext* ctx);
+void installWritableStream(JSContext* ctx);
 void installEventSource(JSContext* ctx);
 
 /// Add a base path for local file fetch resolution.

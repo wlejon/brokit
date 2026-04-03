@@ -19,6 +19,7 @@ void installAll(JSContext* ctx)
     installPath(ctx);
     installReadableStream(ctx);
     installFetch(ctx);
+    installWritableStream(ctx);
     installFS(ctx);
     installChildProcess(ctx);
     installEventSource(ctx);
