@@ -36,6 +36,7 @@ embed_js(readable_stream.js js_readable_stream)
 embed_js(fs.js              js_fs)
 embed_js(child_process.js   js_child_process)
 embed_js(writable_stream.js js_writable_stream)
+embed_js(websocket.js       js_websocket)
 embed_js(eventsource.js     js_eventsource)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
@@ -60,6 +61,8 @@ add_library(brokit_api STATIC
     fs.cpp
     child_process.cpp
     writable_stream.cpp
+    websocket.cpp
+    websocket_js.cpp
     eventsource.cpp
     ${GENERATED_HEADERS}
 )

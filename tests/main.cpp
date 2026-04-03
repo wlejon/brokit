@@ -106,24 +106,42 @@ static TestResult runTestFile(const std::string& path) {
     rt.eval(code, path);
     rt.executePendingJobs();
 
-    // Pump fetch requests: tick curl_multi until all requests complete.
-    // This allows async fetch() tests to resolve their Promises.
+    // Pump async subsystems: tick curl_multi (fetch + websocket) until idle.
     JSContext* ctx = rt.context();
     {
         JSValue global2 = JS_GetGlobalObject(ctx);
-        JSValue hasPending = JS_GetPropertyStr(ctx, global2, "__brokit_fetch_has_pending");
-        JSValue tickFn = JS_GetPropertyStr(ctx, global2, "__brokit_fetch_tick");
+        JSValue fetchHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_fetch_has_pending");
+        JSValue fetchTick = JS_GetPropertyStr(ctx, global2, "__brokit_fetch_tick");
+        JSValue wsHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_ws_has_pending");
+        JSValue wsTick = JS_GetPropertyStr(ctx, global2, "__brokit_ws_tick");
 
-        if (JS_IsFunction(ctx, hasPending) && JS_IsFunction(ctx, tickFn)) {
+        bool haveFetch = JS_IsFunction(ctx, fetchHasPending) && JS_IsFunction(ctx, fetchTick);
+        bool haveWs = JS_IsFunction(ctx, wsHasPending) && JS_IsFunction(ctx, wsTick);
+
+        if (haveFetch || haveWs) {
             for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
-                JSValue pending = JS_Call(ctx, hasPending, global2, 0, nullptr);
-                bool stillPending = JS_ToBool(ctx, pending);
-                JS_FreeValue(ctx, pending);
-                if (!stillPending) break;
+                bool anyPending = false;
 
-                JSValue tr = JS_Call(ctx, tickFn, global2, 0, nullptr);
-                JS_FreeValue(ctx, tr);
+                if (haveFetch) {
+                    JSValue p = JS_Call(ctx, fetchHasPending, global2, 0, nullptr);
+                    if (JS_ToBool(ctx, p)) anyPending = true;
+                    JS_FreeValue(ctx, p);
+
+                    JSValue tr = JS_Call(ctx, fetchTick, global2, 0, nullptr);
+                    JS_FreeValue(ctx, tr);
+                }
+
+                if (haveWs) {
+                    JSValue p = JS_Call(ctx, wsHasPending, global2, 0, nullptr);
+                    if (JS_ToBool(ctx, p)) anyPending = true;
+                    JS_FreeValue(ctx, p);
+
+                    JSValue tr = JS_Call(ctx, wsTick, global2, 0, nullptr);
+                    JS_FreeValue(ctx, tr);
+                }
+
                 rt.executePendingJobs();
+                if (!anyPending) break;
 
 #ifdef _WIN32
                 Sleep(10);
@@ -133,8 +151,10 @@ static TestResult runTestFile(const std::string& path) {
             }
         }
 
-        JS_FreeValue(ctx, tickFn);
-        JS_FreeValue(ctx, hasPending);
+        JS_FreeValue(ctx, wsTick);
+        JS_FreeValue(ctx, wsHasPending);
+        JS_FreeValue(ctx, fetchTick);
+        JS_FreeValue(ctx, fetchHasPending);
         JS_FreeValue(ctx, global2);
     }
 

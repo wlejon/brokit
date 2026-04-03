@@ -10,9 +10,9 @@ The API surface borrows from established standards:
 
 The driving use case is running complex web applications inside bro — specifically, getting pi-mono's web-ui (Lit-based AI chat interface) functional, and eventually building a custom coding agent UI within bro's rendering system.
 
-## Current State (v0.4)
+## Current State (v0.5)
 
-All implemented, all tests passing (441/441):
+All implemented, all tests passing (592/592):
 
 | API | Notes |
 |-----|-------|
@@ -34,6 +34,11 @@ All implemented, all tests passing (441/441):
 | path | join, resolve, dirname, basename, extname, parse, format, isAbsolute, normalize, sep, delimiter |
 | fs | readFileSync/writeFileSync/appendFileSync (string + Uint8Array), statSync/lstatSync (isFile/isDirectory/isSymbolicLink), readdirSync (withFileTypes), existsSync, mkdirSync (recursive), rmSync (recursive+force), rmdirSync, unlinkSync, renameSync, copyFileSync, chmodSync, realpathSync. Async callback+Promise wrappers, fs.promises namespace. Node.js-style error codes (ENOENT, EACCES, etc.) |
 | child_process | execSync, exec (callback+Promise), execFileSync, execFile, spawnSync. Cross-platform (CreateProcess/fork+exec), stdout/stderr capture, stdin input, cwd, timeout, maxBuffer, encoding options. Node.js-style error properties |
+| WritableStream | Full constructor with underlying sink (start/write/close/abort), WritableStreamDefaultWriter, queue-based write processing |
+| TransformStream | Custom transform/flush/start, identity default, TransformStreamDefaultController with enqueue/error/terminate |
+| TextEncoderStream | String-to-Uint8Array transform via TransformStream |
+| EventSource (SSE) | Full SSE wire protocol (data/event/id/retry, comments, multi-line data), auto-reconnect with Last-Event-ID |
+| WebSocket | Native curl WebSocket (CONNECT_ONLY + curl_ws_recv/send), JS class with open/message/error/close events, text + binary frames, auto-pong |
 
 Infrastructure:
 - CMake build matching bro/htmlayout patterns
@@ -63,9 +68,9 @@ Real HTTP fetch is the single biggest unlock. Without it, no app can talk to an 
 |-----|-----|-----------|
 | ~~**fetch (real HTTP)**~~ | ~~REST APIs, LLM provider calls, asset loading~~ | ~~Large~~ — **done (v0.3)** via libcurl |
 | ~~**ReadableStream**~~ | ~~Streaming responses (SSE, LLM token streaming)~~ | ~~Large~~ — **done (v0.4)** with true streaming fetch |
-| **WritableStream / TransformStream** | Stream pipeline composition | Medium |
-| **EventSource (SSE)** | Server-Sent Events — common LLM streaming pattern | Medium (builds on fetch + ReadableStream) |
-| **WebSocket** | Bidirectional real-time communication | Medium |
+| ~~**WritableStream / TransformStream**~~ | ~~Stream pipeline composition~~ | ~~Medium~~ — **done (v0.5)** with TextEncoderStream |
+| ~~**EventSource (SSE)**~~ | ~~Server-Sent Events — common LLM streaming pattern~~ | ~~Medium~~ — **done (v0.5)** JS polyfill on fetch + ReadableStream |
+| ~~**WebSocket**~~ | ~~Bidirectional real-time communication~~ | ~~Medium~~ — **done (v0.5)** native curl WS + JS class |
 
 ## Tier 3 — Persistent storage
 

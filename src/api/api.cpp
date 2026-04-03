@@ -22,6 +22,8 @@ void installAll(JSContext* ctx)
     installWritableStream(ctx);
     installFS(ctx);
     installChildProcess(ctx);
+    installWebSocket(ctx);
+    installWebSocketJS(ctx);
     installEventSource(ctx);
 }
 
