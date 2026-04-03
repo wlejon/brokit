@@ -35,6 +35,7 @@ embed_js(path.js            js_path)
 embed_js(readable_stream.js js_readable_stream)
 embed_js(fs.js              js_fs)
 embed_js(child_process.js   js_child_process)
+embed_js(indexeddb.js       js_indexeddb)
 embed_js(writable_stream.js js_writable_stream)
 embed_js(websocket.js       js_websocket)
 embed_js(eventsource.js     js_eventsource)
@@ -56,6 +57,9 @@ add_library(brokit_api STATIC
     process.cpp
     os.cpp
     path.cpp
+    storage.cpp
+    indexeddb.cpp
+    indexeddb_js.cpp
     readable_stream.cpp
     fetch.cpp
     fs.cpp
@@ -70,4 +74,5 @@ target_include_directories(brokit_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_include_directories(brokit_api PRIVATE ${GEN_DIR})
 target_link_libraries(brokit_api PUBLIC brokit_runtime)
 target_link_libraries(brokit_api PUBLIC libcurl_static)
+target_link_libraries(brokit_api PUBLIC sqlite3)
 target_include_directories(brokit_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party/quickjs)

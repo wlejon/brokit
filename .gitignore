@@ -3,3 +3,6 @@ build/
 .vscode/
 CMakeUserPresets.json
 *.user
+*.idb
+*.idb-wal
+*.idb-shm

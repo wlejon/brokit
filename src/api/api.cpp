@@ -17,6 +17,9 @@ void installAll(JSContext* ctx)
     installProcess(ctx);
     installOS(ctx);
     installPath(ctx);
+    installStorage(ctx);
+    installIndexedDB(ctx);
+    installIndexedDBJS(ctx);
     installReadableStream(ctx);
     installFetch(ctx);
     installWritableStream(ctx);

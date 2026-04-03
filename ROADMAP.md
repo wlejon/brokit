@@ -12,7 +12,7 @@ The driving use case is running complex web applications inside bro — specific
 
 ## Current State (v0.5)
 
-All implemented, all tests passing (592/592):
+All implemented, all tests passing (703/703):
 
 | API | Notes |
 |-----|-------|
@@ -39,6 +39,8 @@ All implemented, all tests passing (592/592):
 | TextEncoderStream | String-to-Uint8Array transform via TransformStream |
 | EventSource (SSE) | Full SSE wire protocol (data/event/id/retry, comments, multi-line data), auto-reconnect with Last-Event-ID |
 | WebSocket | Native curl WebSocket (CONNECT_ONLY + curl_ws_recv/send), JS class with open/message/error/close events, text + binary frames, auto-pong |
+| localStorage / sessionStorage | localStorage with JSON file persistence, sessionStorage in-memory only. Standard Web Storage API (getItem/setItem/removeItem/clear/key/length) |
+| IndexedDB | SQLite-backed (amalgamation). IDBFactory.open/deleteDatabase, IDBDatabase, IDBTransaction, IDBObjectStore (put/add/get/delete/clear/getAll/getAllKeys/count), version upgrades |
 
 Infrastructure:
 - CMake build matching bro/htmlayout patterns
@@ -78,8 +80,8 @@ Apps need to persist data. IndexedDB is the standard, but we can start simpler.
 
 | API | Why | Complexity |
 |-----|-----|-----------|
-| **localStorage / sessionStorage** | Already in bro — move to brokit for standalone use | Small (port existing) |
-| **IndexedDB** | pi-mono's session/settings storage, any data-heavy app | Large — back with SQLite |
+| ~~**localStorage / sessionStorage**~~ | ~~Already in bro — move to brokit for standalone use~~ | ~~Small~~ — **done (v0.5)** ported from bro, JSON file persistence |
+| ~~**IndexedDB**~~ | ~~pi-mono's session/settings storage, any data-heavy app~~ | ~~Large~~ — **done (v0.5)** backed by SQLite amalgamation |
 
 ## Tier 4 — System access
 
