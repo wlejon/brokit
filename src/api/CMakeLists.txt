@@ -32,6 +32,7 @@ embed_js(encoding.js        js_encoding)
 embed_js(treewalker.js      js_treewalker)
 embed_js(url_object.js      js_url_object)
 embed_js(path.js            js_path)
+embed_js(readable_stream.js js_readable_stream)
 embed_js(fs.js              js_fs)
 embed_js(child_process.js   js_child_process)
 
@@ -52,6 +53,7 @@ add_library(brokit_api STATIC
     process.cpp
     os.cpp
     path.cpp
+    readable_stream.cpp
     fetch.cpp
     fs.cpp
     child_process.cpp

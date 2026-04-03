@@ -24,6 +24,7 @@ void installURLObject(JSContext* ctx);
 void installProcess(JSContext* ctx);
 void installOS(JSContext* ctx);
 void installPath(JSContext* ctx);
+void installReadableStream(JSContext* ctx);
 void installFetch(JSContext* ctx);
 void installFS(JSContext* ctx);
 void installChildProcess(JSContext* ctx);
