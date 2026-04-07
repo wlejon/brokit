@@ -2,6 +2,7 @@
 #include "runtime/runtime.h"
 
 #include <FastNoise/FastNoise.h>
+#include <FastNoise/Metadata.h>
 #include <vector>
 #include <cstring>
 
@@ -21,7 +22,6 @@ static void noise_finalizer(JSRuntime*, JSValue val)
 
 static JSClassDef noise_class_def = { "FastNoise", noise_finalizer };
 
-// Helper: create a Float32Array from a float buffer
 static JSValue make_float32_array(JSContext* ctx, const float* data, size_t count)
 {
     size_t byte_len = count * sizeof(float);
@@ -42,7 +42,6 @@ static NoiseWrapper* get_noise(JSContext* ctx, JSValueConst this_val)
     return static_cast<NoiseWrapper*>(JS_GetOpaque2(ctx, this_val, noise_class_id));
 }
 
-// Helper: create a JS FastNoise object wrapping a SmartNode
 static JSValue wrap_node(JSContext* ctx, FastNoise::SmartNode<> node)
 {
     if (!node)
@@ -193,179 +192,233 @@ static JSValue noise_gen_tileable_2d(JSContext* ctx, JSValueConst this_val,
 }
 
 // ---------------------------------------------------------------------------
-// Node configuration methods — direct casts to concrete FN2 types
+// Metadata-driven generic property setter: node.set(name, value)
+//
+// Searches the node's metadata for a matching member by name. Handles:
+//   - MemberVariable (float, int, enum)
+//   - MemberNodeLookup (source node connections)
+//   - MemberHybrid (accepts either a float or a FastNoise node)
 // ---------------------------------------------------------------------------
 
-// setSource(otherNode) — works on Fractal and DomainWarp nodes
-static JSValue noise_set_source(JSContext* ctx, JSValueConst this_val,
-                                 int argc, JSValueConst* argv)
+static JSValue noise_set(JSContext* ctx, JSValueConst this_val,
+                          int argc, JSValueConst* argv)
 {
     auto* w = get_noise(ctx, this_val);
     if (!w) return JS_EXCEPTION;
-    if (argc < 1)
-        return JS_ThrowTypeError(ctx, "setSource(node)");
+    if (argc < 2 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "set(name, value)");
 
-    auto* sw = static_cast<NoiseWrapper*>(JS_GetOpaque2(ctx, argv[0], noise_class_id));
-    if (!sw)
-        return JS_ThrowTypeError(ctx, "setSource: argument must be a FastNoise node");
+    const char* name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
 
-    // Try Fractal types
-    if (auto* fbm = dynamic_cast<FastNoise::FractalFBm*>(w->node.get())) {
-        fbm->SetSource(sw->node); return JS_UNDEFINED;
+    const auto& meta = w->node->GetMetadata();
+    JSValueConst val = argv[1];
+
+    // Search MemberVariable (float, int, enum by name or enum string)
+    for (const auto& mv : meta.memberVariables) {
+        if (strcmp(mv.name, name) != 0) continue;
+        JS_FreeCString(ctx, name);
+
+        if (mv.type == FastNoise::Metadata::MemberVariable::EFloat) {
+            double d;
+            if (JS_ToFloat64(ctx, &d, val)) return JS_EXCEPTION;
+            FastNoise::Metadata::MemberVariable::ValueUnion vu(static_cast<float>(d));
+            if (!mv.setFunc(w->node.get(), vu))
+                return JS_ThrowTypeError(ctx, "Failed to set variable");
+            return JS_UNDEFINED;
+        }
+        if (mv.type == FastNoise::Metadata::MemberVariable::EInt) {
+            int32_t i;
+            if (JS_ToInt32(ctx, &i, val)) return JS_EXCEPTION;
+            FastNoise::Metadata::MemberVariable::ValueUnion vu(static_cast<int>(i));
+            if (!mv.setFunc(w->node.get(), vu))
+                return JS_ThrowTypeError(ctx, "Failed to set variable");
+            return JS_UNDEFINED;
+        }
+        if (mv.type == FastNoise::Metadata::MemberVariable::EEnum) {
+            // Accept int index or string name
+            if (JS_IsNumber(val)) {
+                int32_t i;
+                if (JS_ToInt32(ctx, &i, val)) return JS_EXCEPTION;
+                FastNoise::Metadata::MemberVariable::ValueUnion vu(static_cast<int>(i));
+                if (!mv.setFunc(w->node.get(), vu))
+                    return JS_ThrowTypeError(ctx, "Failed to set enum");
+                return JS_UNDEFINED;
+            }
+            if (JS_IsString(val)) {
+                const char* enumStr = JS_ToCString(ctx, val);
+                if (!enumStr) return JS_EXCEPTION;
+                for (size_t ei = 0; ei < mv.enumNames.size(); ei++) {
+                    if (strcmp(mv.enumNames[ei], enumStr) == 0) {
+                        JS_FreeCString(ctx, enumStr);
+                        FastNoise::Metadata::MemberVariable::ValueUnion vu(static_cast<int>(ei));
+                        if (!mv.setFunc(w->node.get(), vu))
+                            return JS_ThrowTypeError(ctx, "Failed to set enum");
+                        return JS_UNDEFINED;
+                    }
+                }
+                JSValue err = JS_ThrowRangeError(ctx, "Unknown enum value '%s'", enumStr);
+                JS_FreeCString(ctx, enumStr);
+                return err;
+            }
+            return JS_ThrowTypeError(ctx, "Enum expects int or string");
+        }
+        return JS_ThrowTypeError(ctx, "Unknown variable type");
     }
-    if (auto* ridged = dynamic_cast<FastNoise::FractalRidged*>(w->node.get())) {
-        ridged->SetSource(sw->node); return JS_UNDEFINED;
-    }
-    // Try DomainWarp types
-    if (auto* warp = dynamic_cast<FastNoise::DomainWarp*>(w->node.get())) {
-        warp->SetSource(sw->node); return JS_UNDEFINED;
-    }
-    // Try modifier types (DomainScale etc.)
-    if (auto* ds = dynamic_cast<FastNoise::DomainScale*>(w->node.get())) {
-        ds->SetSource(sw->node); return JS_UNDEFINED;
-    }
 
-    return JS_ThrowTypeError(ctx, "This node type does not accept a source");
-}
+    // Search MemberNodeLookup (source connections)
+    for (const auto& mn : meta.memberNodeLookups) {
+        if (strcmp(mn.name, name) != 0) continue;
+        JS_FreeCString(ctx, name);
 
-// setScale(value) — feature scale (1/frequency). Works on ScalableGenerator.
-static JSValue noise_set_scale(JSContext* ctx, JSValueConst this_val,
-                                int argc, JSValueConst* argv)
-{
-    auto* w = get_noise(ctx, this_val);
-    if (!w) return JS_EXCEPTION;
-    if (argc < 1) return JS_ThrowTypeError(ctx, "setScale(value)");
-
-    double val;
-    if (JS_ToFloat64(ctx, &val, argv[0])) return JS_EXCEPTION;
-
-    if (auto* sg = dynamic_cast<FastNoise::ScalableGenerator*>(w->node.get())) {
-        sg->SetScale(static_cast<float>(val));
+        auto* sw = static_cast<NoiseWrapper*>(JS_GetOpaque2(ctx, val, noise_class_id));
+        if (!sw)
+            return JS_ThrowTypeError(ctx, "Node input requires a FastNoise node");
+        if (!mn.setFunc(w->node.get(), sw->node))
+            return JS_ThrowTypeError(ctx, "Failed to set node source (type mismatch)");
         return JS_UNDEFINED;
     }
-    return JS_ThrowTypeError(ctx, "This node type does not have a scale parameter");
-}
 
-// setFrequency(value) — convenience: setScale(1 / freq)
-static JSValue noise_set_frequency(JSContext* ctx, JSValueConst this_val,
-                                    int argc, JSValueConst* argv)
-{
-    auto* w = get_noise(ctx, this_val);
-    if (!w) return JS_EXCEPTION;
-    if (argc < 1) return JS_ThrowTypeError(ctx, "setFrequency(value)");
+    // Search MemberHybrid (float or node)
+    for (const auto& mh : meta.memberHybrids) {
+        if (strcmp(mh.name, name) != 0) continue;
+        JS_FreeCString(ctx, name);
 
-    double val;
-    if (JS_ToFloat64(ctx, &val, argv[0])) return JS_EXCEPTION;
-    if (val == 0.0) return JS_ThrowRangeError(ctx, "Frequency cannot be zero");
-
-    if (auto* sg = dynamic_cast<FastNoise::ScalableGenerator*>(w->node.get())) {
-        sg->SetScale(static_cast<float>(1.0 / val));
+        // If value is a FastNoise node, connect it
+        auto* sw = static_cast<NoiseWrapper*>(JS_GetOpaque(val, noise_class_id));
+        if (sw) {
+            if (!mh.setNodeFunc(w->node.get(), sw->node))
+                return JS_ThrowTypeError(ctx, "Failed to set hybrid node source");
+            return JS_UNDEFINED;
+        }
+        // Otherwise treat as float
+        double d;
+        if (JS_ToFloat64(ctx, &d, val)) return JS_EXCEPTION;
+        if (!mh.setValueFunc(w->node.get(), static_cast<float>(d)))
+            return JS_ThrowTypeError(ctx, "Failed to set hybrid value");
         return JS_UNDEFINED;
     }
-    return JS_ThrowTypeError(ctx, "This node type does not have a frequency parameter");
-}
 
-// setOctaveCount(n) — Fractal types
-static JSValue noise_set_octave_count(JSContext* ctx, JSValueConst this_val,
-                                       int argc, JSValueConst* argv)
-{
-    auto* w = get_noise(ctx, this_val);
-    if (!w) return JS_EXCEPTION;
-    if (argc < 1) return JS_ThrowTypeError(ctx, "setOctaveCount(n)");
-
-    int32_t val;
-    if (JS_ToInt32(ctx, &val, argv[0])) return JS_EXCEPTION;
-
-    // Fractal<> is a template — check concrete types
-    if (auto* f = dynamic_cast<FastNoise::FractalFBm*>(w->node.get())) {
-        f->SetOctaveCount(val); return JS_UNDEFINED;
-    }
-    if (auto* f = dynamic_cast<FastNoise::FractalRidged*>(w->node.get())) {
-        f->SetOctaveCount(val); return JS_UNDEFINED;
-    }
-    return JS_ThrowTypeError(ctx, "This node type does not have octaves");
-}
-
-// setGain(value) — Fractal types
-static JSValue noise_set_gain(JSContext* ctx, JSValueConst this_val,
-                               int argc, JSValueConst* argv)
-{
-    auto* w = get_noise(ctx, this_val);
-    if (!w) return JS_EXCEPTION;
-    if (argc < 1) return JS_ThrowTypeError(ctx, "setGain(value)");
-
-    double val;
-    if (JS_ToFloat64(ctx, &val, argv[0])) return JS_EXCEPTION;
-
-    if (auto* f = dynamic_cast<FastNoise::FractalFBm*>(w->node.get())) {
-        f->SetGain(static_cast<float>(val)); return JS_UNDEFINED;
-    }
-    if (auto* f = dynamic_cast<FastNoise::FractalRidged*>(w->node.get())) {
-        f->SetGain(static_cast<float>(val)); return JS_UNDEFINED;
-    }
-    return JS_ThrowTypeError(ctx, "This node type does not have a gain parameter");
-}
-
-// setLacunarity(value) — Fractal types
-static JSValue noise_set_lacunarity(JSContext* ctx, JSValueConst this_val,
-                                     int argc, JSValueConst* argv)
-{
-    auto* w = get_noise(ctx, this_val);
-    if (!w) return JS_EXCEPTION;
-    if (argc < 1) return JS_ThrowTypeError(ctx, "setLacunarity(value)");
-
-    double val;
-    if (JS_ToFloat64(ctx, &val, argv[0])) return JS_EXCEPTION;
-
-    if (auto* f = dynamic_cast<FastNoise::FractalFBm*>(w->node.get())) {
-        f->SetLacunarity(static_cast<float>(val)); return JS_UNDEFINED;
-    }
-    if (auto* f = dynamic_cast<FastNoise::FractalRidged*>(w->node.get())) {
-        f->SetLacunarity(static_cast<float>(val)); return JS_UNDEFINED;
-    }
-    return JS_ThrowTypeError(ctx, "This node type does not have a lacunarity parameter");
-}
-
-// setWeightedStrength(value) — Fractal types
-static JSValue noise_set_weighted_strength(JSContext* ctx, JSValueConst this_val,
-                                            int argc, JSValueConst* argv)
-{
-    auto* w = get_noise(ctx, this_val);
-    if (!w) return JS_EXCEPTION;
-    if (argc < 1) return JS_ThrowTypeError(ctx, "setWeightedStrength(value)");
-
-    double val;
-    if (JS_ToFloat64(ctx, &val, argv[0])) return JS_EXCEPTION;
-
-    if (auto* f = dynamic_cast<FastNoise::FractalFBm*>(w->node.get())) {
-        f->SetWeightedStrength(static_cast<float>(val)); return JS_UNDEFINED;
-    }
-    if (auto* f = dynamic_cast<FastNoise::FractalRidged*>(w->node.get())) {
-        f->SetWeightedStrength(static_cast<float>(val)); return JS_UNDEFINED;
-    }
-    return JS_ThrowTypeError(ctx, "This node type does not have a weighted strength parameter");
-}
-
-// setWarpAmplitude(value) — DomainWarp types
-static JSValue noise_set_warp_amplitude(JSContext* ctx, JSValueConst this_val,
-                                         int argc, JSValueConst* argv)
-{
-    auto* w = get_noise(ctx, this_val);
-    if (!w) return JS_EXCEPTION;
-    if (argc < 1) return JS_ThrowTypeError(ctx, "setWarpAmplitude(value)");
-
-    double val;
-    if (JS_ToFloat64(ctx, &val, argv[0])) return JS_EXCEPTION;
-
-    if (auto* dw = dynamic_cast<FastNoise::DomainWarp*>(w->node.get())) {
-        dw->SetWarpAmplitude(static_cast<float>(val)); return JS_UNDEFINED;
-    }
-    return JS_ThrowTypeError(ctx, "This node type does not have a warp amplitude parameter");
+    JSValue err = JS_ThrowReferenceError(ctx, "No member '%s' on this node type", name);
+    JS_FreeCString(ctx, name);
+    return err;
 }
 
 // ---------------------------------------------------------------------------
-// Constructor: new FastNoise(encodedNodeTree) — backwards compat
+// Metadata-driven introspection: node.getMembers()
+// Returns { variables: [...], nodes: [...], hybrids: [...] }
 // ---------------------------------------------------------------------------
+
+static JSValue noise_get_members(JSContext* ctx, JSValueConst this_val,
+                                  int, JSValueConst*)
+{
+    auto* w = get_noise(ctx, this_val);
+    if (!w) return JS_EXCEPTION;
+
+    const auto& meta = w->node->GetMetadata();
+    JSValue result = JS_NewObject(ctx);
+    JSValue typeName = JS_NewString(ctx, meta.name);
+    JS_SetPropertyStr(ctx, result, "type", typeName);
+
+    // Variables
+    JSValue vars = JS_NewArray(ctx);
+    for (size_t i = 0; i < meta.memberVariables.size(); i++) {
+        const auto& mv = meta.memberVariables[i];
+        JSValue entry = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, entry, "name", JS_NewString(ctx, mv.name));
+        const char* typeStr = mv.type == FastNoise::Metadata::MemberVariable::EFloat ? "float"
+                            : mv.type == FastNoise::Metadata::MemberVariable::EInt   ? "int"
+                            : "enum";
+        JS_SetPropertyStr(ctx, entry, "type", JS_NewString(ctx, typeStr));
+        if (mv.type == FastNoise::Metadata::MemberVariable::EEnum) {
+            JSValue names = JS_NewArray(ctx);
+            for (size_t ei = 0; ei < mv.enumNames.size(); ei++)
+                JS_SetPropertyUint32(ctx, names, static_cast<uint32_t>(ei),
+                                     JS_NewString(ctx, mv.enumNames[ei]));
+            JS_SetPropertyStr(ctx, entry, "enumValues", names);
+        }
+        JS_SetPropertyUint32(ctx, vars, static_cast<uint32_t>(i), entry);
+    }
+    JS_SetPropertyStr(ctx, result, "variables", vars);
+
+    // Node lookups
+    JSValue nodes = JS_NewArray(ctx);
+    for (size_t i = 0; i < meta.memberNodeLookups.size(); i++) {
+        JSValue entry = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, entry, "name",
+                          JS_NewString(ctx, meta.memberNodeLookups[i].name));
+        JS_SetPropertyUint32(ctx, nodes, static_cast<uint32_t>(i), entry);
+    }
+    JS_SetPropertyStr(ctx, result, "nodes", nodes);
+
+    // Hybrids
+    JSValue hybrids = JS_NewArray(ctx);
+    for (size_t i = 0; i < meta.memberHybrids.size(); i++) {
+        JSValue entry = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, entry, "name",
+                          JS_NewString(ctx, meta.memberHybrids[i].name));
+        JS_SetPropertyStr(ctx, entry, "default",
+                          JS_NewFloat64(ctx, meta.memberHybrids[i].valueDefault));
+        JS_SetPropertyUint32(ctx, hybrids, static_cast<uint32_t>(i), entry);
+    }
+    JS_SetPropertyStr(ctx, result, "hybrids", hybrids);
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// FastNoise.create(typeName) — metadata-driven factory for any node type
+// ---------------------------------------------------------------------------
+
+static JSValue noise_create(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1 || !JS_IsString(argv[0]))
+        return JS_ThrowTypeError(ctx, "FastNoise.create(typeName)");
+
+    const char* typeName = JS_ToCString(ctx, argv[0]);
+    if (!typeName) return JS_EXCEPTION;
+
+    for (const auto* meta : FastNoise::Metadata::GetAll()) {
+        if (meta && strcmp(meta->name, typeName) == 0) {
+            JS_FreeCString(ctx, typeName);
+            auto node = meta->CreateNode();
+            return wrap_node(ctx, std::move(node));
+        }
+    }
+
+    JSValue err = JS_ThrowReferenceError(ctx, "Unknown FastNoise type '%s'", typeName);
+    JS_FreeCString(ctx, typeName);
+    return err;
+}
+
+// ---------------------------------------------------------------------------
+// FastNoise.types() — list all available node types
+// ---------------------------------------------------------------------------
+
+static JSValue noise_types(JSContext* ctx, JSValueConst, int, JSValueConst*)
+{
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t idx = 0;
+    for (const auto* meta : FastNoise::Metadata::GetAll()) {
+        if (!meta) continue;
+        JSValue entry = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, entry, "name", JS_NewString(ctx, meta->name));
+
+        JSValue groups = JS_NewArray(ctx);
+        for (size_t gi = 0; gi < meta->groups.size(); gi++)
+            JS_SetPropertyUint32(ctx, groups, static_cast<uint32_t>(gi),
+                                 JS_NewString(ctx, meta->groups[gi]));
+        JS_SetPropertyStr(ctx, entry, "groups", groups);
+
+        JS_SetPropertyUint32(ctx, arr, idx++, entry);
+    }
+    return arr;
+}
+
+// ---------------------------------------------------------------------------
+// Constructor: new FastNoise(encodedNodeTree)
+// ---------------------------------------------------------------------------
+
 static JSValue noise_ctor(JSContext* ctx, JSValueConst new_target,
                            int argc, JSValueConst* argv)
 {
@@ -394,7 +447,7 @@ static JSValue noise_ctor(JSContext* ctx, JSValueConst new_target,
 }
 
 // ---------------------------------------------------------------------------
-// Factory functions: FastNoise.Simplex(), FastNoise.FractalFBm(), etc.
+// Convenience factory template (for named shortcuts like FastNoise.Simplex())
 // ---------------------------------------------------------------------------
 
 template<typename T>
@@ -417,7 +470,7 @@ void installNoise(JSContext* ctx)
         JS_NewClass(rt, noise_class_id, &noise_class_def);
     }
 
-    // Prototype: generation + configuration methods
+    // Prototype
     JSValue proto = JS_NewObject(ctx);
 
     // Generation
@@ -432,31 +485,25 @@ void installNoise(JSContext* ctx)
     JS_SetPropertyStr(ctx, proto, "genTileable2D",
         JS_NewCFunction(ctx, noise_gen_tileable_2d, "genTileable2D", 4));
 
-    // Configuration
-    JS_SetPropertyStr(ctx, proto, "setSource",
-        JS_NewCFunction(ctx, noise_set_source, "setSource", 1));
-    JS_SetPropertyStr(ctx, proto, "setScale",
-        JS_NewCFunction(ctx, noise_set_scale, "setScale", 1));
-    JS_SetPropertyStr(ctx, proto, "setFrequency",
-        JS_NewCFunction(ctx, noise_set_frequency, "setFrequency", 1));
-    JS_SetPropertyStr(ctx, proto, "setOctaveCount",
-        JS_NewCFunction(ctx, noise_set_octave_count, "setOctaveCount", 1));
-    JS_SetPropertyStr(ctx, proto, "setGain",
-        JS_NewCFunction(ctx, noise_set_gain, "setGain", 1));
-    JS_SetPropertyStr(ctx, proto, "setLacunarity",
-        JS_NewCFunction(ctx, noise_set_lacunarity, "setLacunarity", 1));
-    JS_SetPropertyStr(ctx, proto, "setWeightedStrength",
-        JS_NewCFunction(ctx, noise_set_weighted_strength, "setWeightedStrength", 1));
-    JS_SetPropertyStr(ctx, proto, "setWarpAmplitude",
-        JS_NewCFunction(ctx, noise_set_warp_amplitude, "setWarpAmplitude", 1));
+    // Generic metadata-driven configuration
+    JS_SetPropertyStr(ctx, proto, "set",
+        JS_NewCFunction(ctx, noise_set, "set", 2));
+    JS_SetPropertyStr(ctx, proto, "getMembers",
+        JS_NewCFunction(ctx, noise_get_members, "getMembers", 0));
 
-    // Constructor (encoded string — backwards compat)
+    // Constructor (encoded string)
     JSValue ctor = JS_NewCFunction2(ctx, noise_ctor, "FastNoise", 1,
                                      JS_CFUNC_constructor, 0);
     JS_SetConstructor(ctx, ctor, proto);
     JS_SetClassProto(ctx, noise_class_id, proto);
 
-    // Static factories — coherent noise
+    // Static: generic factory + type listing
+    JS_SetPropertyStr(ctx, ctor, "create",
+        JS_NewCFunction(ctx, noise_create, "create", 1));
+    JS_SetPropertyStr(ctx, ctor, "types",
+        JS_NewCFunction(ctx, noise_types, "types", 0));
+
+    // Named convenience factories for common types
     JS_SetPropertyStr(ctx, ctor, "Simplex",
         JS_NewCFunction(ctx, noise_factory<FastNoise::Simplex>, "Simplex", 0));
     JS_SetPropertyStr(ctx, ctor, "SuperSimplex",
@@ -465,20 +512,16 @@ void installNoise(JSContext* ctx)
         JS_NewCFunction(ctx, noise_factory<FastNoise::Perlin>, "Perlin", 0));
     JS_SetPropertyStr(ctx, ctor, "Value",
         JS_NewCFunction(ctx, noise_factory<FastNoise::Value>, "Value", 0));
-
-    // Cellular
     JS_SetPropertyStr(ctx, ctor, "CellularValue",
         JS_NewCFunction(ctx, noise_factory<FastNoise::CellularValue>, "CellularValue", 0));
     JS_SetPropertyStr(ctx, ctor, "CellularDistance",
         JS_NewCFunction(ctx, noise_factory<FastNoise::CellularDistance>, "CellularDistance", 0));
-
-    // Fractal
+    JS_SetPropertyStr(ctx, ctor, "CellularLookup",
+        JS_NewCFunction(ctx, noise_factory<FastNoise::CellularLookup>, "CellularLookup", 0));
     JS_SetPropertyStr(ctx, ctor, "FractalFBm",
         JS_NewCFunction(ctx, noise_factory<FastNoise::FractalFBm>, "FractalFBm", 0));
     JS_SetPropertyStr(ctx, ctor, "FractalRidged",
         JS_NewCFunction(ctx, noise_factory<FastNoise::FractalRidged>, "FractalRidged", 0));
-
-    // Domain warp
     JS_SetPropertyStr(ctx, ctor, "DomainWarpGradient",
         JS_NewCFunction(ctx, noise_factory<FastNoise::DomainWarpGradient>, "DomainWarpGradient", 0));
 
