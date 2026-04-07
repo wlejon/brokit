@@ -35,10 +35,10 @@ Linux:
 
 ```
 src/runtime/   — QuickJS runtime wrapper (Runtime class)
-src/api/       — Web/system API implementations (console, timers, URL, crypto, encoding, TreeWalker)
+src/api/       — Web/system API implementations (console, timers, URL, crypto, encoding, noise, etc.)
 tests/         — C++ test harness
 tests/js/      — JavaScript test files (one per API)
-third_party/   — QuickJS (bundled)
+third_party/   — QuickJS, libcurl, SQLite, FastNoise2 (bundled)
 ```
 
 ## Namespace

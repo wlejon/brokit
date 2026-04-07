@@ -38,6 +38,12 @@ Built as a dependency for [bro](https://github.com/wlejon/bro).
 | **MessageChannel / MessagePort** | Paired ports with postMessage, start/close, message queuing, MessageEvent |
 | **navigator** | userAgent, language, languages, onLine, platform, hardwareConcurrency |
 
+### Procedural generation
+
+| API | Implementation |
+|-----|---------------|
+| **FastNoise** | SIMD-accelerated noise via FastNoise2. `FastNoise.create(type)` for ~50 node types, `node.set(name, value)` metadata-driven config, `genUniformGrid2D/3D`, `genSingle2D/3D`, `genTileable2D`. Generators, fractals, cellular, domain warp, operators (Add/Multiply/Min/Max/Fade), modifiers (Remap/Terrace/DomainScale). Gated by `BROKIT_ENABLE_NOISE` (ON by default) |
+
 ### System (Node.js-style)
 
 | API | Implementation |
@@ -61,10 +67,11 @@ Dependencies (all bundled):
 - **QuickJS** — JavaScript engine (git submodule)
 - **libcurl 8.19.0** — HTTP/WebSocket (git submodule, static, Schannel TLS on Windows)
 - **SQLite** — IndexedDB persistence (amalgamation)
+- **FastNoise2** — SIMD noise generation (git submodule, gated by `BROKIT_ENABLE_NOISE`)
 
 ## Test
 
-904 tests across 28 test files.
+2307 tests across 29 test files.
 
 ```bash
 # Windows (MSVC)
@@ -110,7 +117,7 @@ src/runtime/   Runtime class: QuickJS wrapper, ES module loader, exception handl
 src/api/       Modular API installers (one .cpp per API, optional .js polyfill)
 src/api/js/    JS polyfills embedded into C++ at build time via cmake/embed_js.cmake
 tests/         C++ test harness that evals JS test files and pumps async subsystems
-third_party/   QuickJS, libcurl, SQLite
+third_party/   QuickJS, libcurl, SQLite, FastNoise2
 ```
 
 **Design principles:**
