@@ -89,6 +89,9 @@ void installAll(JSContext* ctx)
     installNavigator(ctx);
     installEventTarget(ctx);
     installMessageChannel(ctx);
+#ifdef BROKIT_HAS_NOISE
+    installNoise(ctx);
+#endif
 
     // require() must come last — after all modules are installed
     installRequire(ctx);

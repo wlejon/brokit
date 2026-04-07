@@ -48,7 +48,7 @@ embed_js(message_channel.js js_message_channel)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
-add_library(brokit_api STATIC
+set(BROKIT_API_SOURCES
     api.cpp
     console.cpp
     timers.cpp
@@ -80,6 +80,14 @@ add_library(brokit_api STATIC
     navigator.cpp
     event_target.cpp
     message_channel.cpp
+)
+
+if(BROKIT_ENABLE_NOISE)
+    list(APPEND BROKIT_API_SOURCES noise.cpp)
+endif()
+
+add_library(brokit_api STATIC
+    ${BROKIT_API_SOURCES}
     ${GENERATED_HEADERS}
 )
 target_include_directories(brokit_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -88,3 +96,8 @@ target_link_libraries(brokit_api PUBLIC brokit_runtime)
 target_link_libraries(brokit_api PUBLIC libcurl_static)
 target_link_libraries(brokit_api PUBLIC sqlite3)
 target_include_directories(brokit_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party/quickjs)
+
+if(BROKIT_ENABLE_NOISE)
+    target_link_libraries(brokit_api PUBLIC FastNoise)
+    target_compile_definitions(brokit_api PUBLIC BROKIT_HAS_NOISE)
+endif()
