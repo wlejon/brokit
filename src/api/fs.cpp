@@ -22,6 +22,50 @@ namespace fs = std::filesystem;
 
 namespace brokit::api {
 
+// Key for the base-paths array stored on globalThis
+static const char* kFsBasePathsKey = "__brokit_fs_base_paths";
+
+// Resolve a relative path against registered base paths.
+// Returns the first path that exists, or the original path if none match.
+static std::string resolveFsPath(JSContext* ctx, const char* path)
+{
+    // Absolute paths are returned as-is
+    fs::path p(path);
+    if (p.is_absolute()) return path;
+
+    // Check base paths (last added = checked first, like fetch)
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue arr = JS_GetPropertyStr(ctx, global, kFsBasePathsKey);
+    if (JS_IsArray(arr)) {
+        JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
+        int32_t len = 0;
+        JS_ToInt32(ctx, &len, lenVal);
+        JS_FreeValue(ctx, lenVal);
+
+        for (int32_t i = len - 1; i >= 0; --i) {
+            JSValue elem = JS_GetPropertyUint32(ctx, arr, i);
+            const char* base = JS_ToCString(ctx, elem);
+            JS_FreeValue(ctx, elem);
+            if (!base) continue;
+
+            fs::path candidate = fs::path(base) / path;
+            JS_FreeCString(ctx, base);
+
+            std::error_code ec;
+            if (fs::exists(candidate, ec)) {
+                JS_FreeValue(ctx, arr);
+                JS_FreeValue(ctx, global);
+                return candidate.string();
+            }
+        }
+    }
+    JS_FreeValue(ctx, arr);
+    JS_FreeValue(ctx, global);
+
+    // No match — return original (will fail naturally)
+    return path;
+}
+
 // Helper: read encoding arg (default nullptr = buffer mode)
 static const char* getEncoding(JSContext* ctx, int argc, JSValueConst* argv, int idx)
 {
@@ -81,25 +125,25 @@ static JSValue js_readFileSync(JSContext* ctx, JSValueConst, int argc, JSValueCo
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "readFileSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     const char* encoding = getEncoding(ctx, argc, argv, 1);
 
-    std::ifstream f(path, std::ios::in | std::ios::binary);
+    std::ifstream f(resolved, std::ios::in | std::ios::binary);
     if (!f) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
         if (encoding) JS_FreeCString(ctx, encoding);
-        return throwErrno(ctx, "open", p.c_str(), "ENOENT",
-                          ("ENOENT: no such file or directory, open '" + p + "'").c_str());
+        return throwErrno(ctx, "open", resolved.c_str(), "ENOENT",
+                          ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
     }
 
     std::ostringstream ss;
     ss << f.rdbuf();
     std::string data = ss.str();
     f.close();
-    JS_FreeCString(ctx, path);
 
     JSValue result;
     if (encoding && (strcmp(encoding, "utf8") == 0 || strcmp(encoding, "utf-8") == 0)) {
@@ -123,11 +167,11 @@ static JSValue js_writeFileSync(JSContext* ctx, JSValueConst, int argc, JSValueC
 {
     if (argc < 2) return JS_ThrowTypeError(ctx, "writeFileSync: path and data required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
 
-    std::string pathStr(path);
-    JS_FreeCString(ctx, path);
+    std::string pathStr = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     // Get data as bytes
     std::string data;
@@ -180,11 +224,11 @@ static JSValue js_appendFileSync(JSContext* ctx, JSValueConst, int argc, JSValue
 {
     if (argc < 2) return JS_ThrowTypeError(ctx, "appendFileSync: path and data required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
 
-    std::string pathStr(path);
-    JS_FreeCString(ctx, path);
+    std::string pathStr = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     std::string data;
     if (JS_IsString(argv[1])) {
@@ -223,21 +267,22 @@ static JSValue js_statSync(JSContext* ctx, JSValueConst, int argc, JSValueConst*
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "statSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     std::error_code ec;
-    auto status = fs::status(path, ec);
+    auto status = fs::status(resolved, ec);
     if (ec) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "stat", p.c_str(), ec);
+        return throwFsError(ctx, "stat", resolved.c_str(), ec);
     }
 
-    auto fileSize = fs::file_size(path, ec);
+    auto fileSize = fs::file_size(resolved, ec);
     if (ec) fileSize = 0; // directories etc.
 
-    auto mtime = fs::last_write_time(path, ec);
+    auto mtime = fs::last_write_time(resolved, ec);
     // Convert to ms since epoch
     double mtimeMs = 0;
     if (!ec) {
@@ -250,13 +295,13 @@ static JSValue js_statSync(JSContext* ctx, JSValueConst, int argc, JSValueConst*
     bool isDir = fs::is_directory(status);
     bool isSymlink = false;
     {
-        auto lstatus = fs::symlink_status(path, ec);
+        auto lstatus = fs::symlink_status(resolved, ec);
         if (!ec) isSymlink = fs::is_symlink(lstatus);
     }
 
 #ifdef _WIN32
     // Get file attributes for mode approximation
-    DWORD attrs = GetFileAttributesA(path);
+    DWORD attrs = GetFileAttributesA(resolved.c_str());
     int mode = 0;
     if (attrs != INVALID_FILE_ATTRIBUTES) {
         mode = 0444; // readable
@@ -266,12 +311,10 @@ static JSValue js_statSync(JSContext* ctx, JSValueConst, int argc, JSValueConst*
 #else
     struct stat st;
     int mode = 0;
-    if (::stat(path, &st) == 0) {
+    if (::stat(resolved.c_str(), &st) == 0) {
         mode = st.st_mode & 07777;
     }
 #endif
-
-    JS_FreeCString(ctx, path);
 
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "size", JS_NewFloat64(ctx, static_cast<double>(fileSize)));
@@ -291,25 +334,24 @@ static JSValue js_lstatSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "lstatSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     std::error_code ec;
-    auto status = fs::symlink_status(path, ec);
+    auto status = fs::symlink_status(resolved, ec);
     if (ec) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "lstat", p.c_str(), ec);
+        return throwFsError(ctx, "lstat", resolved.c_str(), ec);
     }
 
-    auto fileSize = fs::file_size(path, ec);
+    auto fileSize = fs::file_size(resolved, ec);
     if (ec) fileSize = 0;
 
     bool isFile = fs::is_regular_file(status);
     bool isDir = fs::is_directory(status);
     bool isSymlink = fs::is_symlink(status);
-
-    JS_FreeCString(ctx, path);
 
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "size", JS_NewFloat64(ctx, static_cast<double>(fileSize)));
@@ -328,8 +370,11 @@ static JSValue js_readdirSync(JSContext* ctx, JSValueConst, int argc, JSValueCon
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "readdirSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     // Check for withFileTypes option
     bool withFileTypes = false;
@@ -340,14 +385,10 @@ static JSValue js_readdirSync(JSContext* ctx, JSValueConst, int argc, JSValueCon
     }
 
     std::error_code ec;
-    auto iter = fs::directory_iterator(path, ec);
+    auto iter = fs::directory_iterator(resolved, ec);
     if (ec) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "scandir", p.c_str(), ec);
+        return throwFsError(ctx, "scandir", resolved.c_str(), ec);
     }
-
-    JS_FreeCString(ctx, path);
 
     JSValue arr = JS_NewArray(ctx);
     uint32_t i = 0;
@@ -377,12 +418,14 @@ static JSValue js_existsSync(JSContext* ctx, JSValueConst, int argc, JSValueCons
 {
     if (argc < 1) return JS_NewBool(ctx, false);
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_NewBool(ctx, false);
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_NewBool(ctx, false);
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     std::error_code ec;
-    bool exists = fs::exists(path, ec);
-    JS_FreeCString(ctx, path);
+    bool exists = fs::exists(resolved, ec);
 
     return JS_NewBool(ctx, exists);
 }
@@ -394,8 +437,11 @@ static JSValue js_mkdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "mkdirSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     bool recursive = false;
     if (argc >= 2 && JS_IsObject(argv[1])) {
@@ -406,18 +452,14 @@ static JSValue js_mkdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
 
     std::error_code ec;
     if (recursive) {
-        fs::create_directories(path, ec);
+        fs::create_directories(resolved, ec);
     } else {
-        fs::create_directory(path, ec);
+        fs::create_directory(resolved, ec);
     }
 
     if (ec) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "mkdir", p.c_str(), ec);
+        return throwFsError(ctx, "mkdir", resolved.c_str(), ec);
     }
-
-    JS_FreeCString(ctx, path);
 
     // Node returns the first directory created when recursive, or undefined
     return JS_UNDEFINED;
@@ -430,18 +472,17 @@ static JSValue js_rmdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "rmdirSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     std::error_code ec;
-    fs::remove(path, ec);
+    fs::remove(resolved, ec);
     if (ec) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "rmdir", p.c_str(), ec);
+        return throwFsError(ctx, "rmdir", resolved.c_str(), ec);
     }
-
-    JS_FreeCString(ctx, path);
     return JS_UNDEFINED;
 }
 
@@ -452,8 +493,11 @@ static JSValue js_rmSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* a
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "rmSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     bool recursive = false;
     bool force = false;
@@ -469,24 +513,19 @@ static JSValue js_rmSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* a
     std::error_code ec;
 
     // Check if path exists first for force mode
-    if (!fs::exists(path, ec) && force) {
-        JS_FreeCString(ctx, path);
+    if (!fs::exists(resolved, ec) && force) {
         return JS_UNDEFINED;
     }
 
     if (recursive) {
-        fs::remove_all(path, ec);
+        fs::remove_all(resolved, ec);
     } else {
-        fs::remove(path, ec);
+        fs::remove(resolved, ec);
     }
 
     if (ec && !force) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "rm", p.c_str(), ec);
+        return throwFsError(ctx, "rm", resolved.c_str(), ec);
     }
-
-    JS_FreeCString(ctx, path);
     return JS_UNDEFINED;
 }
 
@@ -497,18 +536,17 @@ static JSValue js_unlinkSync(JSContext* ctx, JSValueConst, int argc, JSValueCons
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "unlinkSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     std::error_code ec;
-    fs::remove(path, ec);
+    fs::remove(resolved, ec);
     if (ec) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "unlink", p.c_str(), ec);
+        return throwFsError(ctx, "unlink", resolved.c_str(), ec);
     }
-
-    JS_FreeCString(ctx, path);
     return JS_UNDEFINED;
 }
 
@@ -519,23 +557,22 @@ static JSValue js_renameSync(JSContext* ctx, JSValueConst, int argc, JSValueCons
 {
     if (argc < 2) return JS_ThrowTypeError(ctx, "renameSync: oldPath and newPath required");
 
-    const char* oldPath = JS_ToCString(ctx, argv[0]);
-    if (!oldPath) return JS_EXCEPTION;
-    const char* newPath = JS_ToCString(ctx, argv[1]);
-    if (!newPath) { JS_FreeCString(ctx, oldPath); return JS_EXCEPTION; }
+    const char* rawOld = JS_ToCString(ctx, argv[0]);
+    if (!rawOld) return JS_EXCEPTION;
+    const char* rawNew = JS_ToCString(ctx, argv[1]);
+    if (!rawNew) { JS_FreeCString(ctx, rawOld); return JS_EXCEPTION; }
+
+    std::string resolvedOld = resolveFsPath(ctx, rawOld);
+    std::string resolvedNew = resolveFsPath(ctx, rawNew);
+    JS_FreeCString(ctx, rawOld);
+    JS_FreeCString(ctx, rawNew);
 
     std::error_code ec;
-    fs::rename(oldPath, newPath, ec);
+    fs::rename(resolvedOld, resolvedNew, ec);
 
     if (ec) {
-        std::string op(oldPath);
-        JS_FreeCString(ctx, oldPath);
-        JS_FreeCString(ctx, newPath);
-        return throwFsError(ctx, "rename", op.c_str(), ec);
+        return throwFsError(ctx, "rename", resolvedOld.c_str(), ec);
     }
-
-    JS_FreeCString(ctx, oldPath);
-    JS_FreeCString(ctx, newPath);
     return JS_UNDEFINED;
 }
 
@@ -546,23 +583,22 @@ static JSValue js_copyFileSync(JSContext* ctx, JSValueConst, int argc, JSValueCo
 {
     if (argc < 2) return JS_ThrowTypeError(ctx, "copyFileSync: src and dest required");
 
-    const char* src = JS_ToCString(ctx, argv[0]);
-    if (!src) return JS_EXCEPTION;
-    const char* dest = JS_ToCString(ctx, argv[1]);
-    if (!dest) { JS_FreeCString(ctx, src); return JS_EXCEPTION; }
+    const char* rawSrc = JS_ToCString(ctx, argv[0]);
+    if (!rawSrc) return JS_EXCEPTION;
+    const char* rawDest = JS_ToCString(ctx, argv[1]);
+    if (!rawDest) { JS_FreeCString(ctx, rawSrc); return JS_EXCEPTION; }
+
+    std::string resolvedSrc = resolveFsPath(ctx, rawSrc);
+    std::string resolvedDest = resolveFsPath(ctx, rawDest);
+    JS_FreeCString(ctx, rawSrc);
+    JS_FreeCString(ctx, rawDest);
 
     std::error_code ec;
-    fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
+    fs::copy_file(resolvedSrc, resolvedDest, fs::copy_options::overwrite_existing, ec);
 
     if (ec) {
-        std::string s(src);
-        JS_FreeCString(ctx, src);
-        JS_FreeCString(ctx, dest);
-        return throwFsError(ctx, "copyfile", s.c_str(), ec);
+        return throwFsError(ctx, "copyfile", resolvedSrc.c_str(), ec);
     }
-
-    JS_FreeCString(ctx, src);
-    JS_FreeCString(ctx, dest);
     return JS_UNDEFINED;
 }
 
@@ -573,8 +609,11 @@ static JSValue js_chmodSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
 {
     if (argc < 2) return JS_ThrowTypeError(ctx, "chmodSync: path and mode required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     int mode = 0;
     JS_ToInt32(ctx, &mode, argv[1]);
@@ -584,19 +623,15 @@ static JSValue js_chmodSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
     int wmode = 0;
     if (mode & 0444) wmode |= 0x100; // _S_IREAD
     if (mode & 0222) wmode |= 0x080; // _S_IWRITE
-    int result = _chmod(path, wmode);
+    int result = _chmod(resolved.c_str(), wmode);
 #else
-    int result = chmod(path, static_cast<mode_t>(mode));
+    int result = chmod(resolved.c_str(), static_cast<mode_t>(mode));
 #endif
 
     if (result != 0) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwErrno(ctx, "chmod", p.c_str(), "ENOENT",
-                          ("ENOENT: no such file or directory, chmod '" + p + "'").c_str());
+        return throwErrno(ctx, "chmod", resolved.c_str(), "ENOENT",
+                          ("ENOENT: no such file or directory, chmod '" + resolved + "'").c_str());
     }
-
-    JS_FreeCString(ctx, path);
     return JS_UNDEFINED;
 }
 
@@ -607,20 +642,19 @@ static JSValue js_realpathSync(JSContext* ctx, JSValueConst, int argc, JSValueCo
 {
     if (argc < 1) return JS_ThrowTypeError(ctx, "realpathSync: path required");
 
-    const char* path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+
+    std::string fsResolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
 
     std::error_code ec;
-    auto resolved = fs::canonical(path, ec);
+    auto canonical = fs::canonical(fsResolved, ec);
     if (ec) {
-        std::string p(path);
-        JS_FreeCString(ctx, path);
-        return throwFsError(ctx, "realpath", p.c_str(), ec);
+        return throwFsError(ctx, "realpath", fsResolved.c_str(), ec);
     }
 
-    JS_FreeCString(ctx, path);
-
-    std::string result = resolved.string();
+    std::string result = canonical.string();
     return JS_NewString(ctx, result.c_str());
 }
 
@@ -630,6 +664,9 @@ static JSValue js_realpathSync(JSContext* ctx, JSValueConst, int argc, JSValueCo
 void installFS(JSContext* ctx)
 {
     JSValue global = JS_GetGlobalObject(ctx);
+
+    // Initialize base-paths array for relative path resolution
+    JS_SetPropertyStr(ctx, global, kFsBasePathsKey, JS_NewArray(ctx));
 
     // Native sync functions as __brokit_fs_* globals
     JS_SetPropertyStr(ctx, global, "__brokit_fs_readFileSync",
@@ -671,6 +708,24 @@ void installFS(JSContext* ctx)
         Runtime::checkException(ctx, r);
     }
     JS_FreeValue(ctx, r);
+}
+
+void addFsBasePath(JSContext* ctx, const std::string& path)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue arr = JS_GetPropertyStr(ctx, global, kFsBasePathsKey);
+    if (!JS_IsArray(arr)) {
+        JS_FreeValue(ctx, arr);
+        arr = JS_NewArray(ctx);
+        JS_SetPropertyStr(ctx, global, kFsBasePathsKey, JS_DupValue(ctx, arr));
+    }
+    JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
+    int32_t len = 0;
+    JS_ToInt32(ctx, &len, lenVal);
+    JS_FreeValue(ctx, lenVal);
+    JS_SetPropertyUint32(ctx, arr, len, JS_NewString(ctx, path.c_str()));
+    JS_FreeValue(ctx, arr);
+    JS_FreeValue(ctx, global);
 }
 
 } // namespace brokit::api

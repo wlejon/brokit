@@ -56,4 +56,9 @@ void installNoise(JSContext* ctx);
 /// Call after installFetch() or installAll().
 void addFetchBasePath(JSContext* ctx, const std::string& path);
 
+/// Add a base path for fs module relative path resolution.
+/// Relative paths are resolved against base paths (last added = checked first).
+/// Call after installFS() or installAll().
+void addFsBasePath(JSContext* ctx, const std::string& path);
+
 } // namespace brokit::api
