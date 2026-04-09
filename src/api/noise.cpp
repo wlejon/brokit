@@ -8,7 +8,7 @@
 
 namespace brokit::api {
 
-static JSClassID noise_class_id = 0;
+static thread_local JSClassID noise_class_id = 0;
 
 struct NoiseWrapper {
     FastNoise::SmartNode<> node;
@@ -164,6 +164,64 @@ static JSValue noise_gen_uniform_grid_3d(JSContext* ctx, JSValueConst this_val,
                                xSize, ySize, zSize,
                                step, step, step, seed);
     return make_float32_array(ctx, output.data(), count);
+}
+
+// In-place overload: writes directly into a caller-supplied Float32Array.
+// Avoids the std::vector + JS_NewArrayBufferCopy allocations of the
+// allocating variant — the caller owns one reusable buffer for repeated calls.
+// Signature: genUniformGrid3DInto(dest, xOff, yOff, zOff, xSize, ySize, zSize, freq, seed)
+static JSValue noise_gen_uniform_grid_3d_into(JSContext* ctx, JSValueConst this_val,
+                                                int argc, JSValueConst* argv)
+{
+    auto* w = get_noise(ctx, this_val);
+    if (!w) return JS_EXCEPTION;
+    if (argc < 9)
+        return JS_ThrowTypeError(ctx, "genUniformGrid3DInto(dest, xOff, yOff, zOff, xSize, ySize, zSize, freq, seed)");
+
+    // Resolve destination Float32Array -> raw pointer
+    size_t byte_offset = 0, byte_len = 0, bpe = 0;
+    JSValue buf = JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_len, &bpe);
+    if (JS_IsException(buf)) {
+        // Clear the pending TypedArray exception so we can throw our own
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return JS_ThrowTypeError(ctx, "dest must be a Float32Array");
+    }
+    if (bpe != sizeof(float)) {
+        JS_FreeValue(ctx, buf);
+        return JS_ThrowTypeError(ctx, "dest must be a Float32Array");
+    }
+    size_t abLen = 0;
+    uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, buf);
+    JS_FreeValue(ctx, buf);
+    if (!abPtr)
+        return JS_ThrowTypeError(ctx, "dest has detached or invalid buffer");
+
+    double xOff, yOff, zOff, frequency;
+    int32_t xSize, ySize, zSize, seed;
+    if (JS_ToFloat64(ctx, &xOff, argv[1])) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &yOff, argv[2])) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &zOff, argv[3])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &xSize, argv[4])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &ySize, argv[5])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &zSize, argv[6])) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &frequency, argv[7])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &seed, argv[8])) return JS_EXCEPTION;
+
+    if (xSize <= 0 || ySize <= 0 || zSize <= 0)
+        return JS_ThrowRangeError(ctx, "Grid dimensions must be positive");
+
+    size_t count = static_cast<size_t>(xSize) * static_cast<size_t>(ySize) * static_cast<size_t>(zSize);
+    if (byte_len < count * sizeof(float))
+        return JS_ThrowRangeError(ctx, "dest too small: %zu floats required", count);
+
+    float* dest = reinterpret_cast<float*>(abPtr + byte_offset);
+    float step = static_cast<float>(frequency);
+    w->node->GenUniformGrid3D(dest,
+                               static_cast<float>(xOff), static_cast<float>(yOff),
+                               static_cast<float>(zOff),
+                               xSize, ySize, zSize,
+                               step, step, step, seed);
+    return JS_UNDEFINED;
 }
 
 static JSValue noise_gen_tileable_2d(JSContext* ctx, JSValueConst this_val,
@@ -465,10 +523,8 @@ void installNoise(JSContext* ctx)
 {
     JSRuntime* rt = JS_GetRuntime(ctx);
 
-    if (noise_class_id == 0) {
-        JS_NewClassID(rt, &noise_class_id);
-        JS_NewClass(rt, noise_class_id, &noise_class_def);
-    }
+    JS_NewClassID(rt, &noise_class_id);
+    JS_NewClass(rt, noise_class_id, &noise_class_def);
 
     // Prototype
     JSValue proto = JS_NewObject(ctx);
@@ -482,6 +538,8 @@ void installNoise(JSContext* ctx)
         JS_NewCFunction(ctx, noise_gen_uniform_grid_2d, "genUniformGrid2D", 6));
     JS_SetPropertyStr(ctx, proto, "genUniformGrid3D",
         JS_NewCFunction(ctx, noise_gen_uniform_grid_3d, "genUniformGrid3D", 8));
+    JS_SetPropertyStr(ctx, proto, "genUniformGrid3DInto",
+        JS_NewCFunction(ctx, noise_gen_uniform_grid_3d_into, "genUniformGrid3DInto", 9));
     JS_SetPropertyStr(ctx, proto, "genTileable2D",
         JS_NewCFunction(ctx, noise_gen_tileable_2d, "genTileable2D", 4));
 
