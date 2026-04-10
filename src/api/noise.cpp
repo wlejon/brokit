@@ -258,6 +258,34 @@ static JSValue noise_gen_tileable_2d(JSContext* ctx, JSValueConst this_val,
 //   - MemberHybrid (accepts either a float or a FastNoise node)
 // ---------------------------------------------------------------------------
 
+// Matches a user-supplied member name against a Metadata member.
+//
+// Simple (non per-dimension) members match by exact string equality. Per-
+// dimension members (those registered with AddPerDimensionVariable /
+// AddPerDimensionHybridSource) have 4 entries sharing the same name and
+// differing only by dimensionIdx (0..3 for X/Y/Z/W). We let the caller
+// disambiguate by writing the dimension as a suffix: "Multiplier Y" picks
+// the entry with base name "Multiplier" and dimensionIdx 1.
+static bool memberNameMatches(const char* query, const FastNoise::Metadata::Member& m)
+{
+    if (m.dimensionIdx < 0) {
+        // Non per-dimension: exact match
+        return strcmp(query, m.name) == 0;
+    }
+    // Per-dimension: expect "<BaseName> <X|Y|Z|W>"
+    size_t baseLen = strlen(m.name);
+    if (strncmp(query, m.name, baseLen) != 0) return false;
+    if (query[baseLen] != ' ') return false;
+    char dim = query[baseLen + 1];
+    if (query[baseLen + 2] != '\0') return false;
+    int queryIdx = (dim == 'X') ? 0
+                 : (dim == 'Y') ? 1
+                 : (dim == 'Z') ? 2
+                 : (dim == 'W') ? 3
+                 : -1;
+    return queryIdx == m.dimensionIdx;
+}
+
 static JSValue noise_set(JSContext* ctx, JSValueConst this_val,
                           int argc, JSValueConst* argv)
 {
@@ -274,7 +302,7 @@ static JSValue noise_set(JSContext* ctx, JSValueConst this_val,
 
     // Search MemberVariable (float, int, enum by name or enum string)
     for (const auto& mv : meta.memberVariables) {
-        if (strcmp(mv.name, name) != 0) continue;
+        if (!memberNameMatches(name, mv)) continue;
         JS_FreeCString(ctx, name);
 
         if (mv.type == FastNoise::Metadata::MemberVariable::EFloat) {
@@ -326,7 +354,7 @@ static JSValue noise_set(JSContext* ctx, JSValueConst this_val,
 
     // Search MemberNodeLookup (source connections)
     for (const auto& mn : meta.memberNodeLookups) {
-        if (strcmp(mn.name, name) != 0) continue;
+        if (!memberNameMatches(name, mn)) continue;
         JS_FreeCString(ctx, name);
 
         auto* sw = static_cast<NoiseWrapper*>(JS_GetOpaque2(ctx, val, noise_class_id));
@@ -339,7 +367,7 @@ static JSValue noise_set(JSContext* ctx, JSValueConst this_val,
 
     // Search MemberHybrid (float or node)
     for (const auto& mh : meta.memberHybrids) {
-        if (strcmp(mh.name, name) != 0) continue;
+        if (!memberNameMatches(name, mh)) continue;
         JS_FreeCString(ctx, name);
 
         // If value is a FastNoise node, connect it

@@ -15,7 +15,10 @@ struct BlobData {
     std::string type;
 };
 
-static JSClassID blobClassId = 0;
+// thread_local: each thread (main + each worker) has its own JSRuntime,
+// so each must allocate its own class ID from that runtime's counter.
+// Sharing across threads causes ID collisions with other classes.
+static thread_local JSClassID blobClassId = 0;
 
 static void blobFinalizer(JSRuntime*, JSValue val)
 {
@@ -292,7 +295,7 @@ struct FileData {
     double lastModified;
 };
 
-static JSClassID fileClassId = 0;
+static thread_local JSClassID fileClassId = 0;
 
 static void fileFinalizer(JSRuntime*, JSValue val)
 {
