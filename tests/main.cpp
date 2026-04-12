@@ -244,9 +244,13 @@ int main(int argc, char* argv[]) {
     }
 
     std::vector<std::string> testFiles;
-    for (auto& entry : fs::directory_iterator(testDir)) {
-        if (entry.path().extension() == ".js") {
-            testFiles.push_back(entry.path().string());
+    if (fs::is_regular_file(testDir) && fs::path(testDir).extension() == ".js") {
+        testFiles.push_back(testDir);
+    } else {
+        for (auto& entry : fs::directory_iterator(testDir)) {
+            if (entry.path().extension() == ".js") {
+                testFiles.push_back(entry.path().string());
+            }
         }
     }
     std::sort(testFiles.begin(), testFiles.end());

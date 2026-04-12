@@ -63,6 +63,7 @@ void installAll(JSContext* ctx)
     installTimers(ctx);
     installURL(ctx);
     installCrypto(ctx);
+    installSubtleCrypto(ctx);
     installEncoding(ctx);
     installTreeWalker(ctx);
     installAbortController(ctx);

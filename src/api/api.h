@@ -17,6 +17,7 @@ void installConsole(JSContext* ctx);
 void installTimers(JSContext* ctx);
 void installURL(JSContext* ctx);
 void installCrypto(JSContext* ctx);
+void installSubtleCrypto(JSContext* ctx);
 void installEncoding(JSContext* ctx);
 void installTreeWalker(JSContext* ctx);
 void installAbortController(JSContext* ctx);

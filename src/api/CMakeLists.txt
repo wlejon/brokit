@@ -54,6 +54,7 @@ set(BROKIT_API_SOURCES
     timers.cpp
     url.cpp
     crypto.cpp
+    crypto_subtle.cpp
     encoding.cpp
     treewalker.cpp
     abort.cpp
