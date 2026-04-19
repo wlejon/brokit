@@ -126,3 +126,7 @@ third_party/   QuickJS, libcurl, SQLite, FastNoise2
 - All state is per-JSContext, no globals
 - JS polyfills for complex logic, native C++ for performance-critical ops
 - Static CRT on Windows (runs in Windows Sandbox without vcruntime DLLs)
+
+## License
+
+[MIT](LICENSE)
