@@ -19,6 +19,15 @@ struct BlobData {
 // so each must allocate its own class ID from that runtime's counter.
 // Sharing across threads causes ID collisions with other classes.
 static thread_local JSClassID blobClassId = 0;
+static thread_local JSClassID fileClassId = 0;
+
+// File extends Blob — FileData embeds BlobData as its first member so methods
+// on Blob.prototype can retrieve the underlying bytes from a File instance.
+struct FileData {
+    BlobData blob;
+    std::string name;
+    double lastModified;
+};
 
 static void blobFinalizer(JSRuntime*, JSValue val)
 {
@@ -32,10 +41,16 @@ static JSClassDef blobClassDef = {
     nullptr, nullptr, nullptr
 };
 
-// Helper: extract bytes from a Blob JS object
+// Helper: extract bytes from a Blob or File JS object. File extends Blob,
+// so methods on Blob.prototype must accept File instances too.
 static BlobData* getBlobData(JSContext* ctx, JSValueConst val)
 {
-    return static_cast<BlobData*>(JS_GetOpaque2(ctx, val, blobClassId));
+    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(val, blobClassId));
+    if (bdata) return bdata;
+    auto* fdata = static_cast<FileData*>(JS_GetOpaque(val, fileClassId));
+    if (fdata) return &fdata->blob;
+    JS_ThrowTypeError(ctx, "not a Blob");
+    return nullptr;
 }
 
 // Helper: flatten a single "part" (string, ArrayBuffer, TypedArray, or Blob) into bytes
@@ -54,6 +69,11 @@ static bool flattenPart(JSContext* ctx, JSValueConst part, std::vector<uint8_t>&
 
     // Blob?
     auto* bdata = static_cast<BlobData*>(JS_GetOpaque(part, blobClassId));
+    if (!bdata) {
+        // File? (File extends Blob)
+        auto* fdata = static_cast<FileData*>(JS_GetOpaque(part, fileClassId));
+        if (fdata) bdata = &fdata->blob;
+    }
     if (bdata) {
         out.insert(out.end(), bdata->bytes.begin(), bdata->bytes.end());
         return true;
@@ -288,15 +308,8 @@ static JSValue js_blob_text(JSContext* ctx, JSValueConst this_val,
     return promise;
 }
 
-// File extends Blob — implemented as a separate class with same opaque type + name/lastModified
-struct FileData {
-    BlobData blob;
-    std::string name;
-    double lastModified;
-};
-
-static thread_local JSClassID fileClassId = 0;
-
+// File extends Blob — FileData is declared at top of file so getBlobData() can
+// unwrap File instances. fileClassId is also declared up top.
 static void fileFinalizer(JSRuntime*, JSValue val)
 {
     auto* data = static_cast<FileData*>(JS_GetOpaque(val, fileClassId));
