@@ -14,6 +14,9 @@ extern "C" {
 #include <windows.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace brokit::api {
