@@ -7,6 +7,9 @@
 #include <vector>
 #include <array>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <atomic>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -19,6 +22,29 @@
 #endif
 
 namespace brokit::api {
+
+// ---------------------------------------------------------------------------
+// Async spawn registry
+//
+// `spawn()` returns immediately with a child handle; JS polls __brokit_cp_childPoll
+// to learn when the child exits. We keep a small registry so we can hang on to
+// OS handles (Windows HANDLE, Linux pid) without leaking them.
+// ---------------------------------------------------------------------------
+struct ChildHandle {
+#ifdef _WIN32
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+#else
+    pid_t pid = 0;
+#endif
+    std::atomic<bool> finished{false};
+    int exitCode = -1;
+    std::string signal;
+};
+
+static std::mutex g_childMutex;
+static std::unordered_map<int, std::unique_ptr<ChildHandle>> g_children;
+static std::atomic<int> g_nextChildId{1};
 
 // ---------------------------------------------------------------------------
 // Helper: run a command and capture stdout/stderr
@@ -485,6 +511,202 @@ static JSValue js_spawnSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
 }
 
 // ---------------------------------------------------------------------------
+// __brokit_cp_spawnAsync(file, args, options)
+//
+// Non-blocking spawn: starts a detached child process and returns
+// { id, pid } immediately. Caller polls __brokit_cp_childPoll(id) to detect
+// exit. Child inherits no stdio pipes (keeps its own terminal/window).
+// ---------------------------------------------------------------------------
+static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "spawnAsync: file required");
+
+    const char* fileC = JS_ToCString(ctx, argv[0]);
+    if (!fileC) return JS_EXCEPTION;
+    std::string file(fileC);
+    JS_FreeCString(ctx, fileC);
+
+    std::vector<std::string> args;
+    if (argc >= 2 && JS_IsArray(argv[1])) {
+        uint32_t len = 0;
+        JSValue lenVal = JS_GetPropertyStr(ctx, argv[1], "length");
+        JS_ToUint32(ctx, &len, lenVal);
+        JS_FreeValue(ctx, lenVal);
+        for (uint32_t i = 0; i < len; i++) {
+            JSValue elem = JS_GetPropertyUint32(ctx, argv[1], i);
+            const char* a = JS_ToCString(ctx, elem);
+            if (a) { args.emplace_back(a); JS_FreeCString(ctx, a); }
+            JS_FreeValue(ctx, elem);
+        }
+    }
+
+    int optIdx = (argc >= 2 && JS_IsArray(argv[1])) ? 2 : 1;
+    auto opts = parseOptions(ctx, argc, argv, optIdx);
+
+    auto handle = std::make_unique<ChildHandle>();
+
+#ifdef _WIN32
+    // Build quoted command line
+    auto quote = [](const std::string& s) -> std::string {
+        if (s.find_first_of(" \t\"") == std::string::npos) return s;
+        std::string out = "\"";
+        for (char c : s) {
+            if (c == '"') out += "\\\"";
+            else out += c;
+        }
+        out += "\"";
+        return out;
+    };
+    std::string cmdLine = quote(file);
+    for (auto& a : args) { cmdLine += " "; cmdLine += quote(a); }
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+
+    BOOL ok = CreateProcessA(
+        nullptr,
+        cmdLine.data(),
+        nullptr, nullptr,
+        FALSE,
+        0, // no CREATE_NO_WINDOW — let GUI children show their window
+        nullptr,
+        opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
+        &si, &pi);
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        return JS_ThrowInternalError(ctx, "spawn failed: CreateProcess error %lu", err);
+    }
+    CloseHandle(pi.hThread);
+    handle->process = pi.hProcess;
+    handle->pid = pi.dwProcessId;
+#else
+    pid_t pid = fork();
+    if (pid < 0) {
+        return JS_ThrowInternalError(ctx, "spawn failed: fork");
+    }
+    if (pid == 0) {
+        // Child
+        if (!opts.cwd.empty()) {
+            if (chdir(opts.cwd.c_str()) != 0) _exit(127);
+        }
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(file.c_str()));
+        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp(file.c_str(), argv.data());
+        _exit(127);
+    }
+    handle->pid = pid;
+#endif
+
+    int id = g_nextChildId.fetch_add(1);
+    int pidVal = (int)handle->pid;
+    {
+        std::lock_guard<std::mutex> lock(g_childMutex);
+        g_children[id] = std::move(handle);
+    }
+
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "id", JS_NewInt32(ctx, id));
+    JS_SetPropertyStr(ctx, obj, "pid", JS_NewInt32(ctx, pidVal));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// __brokit_cp_childPoll(id)
+//
+// Returns null if the child is still running, or { exitCode, signal } if it
+// has exited. After a non-null return the handle is released from the
+// registry — subsequent polls throw.
+// ---------------------------------------------------------------------------
+static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "childPoll: id required");
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+
+    ChildHandle* h = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_childMutex);
+        auto it = g_children.find(id);
+        if (it == g_children.end()) {
+            return JS_ThrowRangeError(ctx, "childPoll: unknown child id %d", id);
+        }
+        h = it->second.get();
+    }
+
+#ifdef _WIN32
+    DWORD status = WaitForSingleObject(h->process, 0);
+    if (status == WAIT_TIMEOUT) {
+        return JS_NULL;
+    }
+    DWORD code = 0;
+    GetExitCodeProcess(h->process, &code);
+    CloseHandle(h->process);
+    int exitCode = (int)code;
+#else
+    int status = 0;
+    pid_t r = waitpid(h->pid, &status, WNOHANG);
+    if (r == 0) return JS_NULL;
+    int exitCode = -1;
+    std::string sig;
+    if (r > 0) {
+        if (WIFEXITED(status)) exitCode = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) { exitCode = 128 + WTERMSIG(status); sig = "SIG" + std::to_string(WTERMSIG(status)); }
+    }
+#endif
+
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "exitCode", JS_NewInt32(ctx, exitCode));
+#ifdef _WIN32
+    JS_SetPropertyStr(ctx, obj, "signal", JS_NULL);
+#else
+    if (sig.empty()) JS_SetPropertyStr(ctx, obj, "signal", JS_NULL);
+    else JS_SetPropertyStr(ctx, obj, "signal", JS_NewString(ctx, sig.c_str()));
+#endif
+
+    {
+        std::lock_guard<std::mutex> lock(g_childMutex);
+        g_children.erase(id);
+    }
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// __brokit_cp_childKill(id, signal?)
+// Returns true if a kill was issued. After kill the child still needs a
+// subsequent poll to observe exit.
+// ---------------------------------------------------------------------------
+static JSValue js_childKill(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "childKill: id required");
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+
+    std::lock_guard<std::mutex> lock(g_childMutex);
+    auto it = g_children.find(id);
+    if (it == g_children.end()) return JS_FALSE;
+    ChildHandle* h = it->second.get();
+#ifdef _WIN32
+    TerminateProcess(h->process, 1);
+#else
+    int sig = SIGTERM;
+    if (argc >= 2 && JS_IsString(argv[1])) {
+        const char* s = JS_ToCString(ctx, argv[1]);
+        if (s) {
+            if (strcmp(s, "SIGKILL") == 0) sig = SIGKILL;
+            else if (strcmp(s, "SIGINT") == 0) sig = SIGINT;
+            JS_FreeCString(ctx, s);
+        }
+    }
+    ::kill(h->pid, sig);
+#endif
+    return JS_TRUE;
+}
+
+// ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 void installChildProcess(JSContext* ctx)
@@ -497,6 +719,12 @@ void installChildProcess(JSContext* ctx)
                       JS_NewCFunction(ctx, js_cp_exec, "__brokit_cp_exec", 2));
     JS_SetPropertyStr(ctx, global, "__brokit_cp_spawnSync",
                       JS_NewCFunction(ctx, js_spawnSync, "spawnSync", 3));
+    JS_SetPropertyStr(ctx, global, "__brokit_cp_spawnAsync",
+                      JS_NewCFunction(ctx, js_spawnAsync, "__brokit_cp_spawnAsync", 3));
+    JS_SetPropertyStr(ctx, global, "__brokit_cp_childPoll",
+                      JS_NewCFunction(ctx, js_childPoll, "__brokit_cp_childPoll", 1));
+    JS_SetPropertyStr(ctx, global, "__brokit_cp_childKill",
+                      JS_NewCFunction(ctx, js_childKill, "__brokit_cp_childKill", 2));
 
     JS_FreeValue(ctx, global);
 
