@@ -77,108 +77,107 @@
     // performance.now — monotonic time, plus the User Timing API:
     // mark(name), measure(name, startMark?, endMark?), getEntries*, clearMarks,
     // clearMeasures. Entries are PerformanceEntry-like plain objects.
-    if (typeof globalThis.performance === 'undefined') {
+    // The host runtime (e.g. bro) may pre-install a performance object with
+    // just .now(); in that case we augment it in place rather than replace.
+    var _perfHost = globalThis.performance;
+    var _needsPerfInit = typeof _perfHost === 'undefined';
+    var _needsTimingApi = _needsPerfInit ||
+        typeof _perfHost.mark !== 'function';
+    if (_needsTimingApi) {
         var _startTime = globalThis.__brokit_now();
         var _entries = [];
         var _marks = Object.create(null);
 
-        function _findLast(name) {
-            for (var i = _entries.length - 1; i >= 0; i--) {
-                var e = _entries[i];
-                if (e.name === name) return e;
-            }
-            return null;
+        var _target;
+        if (_needsPerfInit) {
+            _target = { now: function() { return globalThis.__brokit_now() - _startTime; } };
+            globalThis.performance = _target;
+        } else {
+            _target = _perfHost;
         }
 
-        globalThis.performance = {
-            now: function() { return globalThis.__brokit_now() - _startTime; },
-
-            mark: function(name, options) {
-                var startTime = (options && typeof options.startTime === 'number')
-                    ? options.startTime
-                    : this.now();
-                var entry = {
-                    name: String(name), entryType: 'mark',
-                    startTime: startTime, duration: 0,
-                    detail: options ? options.detail : null
-                };
-                _entries.push(entry);
-                _marks[entry.name] = entry;
-                return entry;
-            },
-
-            measure: function(name, startOrOptions, endMark) {
-                var startTime = 0, endTime = this.now(), detail = null;
-                if (typeof startOrOptions === 'object' && startOrOptions !== null) {
-                    // measure(name, { start, end, duration, detail })
-                    if (typeof startOrOptions.start === 'string') {
-                        var s = _marks[startOrOptions.start];
-                        if (!s) throw new Error("Mark '" + startOrOptions.start + "' not found");
-                        startTime = s.startTime;
-                    } else if (typeof startOrOptions.start === 'number') {
-                        startTime = startOrOptions.start;
-                    }
-                    if (typeof startOrOptions.end === 'string') {
-                        var e = _marks[startOrOptions.end];
-                        if (!e) throw new Error("Mark '" + startOrOptions.end + "' not found");
-                        endTime = e.startTime;
-                    } else if (typeof startOrOptions.end === 'number') {
-                        endTime = startOrOptions.end;
-                    }
-                    if (typeof startOrOptions.duration === 'number') {
-                        if (typeof startOrOptions.start !== 'undefined') {
-                            endTime = startTime + startOrOptions.duration;
-                        } else if (typeof startOrOptions.end !== 'undefined') {
-                            startTime = endTime - startOrOptions.duration;
-                        }
-                    }
-                    detail = startOrOptions.detail || null;
-                } else {
-                    if (typeof startOrOptions === 'string') {
-                        var sm = _marks[startOrOptions];
-                        if (!sm) throw new Error("Mark '" + startOrOptions + "' not found");
-                        startTime = sm.startTime;
-                    }
-                    if (typeof endMark === 'string') {
-                        var em = _marks[endMark];
-                        if (!em) throw new Error("Mark '" + endMark + "' not found");
-                        endTime = em.startTime;
+        _target.mark = function(name, options) {
+            var startTime = (options && typeof options.startTime === 'number')
+                ? options.startTime
+                : _target.now();
+            var entry = {
+                name: String(name), entryType: 'mark',
+                startTime: startTime, duration: 0,
+                detail: options ? options.detail : null
+            };
+            _entries.push(entry);
+            _marks[entry.name] = entry;
+            return entry;
+        };
+        _target.measure = function(name, startOrOptions, endMark) {
+            var startTime = 0, endTime = _target.now(), detail = null;
+            if (typeof startOrOptions === 'object' && startOrOptions !== null) {
+                if (typeof startOrOptions.start === 'string') {
+                    var s = _marks[startOrOptions.start];
+                    if (!s) throw new Error("Mark '" + startOrOptions.start + "' not found");
+                    startTime = s.startTime;
+                } else if (typeof startOrOptions.start === 'number') {
+                    startTime = startOrOptions.start;
+                }
+                if (typeof startOrOptions.end === 'string') {
+                    var e = _marks[startOrOptions.end];
+                    if (!e) throw new Error("Mark '" + startOrOptions.end + "' not found");
+                    endTime = e.startTime;
+                } else if (typeof startOrOptions.end === 'number') {
+                    endTime = startOrOptions.end;
+                }
+                if (typeof startOrOptions.duration === 'number') {
+                    if (typeof startOrOptions.start !== 'undefined') {
+                        endTime = startTime + startOrOptions.duration;
+                    } else if (typeof startOrOptions.end !== 'undefined') {
+                        startTime = endTime - startOrOptions.duration;
                     }
                 }
-                var entry = {
-                    name: String(name), entryType: 'measure',
-                    startTime: startTime, duration: endTime - startTime,
-                    detail: detail
-                };
-                _entries.push(entry);
-                return entry;
-            },
-
-            getEntries: function() { return _entries.slice(); },
-            getEntriesByName: function(name, type) {
-                return _entries.filter(function(e) {
-                    return e.name === name && (!type || e.entryType === type);
-                });
-            },
-            getEntriesByType: function(type) {
-                return _entries.filter(function(e) { return e.entryType === type; });
-            },
-            clearMarks: function(name) {
-                _entries = _entries.filter(function(e) {
-                    if (e.entryType !== 'mark') return true;
-                    if (name && e.name !== name) return true;
-                    return false;
-                });
-                if (name) delete _marks[name];
-                else _marks = Object.create(null);
-            },
-            clearMeasures: function(name) {
-                _entries = _entries.filter(function(e) {
-                    if (e.entryType !== 'measure') return true;
-                    if (name && e.name !== name) return true;
-                    return false;
-                });
+                detail = startOrOptions.detail || null;
+            } else {
+                if (typeof startOrOptions === 'string') {
+                    var sm = _marks[startOrOptions];
+                    if (!sm) throw new Error("Mark '" + startOrOptions + "' not found");
+                    startTime = sm.startTime;
+                }
+                if (typeof endMark === 'string') {
+                    var em = _marks[endMark];
+                    if (!em) throw new Error("Mark '" + endMark + "' not found");
+                    endTime = em.startTime;
+                }
             }
+            var entry = {
+                name: String(name), entryType: 'measure',
+                startTime: startTime, duration: endTime - startTime,
+                detail: detail
+            };
+            _entries.push(entry);
+            return entry;
+        };
+        _target.getEntries = function() { return _entries.slice(); };
+        _target.getEntriesByName = function(name, type) {
+            return _entries.filter(function(e) {
+                return e.name === name && (!type || e.entryType === type);
+            });
+        };
+        _target.getEntriesByType = function(type) {
+            return _entries.filter(function(e) { return e.entryType === type; });
+        };
+        _target.clearMarks = function(name) {
+            _entries = _entries.filter(function(e) {
+                if (e.entryType !== 'mark') return true;
+                if (name && e.name !== name) return true;
+                return false;
+            });
+            if (name) delete _marks[name];
+            else _marks = Object.create(null);
+        };
+        _target.clearMeasures = function(name) {
+            _entries = _entries.filter(function(e) {
+                if (e.entryType !== 'measure') return true;
+                if (name && e.name !== name) return true;
+                return false;
+            });
         };
     }
 
