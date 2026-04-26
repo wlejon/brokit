@@ -30,6 +30,7 @@ void installPath(JSContext* ctx);
 void installReadableStream(JSContext* ctx);
 void installFetch(JSContext* ctx);
 void installFS(JSContext* ctx);
+void installFSWatch(JSContext* ctx);
 void installChildProcess(JSContext* ctx);
 void installStorage(JSContext* ctx);
 void setStoragePath(JSContext* ctx, const std::string& path);

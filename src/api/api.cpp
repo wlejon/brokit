@@ -80,6 +80,7 @@ void installAll(JSContext* ctx)
     installFetch(ctx);
     installWritableStream(ctx);
     installFS(ctx);
+    installFSWatch(ctx);
     installChildProcess(ctx);
     installWebSocket(ctx);
     installWebSocketJS(ctx);

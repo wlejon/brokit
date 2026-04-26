@@ -45,6 +45,7 @@ embed_js(base64.js          js_base64)
 embed_js(navigator.js       js_navigator)
 embed_js(event_target.js    js_event_target)
 embed_js(message_channel.js js_message_channel)
+embed_js(fs_watch.js        js_fs_watch)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,10 @@ set(BROKIT_API_SOURCES
     readable_stream.cpp
     fetch.cpp
     fs.cpp
+    fs_watch.cpp
+    fs_watch_linux.cpp
+    fs_watch_macos.cpp
+    fs_watch_windows.cpp
     child_process.cpp
     writable_stream.cpp
     websocket.cpp
@@ -101,4 +106,13 @@ target_include_directories(brokit_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party/qu
 if(BROKIT_ENABLE_NOISE)
     target_link_libraries(brokit_api PUBLIC FastNoise)
     target_compile_definitions(brokit_api PUBLIC BROKIT_HAS_NOISE)
+endif()
+
+# fs.watch — native filesystem watcher uses one OS thread per watcher.
+# Threads is required on Linux for std::thread; macOS needs the CoreServices
+# framework for FSEvents.
+find_package(Threads REQUIRED)
+target_link_libraries(brokit_api PUBLIC Threads::Threads)
+if(APPLE)
+    target_link_libraries(brokit_api PUBLIC "-framework CoreServices" "-framework CoreFoundation")
 endif()

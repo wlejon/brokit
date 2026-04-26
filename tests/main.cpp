@@ -114,11 +114,14 @@ static TestResult runTestFile(const std::string& path) {
         JSValue fetchTick = JS_GetPropertyStr(ctx, global2, "__brokit_fetch_tick");
         JSValue wsHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_ws_has_pending");
         JSValue wsTick = JS_GetPropertyStr(ctx, global2, "__brokit_ws_tick");
+        JSValue fwHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_has_pending");
+        JSValue fwTick = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_tick");
 
         bool haveFetch = JS_IsFunction(ctx, fetchHasPending) && JS_IsFunction(ctx, fetchTick);
         bool haveWs = JS_IsFunction(ctx, wsHasPending) && JS_IsFunction(ctx, wsTick);
+        bool haveFw = JS_IsFunction(ctx, fwHasPending) && JS_IsFunction(ctx, fwTick);
 
-        if (haveFetch || haveWs) {
+        if (haveFetch || haveWs || haveFw) {
             for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
                 bool anyPending = false;
 
@@ -140,6 +143,15 @@ static TestResult runTestFile(const std::string& path) {
                     JS_FreeValue(ctx, tr);
                 }
 
+                if (haveFw) {
+                    JSValue p = JS_Call(ctx, fwHasPending, global2, 0, nullptr);
+                    if (JS_ToBool(ctx, p)) anyPending = true;
+                    JS_FreeValue(ctx, p);
+
+                    JSValue tr = JS_Call(ctx, fwTick, global2, 0, nullptr);
+                    JS_FreeValue(ctx, tr);
+                }
+
                 rt.executePendingJobs();
                 if (!anyPending) break;
 
@@ -151,6 +163,8 @@ static TestResult runTestFile(const std::string& path) {
             }
         }
 
+        JS_FreeValue(ctx, fwTick);
+        JS_FreeValue(ctx, fwHasPending);
         JS_FreeValue(ctx, wsTick);
         JS_FreeValue(ctx, wsHasPending);
         JS_FreeValue(ctx, fetchTick);
