@@ -63,4 +63,17 @@ void addFetchBasePath(JSContext* ctx, const std::string& path);
 /// Call after installFS() or installAll().
 void addFsBasePath(JSContext* ctx, const std::string& path);
 
+/// Mount a virtual prefix for both fs and fetch resolution. Paths beginning
+/// with "<prefix>/..." (or exactly "<prefix>") are rewritten to
+/// "<absPath>/<remainder>" before any base-path lookup.
+///
+/// Mount prefixes always start with `/` and have no trailing slash. The
+/// rewritten absolute path takes precedence over both base paths and the
+/// filesystem-absolute interpretation, so `/lib/foo.js` resolves through
+/// the mount even when `/lib/foo.js` happens to exist on disk.
+///
+/// Call after installFS() / installFetch() / installAll().
+void addFsPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath);
+void addFetchPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath);
+
 } // namespace brokit::api

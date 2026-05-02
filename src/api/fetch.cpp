@@ -119,8 +119,15 @@ static std::string detectMimeType(const std::string& path)
     return "application/octet-stream";
 }
 
+// Defined in fs.cpp — engine prefix mounts (e.g. /lib, /system).
+extern std::string resolveBrokitPrefixMount(JSContext* ctx, const std::string& path);
+
 static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
 {
+    // Engine-supplied prefix mounts win over basePath resolution.
+    std::string mounted = resolveBrokitPrefixMount(ctx, url);
+    if (!mounted.empty()) return mounted;
+
     // Strip leading ./
     std::string clean = url;
     if (clean.size() >= 2 && clean[0] == '.' && clean[1] == '/')

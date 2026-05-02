@@ -25,10 +25,72 @@ namespace brokit::api {
 // Key for the base-paths array stored on globalThis
 static const char* kFsBasePathsKey = "__brokit_fs_base_paths";
 
-// Resolve a relative path against registered base paths.
+// Key for the prefix-mounts object stored on globalThis. Shared by fs and
+// fetch — both consult this map to rewrite paths beginning with /<prefix>/.
+static const char* kPathMountsKey = "__brokit_path_mounts";
+
+/// Look up a path against globalThis.__brokit_path_mounts. If `path` begins
+/// with `<prefix>/...` (or equals `<prefix>`) for any registered mount,
+/// return the rewritten absolute disk path. Otherwise return empty string.
+/// Exposed (extern "C"-internally) so fetch.cpp can call it too.
+std::string resolveBrokitPrefixMount(JSContext* ctx, const std::string& path)
+{
+    if (path.empty() || path[0] != '/') return {};
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue obj = JS_GetPropertyStr(ctx, global, kPathMountsKey);
+    if (!JS_IsObject(obj)) {
+        JS_FreeValue(ctx, obj);
+        JS_FreeValue(ctx, global);
+        return {};
+    }
+
+    JSPropertyEnum* tab = nullptr;
+    uint32_t len = 0;
+    std::string best, bestRewrite;
+    if (JS_GetOwnPropertyNames(ctx, &tab, &len, obj,
+                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0)
+    {
+        for (uint32_t i = 0; i < len; i++) {
+            const char* keyC = JS_AtomToCString(ctx, tab[i].atom);
+            if (!keyC) continue;
+            std::string prefix(keyC);
+            JS_FreeCString(ctx, keyC);
+
+            if (path.size() >= prefix.size() &&
+                path.compare(0, prefix.size(), prefix) == 0 &&
+                (path.size() == prefix.size() || path[prefix.size()] == '/'))
+            {
+                if (prefix.size() > best.size()) {
+                    JSValue v = JS_GetProperty(ctx, obj, tab[i].atom);
+                    const char* targetC = JS_ToCString(ctx, v);
+                    JS_FreeValue(ctx, v);
+                    if (targetC) {
+                        best = prefix;
+                        bestRewrite = std::string(targetC) + path.substr(prefix.size());
+                        JS_FreeCString(ctx, targetC);
+                    }
+                }
+            }
+        }
+        for (uint32_t i = 0; i < len; i++) JS_FreeAtom(ctx, tab[i].atom);
+        js_free(ctx, tab);
+    }
+
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, global);
+    return bestRewrite;
+}
+
+// Resolve a path against engine prefix mounts and registered base paths.
 // Returns the first path that exists, or the original path if none match.
 static std::string resolveFsPath(JSContext* ctx, const char* path)
 {
+    // Engine-supplied prefix mounts (e.g. /lib, /system) win over both
+    // basePath resolution and filesystem-absolute interpretation.
+    std::string mounted = resolveBrokitPrefixMount(ctx, std::string(path));
+    if (!mounted.empty()) return mounted;
+
     // Absolute paths are returned as-is
     fs::path p(path);
     if (p.is_absolute()) return path;
@@ -726,6 +788,34 @@ void addFsBasePath(JSContext* ctx, const std::string& path)
     JS_SetPropertyUint32(ctx, arr, len, JS_NewString(ctx, path.c_str()));
     JS_FreeValue(ctx, arr);
     JS_FreeValue(ctx, global);
+}
+
+// Internal: shared mount registration used by both fs and fetch entry points.
+static void addPrefixMountInternal(JSContext* ctx, const std::string& prefix,
+                                   const std::string& absPath)
+{
+    if (prefix.empty() || prefix[0] != '/') return;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue obj = JS_GetPropertyStr(ctx, global, kPathMountsKey);
+    if (!JS_IsObject(obj)) {
+        JS_FreeValue(ctx, obj);
+        obj = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, global, kPathMountsKey, JS_DupValue(ctx, obj));
+    }
+    JS_SetPropertyStr(ctx, obj, prefix.c_str(),
+                      JS_NewString(ctx, absPath.c_str()));
+    JS_FreeValue(ctx, obj);
+    JS_FreeValue(ctx, global);
+}
+
+void addFsPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath)
+{
+    addPrefixMountInternal(ctx, prefix, absPath);
+}
+
+void addFetchPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath)
+{
+    addPrefixMountInternal(ctx, prefix, absPath);
 }
 
 } // namespace brokit::api
