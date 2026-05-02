@@ -83,8 +83,16 @@ std::string resolveBrokitPrefixMount(JSContext* ctx, const std::string& path)
 }
 
 // Resolve a path against engine prefix mounts and registered base paths.
-// Returns the first path that exists, or the original path if none match.
-static std::string resolveFsPath(JSContext* ctx, const char* path)
+// Read mode (forCreate=false): returns the first existing candidate, or the
+// raw path when nothing exists (which then resolves against process CWD —
+// fine, the call will fail naturally with ENOENT).
+// Create mode (forCreate=true): used by writeFileSync / mkdirSync / etc.
+// where the target path may not exist yet. If no existing candidate is
+// found, fall back to the most-recently-added basePath instead of CWD so
+// app-relative writes land in the app's directory, not wherever the binary
+// was launched from.
+static std::string resolveFsPath(JSContext* ctx, const char* path,
+                                 bool forCreate = false)
 {
     // Engine-supplied prefix mounts (e.g. /lib, /system) win over both
     // basePath resolution and filesystem-absolute interpretation.
@@ -96,6 +104,7 @@ static std::string resolveFsPath(JSContext* ctx, const char* path)
     if (p.is_absolute()) return path;
 
     // Check base paths (last added = checked first, like fetch)
+    std::string topBase;
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue arr = JS_GetPropertyStr(ctx, global, kFsBasePathsKey);
     if (JS_IsArray(arr)) {
@@ -111,6 +120,7 @@ static std::string resolveFsPath(JSContext* ctx, const char* path)
             if (!base) continue;
 
             fs::path candidate = fs::path(base) / path;
+            if (topBase.empty()) topBase = base;
             JS_FreeCString(ctx, base);
 
             std::error_code ec;
@@ -123,6 +133,12 @@ static std::string resolveFsPath(JSContext* ctx, const char* path)
     }
     JS_FreeValue(ctx, arr);
     JS_FreeValue(ctx, global);
+
+    // Create mode: nothing existed; anchor the new path under the most-
+    // recently-registered basePath (the app dir) instead of process CWD.
+    if (forCreate && !topBase.empty()) {
+        return (fs::path(topBase) / path).string();
+    }
 
     // No match — return original (will fail naturally)
     return path;
@@ -232,7 +248,7 @@ static JSValue js_writeFileSync(JSContext* ctx, JSValueConst, int argc, JSValueC
     const char* rawPath = JS_ToCString(ctx, argv[0]);
     if (!rawPath) return JS_EXCEPTION;
 
-    std::string pathStr = resolveFsPath(ctx, rawPath);
+    std::string pathStr = resolveFsPath(ctx, rawPath, /*forCreate=*/true);
     JS_FreeCString(ctx, rawPath);
 
     // Get data as bytes
@@ -289,7 +305,7 @@ static JSValue js_appendFileSync(JSContext* ctx, JSValueConst, int argc, JSValue
     const char* rawPath = JS_ToCString(ctx, argv[0]);
     if (!rawPath) return JS_EXCEPTION;
 
-    std::string pathStr = resolveFsPath(ctx, rawPath);
+    std::string pathStr = resolveFsPath(ctx, rawPath, /*forCreate=*/true);
     JS_FreeCString(ctx, rawPath);
 
     std::string data;
@@ -502,7 +518,7 @@ static JSValue js_mkdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
     const char* rawPath = JS_ToCString(ctx, argv[0]);
     if (!rawPath) return JS_EXCEPTION;
 
-    std::string resolved = resolveFsPath(ctx, rawPath);
+    std::string resolved = resolveFsPath(ctx, rawPath, /*forCreate=*/true);
     JS_FreeCString(ctx, rawPath);
 
     bool recursive = false;
@@ -625,7 +641,7 @@ static JSValue js_renameSync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     if (!rawNew) { JS_FreeCString(ctx, rawOld); return JS_EXCEPTION; }
 
     std::string resolvedOld = resolveFsPath(ctx, rawOld);
-    std::string resolvedNew = resolveFsPath(ctx, rawNew);
+    std::string resolvedNew = resolveFsPath(ctx, rawNew, /*forCreate=*/true);
     JS_FreeCString(ctx, rawOld);
     JS_FreeCString(ctx, rawNew);
 
@@ -651,7 +667,7 @@ static JSValue js_copyFileSync(JSContext* ctx, JSValueConst, int argc, JSValueCo
     if (!rawDest) { JS_FreeCString(ctx, rawSrc); return JS_EXCEPTION; }
 
     std::string resolvedSrc = resolveFsPath(ctx, rawSrc);
-    std::string resolvedDest = resolveFsPath(ctx, rawDest);
+    std::string resolvedDest = resolveFsPath(ctx, rawDest, /*forCreate=*/true);
     JS_FreeCString(ctx, rawSrc);
     JS_FreeCString(ctx, rawDest);
 
