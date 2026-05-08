@@ -29,6 +29,10 @@ void installOS(JSContext* ctx);
 void installPath(JSContext* ctx);
 void installReadableStream(JSContext* ctx);
 void installFetch(JSContext* ctx);
+/// Tear down per-context fetch state. Cancels in-flight requests, frees curl
+/// handles, and releases owned JSValues. Call before JS_FreeContext if the
+/// runtime is being destroyed while fetches may still be pending.
+void uninstallFetch(JSContext* ctx);
 void installFS(JSContext* ctx);
 void installFSWatch(JSContext* ctx);
 void installChildProcess(JSContext* ctx);

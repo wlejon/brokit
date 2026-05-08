@@ -46,6 +46,7 @@ embed_js(navigator.js       js_navigator)
 embed_js(event_target.js    js_event_target)
 embed_js(message_channel.js js_message_channel)
 embed_js(fs_watch.js        js_fs_watch)
+embed_js(fetch_helpers.js   js_fetch_helpers)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 

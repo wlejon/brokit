@@ -1,11 +1,12 @@
 #include "api/api.h"
 #include "runtime/runtime.h"
+#include "fetch_helpers.js.h"
 
 #include <cstring>
 #include <string>
 #include <vector>
+#include <memory>
 #include <unordered_map>
-#include <mutex>
 #include <fstream>
 #include <algorithm>
 
@@ -17,31 +18,26 @@ namespace brokit::api {
 // Per-request state
 // ---------------------------------------------------------------------------
 struct FetchRequest {
-    // Curl handle
     CURL* easy = nullptr;
 
-    // Promise resolve/reject functions
     JSValue resolving[2] = { JS_UNDEFINED, JS_UNDEFINED };
     JSContext* ctx = nullptr;
 
-    // Response data — full body accumulation (for .text()/.json() shortcut)
     std::vector<uint8_t> body;
     std::vector<std::string> headers;
     long statusCode = 0;
     std::string statusText;
     std::string url;
 
-    // Request body for POST etc.
     std::vector<uint8_t> requestBody;
     struct curl_slist* requestHeaders = nullptr;
 
-    // Streaming support
     int streamId = 0;
     bool headersResolved = false;
     bool bodyComplete = false;
     bool hasReceivedData = false;
-    std::vector<std::vector<uint8_t>> chunks;  // individual chunks for streaming
-    JSValue waitCallback = JS_UNDEFINED;        // called when data/done available
+    std::vector<std::vector<uint8_t>> chunks;
+    JSValue waitCallback = JS_UNDEFINED;
 
     ~FetchRequest() {
         if (requestHeaders) curl_slist_free_all(requestHeaders);
@@ -49,12 +45,36 @@ struct FetchRequest {
 };
 
 // ---------------------------------------------------------------------------
-// Global state
+// Per-context state. Mirrors the pattern used in fs_watch.cpp.
 // ---------------------------------------------------------------------------
-static CURLM* g_multi = nullptr;
-static std::vector<FetchRequest*> g_pending;        // active curl handles
-static std::unordered_map<int, FetchRequest*> g_streams; // stream ID -> request
-static int g_nextStreamId = 1;
+namespace {
+
+// Ownership model: `streams` owns every live FetchRequest (keyed by streamId).
+// `pending` is a non-owning working set of in-flight curl handles consulted
+// each tick(); entries are removed from `pending` when curl reports DONE,
+// but the request stays in `streams` until JS finishes draining the body.
+struct CtxState {
+    CURLM* multi = nullptr;
+    std::unordered_map<int, std::unique_ptr<FetchRequest>> streams;
+    std::vector<FetchRequest*> pending; // non-owning view into streams
+    int nextStreamId = 1;
+};
+
+static std::unordered_map<JSContext*, CtxState> g_state;
+
+CtxState& stateOf(JSContext* ctx) { return g_state[ctx]; }
+CtxState* findState(JSContext* ctx) {
+    auto it = g_state.find(ctx);
+    return it == g_state.end() ? nullptr : &it->second;
+}
+
+void removePending(CtxState& s, FetchRequest* req) {
+    for (auto it = s.pending.begin(); it != s.pending.end(); ++it) {
+        if (*it == req) { s.pending.erase(it); return; }
+    }
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Per-context fetch base path stack (last added = checked first)
@@ -81,6 +101,30 @@ static std::vector<std::string> getBasePaths(JSContext* ctx)
     JS_FreeValue(ctx, arr);
     JS_FreeValue(ctx, global);
     return paths;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers backed by JS factories from fetch_helpers.js
+// ---------------------------------------------------------------------------
+static JSValue callInternal(JSContext* ctx, const char* fnName,
+                            int argc, JSValueConst* argv)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue internals = JS_GetPropertyStr(ctx, global, "__brokit_fetch_internals");
+    JS_FreeValue(ctx, global);
+    if (!JS_IsObject(internals)) {
+        JS_FreeValue(ctx, internals);
+        return JS_ThrowInternalError(ctx, "fetch: internals not installed");
+    }
+    JSValue fn = JS_GetPropertyStr(ctx, internals, fnName);
+    JS_FreeValue(ctx, internals);
+    if (!JS_IsFunction(ctx, fn)) {
+        JS_FreeValue(ctx, fn);
+        return JS_ThrowInternalError(ctx, "fetch: missing internal helper '%s'", fnName);
+    }
+    JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, argc, argv);
+    JS_FreeValue(ctx, fn);
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,23 +168,18 @@ extern std::string resolveBrokitPrefixMount(JSContext* ctx, const std::string& p
 
 static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
 {
-    // Engine-supplied prefix mounts win over basePath resolution.
     std::string mounted = resolveBrokitPrefixMount(ctx, url);
     if (!mounted.empty()) return mounted;
 
-    // Strip leading ./
     std::string clean = url;
     if (clean.size() >= 2 && clean[0] == '.' && clean[1] == '/')
         clean = clean.substr(2);
 
-    // Already absolute? (Windows drive letter or Unix root)
     if (clean.size() >= 2 && clean[1] == ':') return clean;
     if (!clean.empty() && (clean[0] == '/' || clean[0] == '\\')) {
-        // Absolute path — still search base paths (treat as relative to roots)
         clean = clean.substr(1);
     }
 
-    // Search base paths (last added first = overlay)
     auto paths = getBasePaths(ctx);
     for (int i = static_cast<int>(paths.size()) - 1; i >= 0; i--) {
         std::string candidate = paths[i];
@@ -151,12 +190,29 @@ static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
         if (test.good()) return candidate;
     }
 
-    // Fallback: return as-is (will fail to open)
     return clean;
 }
 
-// Forward declaration — defined later in the file
-static JSValue buildHeaders(JSContext* ctx, FetchRequest* req);
+// Build a Headers-like JS object from a flat header list ("name: value" lines).
+static JSValue buildHeaders(JSContext* ctx, const std::vector<std::string>& headers)
+{
+    JSValue hdrs = JS_NewObject(ctx);
+    for (auto& h : headers) {
+        auto colon = h.find(':');
+        if (colon != std::string::npos) {
+            std::string name = h.substr(0, colon);
+            std::string value = h.substr(colon + 1);
+            while (!value.empty() && value[0] == ' ') value.erase(0, 1);
+            for (auto& c : name) c = static_cast<char>(tolower(c));
+            JS_SetPropertyStr(ctx, hdrs, name.c_str(), JS_NewString(ctx, value.c_str()));
+        }
+    }
+
+    JSValueConst args[1] = { hdrs };
+    JSValue result = callInternal(ctx, "headers", 1, args);
+    JS_FreeValue(ctx, hdrs);
+    return result;
+}
 
 // Build a Response for a local file read
 static JSValue buildFileResponse(JSContext* ctx, const std::string& url,
@@ -164,33 +220,18 @@ static JSValue buildFileResponse(JSContext* ctx, const std::string& url,
 {
     std::ifstream file(resolvedPath, std::ios::in | std::ios::binary | std::ios::ate);
     if (!file) {
-        // 404 — resolve promise with a not-ok Response (matches browser behavior)
+        // 404 — resolve promise with a not-ok Response (matches browser behavior
+        // for HTTP missing resources).
         JSValue resp = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 404));
         JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, "Not Found"));
         JS_SetPropertyStr(ctx, resp, "ok", JS_FALSE);
         JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
+        JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, {}));
 
-        // Empty headers
-        FetchRequest emptyReq;
-        JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, &emptyReq));
-
-        // Body methods that reject
-        const char* notFoundBody = R"JS(
-(function(resp) {
-    resp.bodyUsed = false;
-    resp.body = null;
-    resp.text = function() { return Promise.resolve(''); };
-    resp.json = function() { return Promise.reject(new SyntaxError('Not Found')); };
-    resp.arrayBuffer = function() { return Promise.resolve(new ArrayBuffer(0)); };
-    resp.blob = function() { return Promise.resolve(new Blob([])); };
-    resp.clone = function() { return Object.assign(Object.create(null), resp); };
-})
-)JS";
-        JSValue fn = JS_Eval(ctx, notFoundBody, strlen(notFoundBody), "<fetch-404>", JS_EVAL_TYPE_GLOBAL);
-        JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, 1, &resp);
+        JSValueConst args[1] = { resp };
+        JSValue ret = callInternal(ctx, "applyNotFoundBody", 1, args);
         JS_FreeValue(ctx, ret);
-        JS_FreeValue(ctx, fn);
         return resp;
     }
 
@@ -205,49 +246,19 @@ static JSValue buildFileResponse(JSContext* ctx, const std::string& url,
     JS_SetPropertyStr(ctx, resp, "ok", JS_TRUE);
     JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
 
-    // Build headers with content-type and content-length
     std::string mime = detectMimeType(resolvedPath);
-    // We build a fake header list to reuse buildHeaders
-    FetchRequest fakeReq;
-    fakeReq.headers.push_back("content-type: " + mime);
-    fakeReq.headers.push_back("content-length: " + std::to_string(data.size()));
-    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, &fakeReq));
+    std::vector<std::string> headerLines = {
+        "content-type: " + mime,
+        "content-length: " + std::to_string(data.size()),
+    };
+    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, headerLines));
 
     JSValue bodyAB = JS_NewArrayBufferCopy(ctx, data.data(), data.size());
     JS_SetPropertyStr(ctx, resp, "__body", bodyAB);
 
-    const char* bodyMethods = R"JS(
-(function(resp) {
-    resp.bodyUsed = false;
-    resp.body = null;
-    resp.text = function() {
-        resp.bodyUsed = true;
-        return Promise.resolve(new TextDecoder().decode(new Uint8Array(this.__body)));
-    };
-    resp.json = function() {
-        return this.text().then(function(t) { return JSON.parse(t); });
-    };
-    resp.arrayBuffer = function() {
-        resp.bodyUsed = true;
-        return Promise.resolve(this.__body.slice(0));
-    };
-    resp.blob = function() {
-        var ct = resp.headers.get('content-type') || '';
-        resp.bodyUsed = true;
-        return Promise.resolve(new Blob([new Uint8Array(this.__body)], { type: ct }));
-    };
-    resp.clone = function() {
-        var r = Object.assign(Object.create(null), this);
-        r.__body = this.__body.slice(0);
-        return r;
-    };
-})
-)JS";
-    JSValue fn = JS_Eval(ctx, bodyMethods, strlen(bodyMethods), "<fetch-file-body>", JS_EVAL_TYPE_GLOBAL);
-    JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, 1, &resp);
+    JSValueConst args[1] = { resp };
+    JSValue ret = callInternal(ctx, "applyFileBody", 1, args);
     JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, fn);
-
     return resp;
 }
 
@@ -255,9 +266,7 @@ static size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata
 {
     auto* req = static_cast<FetchRequest*>(userdata);
     size_t bytes = size * nmemb;
-    // Accumulate full body (for .text()/.json() on complete responses)
     req->body.insert(req->body.end(), ptr, ptr + bytes);
-    // Push individual chunk for streaming
     req->chunks.emplace_back(ptr, ptr + bytes);
     req->hasReceivedData = true;
     return bytes;
@@ -286,236 +295,40 @@ static size_t headerCallback(char* buffer, size_t size, size_t nitems, void* use
     return bytes;
 }
 
-// Build headers JS object (shared between streaming and complete responses)
-static JSValue buildHeaders(JSContext* ctx, FetchRequest* req)
-{
-    JSValue hdrs = JS_NewObject(ctx);
-    for (auto& h : req->headers) {
-        auto colon = h.find(':');
-        if (colon != std::string::npos) {
-            std::string name = h.substr(0, colon);
-            std::string value = h.substr(colon + 1);
-            while (!value.empty() && value[0] == ' ') value.erase(0, 1);
-            for (auto& c : name) c = static_cast<char>(tolower(c));
-            JS_SetPropertyStr(ctx, hdrs, name.c_str(), JS_NewString(ctx, value.c_str()));
-        }
-    }
-
-    const char* headersPolyfill = R"JS(
-(function(entries) {
-    var obj = {
-        get: function(name) { return entries[name.toLowerCase()] || null; },
-        has: function(name) { return entries[name.toLowerCase()] !== undefined; },
-        forEach: function(cb) {
-            var keys = Object.keys(entries);
-            for (var i = 0; i < keys.length; i++) cb(entries[keys[i]], keys[i], this);
-        },
-        entries: function() {
-            var keys = Object.keys(entries); var i = 0;
-            return { next: function() {
-                if (i >= keys.length) return { done: true };
-                var k = keys[i++]; return { done: false, value: [k, entries[k]] };
-            }, [Symbol.iterator]: function() { return this; } };
-        },
-        keys: function() {
-            var keys = Object.keys(entries); var i = 0;
-            return { next: function() {
-                if (i >= keys.length) return { done: true };
-                return { done: false, value: keys[i++] };
-            }, [Symbol.iterator]: function() { return this; } };
-        },
-        values: function() {
-            var keys = Object.keys(entries); var i = 0;
-            return { next: function() {
-                if (i >= keys.length) return { done: true };
-                return { done: false, value: entries[keys[i++]] };
-            }, [Symbol.iterator]: function() { return this; } };
-        }
-    };
-    obj[Symbol.iterator] = obj.entries;
-    return obj;
-})
-)JS";
-
-    JSValue headersFn = JS_Eval(ctx, headersPolyfill, strlen(headersPolyfill),
-                                 "<fetch-headers>", JS_EVAL_TYPE_GLOBAL);
-    JSValue headersObj = JS_Call(ctx, headersFn, JS_UNDEFINED, 1, &hdrs);
-    JS_FreeValue(ctx, headersFn);
-    JS_FreeValue(ctx, hdrs);
-    return headersObj;
-}
-
 // Build a Response object for a streaming response (resolved early, body not complete)
 static JSValue buildStreamingResponse(JSContext* ctx, FetchRequest* req)
 {
     JSValue resp = JS_NewObject(ctx);
-
     JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, static_cast<int>(req->statusCode)));
     JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, req->statusText.c_str()));
     JS_SetPropertyStr(ctx, resp, "ok", JS_NewBool(ctx, req->statusCode >= 200 && req->statusCode < 300));
     JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, req->url.c_str()));
-    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, req));
+    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, req->headers));
     JS_SetPropertyStr(ctx, resp, "__streamId", JS_NewInt32(ctx, req->streamId));
 
-    // Install body methods via JS — uses ReadableStream for body
-    const char* bodySetup = R"JS(
-(function(resp) {
-    var streamId = resp.__streamId;
-
-    // Create ReadableStream body that pulls from native chunk buffer
-    resp.body = new ReadableStream({
-        pull: function(controller) {
-            return new Promise(function(resolve) {
-                function tryRead() {
-                    var result = globalThis.__brokit_fetch_stream_read(streamId);
-                    if (result === null) {
-                        // No data yet — register for notification
-                        globalThis.__brokit_fetch_stream_wait(streamId, function() {
-                            tryRead();
-                        });
-                        return;
-                    }
-                    if (result.done) {
-                        controller.close();
-                        resolve();
-                        return;
-                    }
-                    controller.enqueue(result.value);
-                    resolve();
-                }
-                tryRead();
-            });
-        },
-        cancel: function() {
-            // Best effort — data already in flight
-        }
-    });
-    resp.bodyUsed = false;
-
-    function consumeBody() {
-        if (resp.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
-        resp.bodyUsed = true;
-        var reader = resp.body.getReader();
-        var chunks = [];
-        function pump() {
-            return reader.read().then(function(result) {
-                if (result.done) {
-                    var totalLen = 0;
-                    for (var i = 0; i < chunks.length; i++) totalLen += chunks[i].byteLength;
-                    var merged = new Uint8Array(totalLen);
-                    var offset = 0;
-                    for (var i = 0; i < chunks.length; i++) {
-                        merged.set(new Uint8Array(chunks[i].buffer || chunks[i]), offset);
-                        offset += chunks[i].byteLength;
-                    }
-                    return merged;
-                }
-                chunks.push(result.value);
-                return pump();
-            });
-        }
-        return pump();
-    }
-
-    resp.text = function() {
-        return consumeBody().then(function(bytes) {
-            return new TextDecoder().decode(bytes);
-        });
-    };
-    resp.json = function() {
-        return resp.text().then(function(t) { return JSON.parse(t); });
-    };
-    resp.arrayBuffer = function() {
-        return consumeBody().then(function(bytes) { return bytes.buffer; });
-    };
-    resp.blob = function() {
-        var ct = resp.headers.get('content-type') || '';
-        return consumeBody().then(function(bytes) {
-            return new Blob([bytes], { type: ct });
-        });
-    };
-    resp.clone = function() {
-        throw new TypeError('Cannot clone a streaming response');
-    };
-})
-)JS";
-
-    JSValue bodyFn = JS_Eval(ctx, bodySetup, strlen(bodySetup),
-                              "<fetch-stream-body>", JS_EVAL_TYPE_GLOBAL);
-    JSValue ret = JS_Call(ctx, bodyFn, JS_UNDEFINED, 1, &resp);
+    JSValueConst args[1] = { resp };
+    JSValue ret = callInternal(ctx, "applyStreamingBody", 1, args);
     JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, bodyFn);
-
     return resp;
 }
 
-// Build a Response for a completed response (all body available, backward compat)
+// Build a Response for a completed response (all body available)
 static JSValue buildCompleteResponse(JSContext* ctx, FetchRequest* req)
 {
     JSValue resp = JS_NewObject(ctx);
-
     JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, static_cast<int>(req->statusCode)));
     JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, req->statusText.c_str()));
     JS_SetPropertyStr(ctx, resp, "ok", JS_NewBool(ctx, req->statusCode >= 200 && req->statusCode < 300));
     JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, req->url.c_str()));
-    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, req));
+    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, req->headers));
 
-    // Full body as ArrayBuffer
     JSValue bodyAB = JS_NewArrayBufferCopy(ctx, req->body.data(), req->body.size());
     JS_SetPropertyStr(ctx, resp, "__body", bodyAB);
     JS_SetPropertyStr(ctx, resp, "__streamId", JS_NewInt32(ctx, req->streamId));
 
-    // Body methods: use __body for fast synchronous access, but also provide .body stream
-    const char* bodyMethods = R"JS(
-(function(resp) {
-    var streamId = resp.__streamId;
-    resp.bodyUsed = false;
-
-    // body stream from already-complete data
-    resp.body = new ReadableStream({
-        pull: function(controller) {
-            var result = globalThis.__brokit_fetch_stream_read(streamId);
-            if (result === null || result.done) {
-                controller.close();
-                return;
-            }
-            controller.enqueue(result.value);
-        }
-    });
-
-    resp.text = function() {
-        resp.bodyUsed = true;
-        var decoder = new TextDecoder();
-        var text = decoder.decode(new Uint8Array(this.__body));
-        return Promise.resolve(text);
-    };
-    resp.json = function() {
-        return this.text().then(function(t) { return JSON.parse(t); });
-    };
-    resp.arrayBuffer = function() {
-        resp.bodyUsed = true;
-        return Promise.resolve(this.__body.slice(0));
-    };
-    resp.blob = function() {
-        var ct = this.headers.get('content-type') || '';
-        resp.bodyUsed = true;
-        return Promise.resolve(new Blob([new Uint8Array(this.__body)], { type: ct }));
-    };
-    resp.clone = function() {
-        var r = Object.create(Object.getPrototypeOf(this));
-        Object.assign(r, this);
-        r.__body = this.__body.slice(0);
-        return r;
-    };
-})
-)JS";
-
-    JSValue bodyFn = JS_Eval(ctx, bodyMethods, strlen(bodyMethods),
-                              "<fetch-body>", JS_EVAL_TYPE_GLOBAL);
-    JSValue ret = JS_Call(ctx, bodyFn, JS_UNDEFINED, 1, &resp);
+    JSValueConst args[1] = { resp };
+    JSValue ret = callInternal(ctx, "applyCompleteBody", 1, args);
     JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, bodyFn);
-
     return resp;
 }
 
@@ -530,16 +343,18 @@ static JSValue js_fetch_stream_read(JSContext* ctx, JSValueConst, int argc, JSVa
     int streamId = 0;
     JS_ToInt32(ctx, &streamId, argv[0]);
 
-    auto it = g_streams.find(streamId);
-    if (it == g_streams.end()) {
-        // Stream gone — return done
+    CtxState* s = findState(ctx);
+    if (!s) return JS_NULL;
+
+    auto it = s->streams.find(streamId);
+    if (it == s->streams.end() || !it->second) {
         JSValue obj = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, obj, "done", JS_TRUE);
         JS_SetPropertyStr(ctx, obj, "value", JS_UNDEFINED);
         return obj;
     }
 
-    FetchRequest* req = it->second;
+    FetchRequest* req = it->second.get();
 
     if (!req->chunks.empty()) {
         auto chunk = std::move(req->chunks.front());
@@ -553,20 +368,16 @@ static JSValue js_fetch_stream_read(JSContext* ctx, JSValueConst, int argc, JSVa
     }
 
     if (req->bodyComplete) {
-        // All data consumed and body complete — done
         JSValue obj = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, obj, "done", JS_TRUE);
         JS_SetPropertyStr(ctx, obj, "value", JS_UNDEFINED);
-        // Clean up stream
         if (req->headersResolved && !req->easy) {
-            // Fully done and curl cleaned up — safe to delete
-            g_streams.erase(it);
-            delete req;
+            // Fully done and curl cleaned up — drop ownership; unique_ptr frees it.
+            s->streams.erase(it);
         }
         return obj;
     }
 
-    // No data yet
     return JS_NULL;
 }
 
@@ -577,17 +388,17 @@ static JSValue js_fetch_stream_wait(JSContext* ctx, JSValueConst, int argc, JSVa
     int streamId = 0;
     JS_ToInt32(ctx, &streamId, argv[0]);
 
-    auto it = g_streams.find(streamId);
-    if (it == g_streams.end()) return JS_UNDEFINED;
+    CtxState* s = findState(ctx);
+    if (!s) return JS_UNDEFINED;
 
-    FetchRequest* req = it->second;
+    auto it = s->streams.find(streamId);
+    if (it == s->streams.end()) return JS_UNDEFINED;
 
-    // Free previous callback if any
+    FetchRequest* req = it->second.get();
     if (JS_IsFunction(ctx, req->waitCallback)) {
         JS_FreeValue(ctx, req->waitCallback);
     }
     req->waitCallback = JS_DupValue(ctx, argv[1]);
-
     return JS_UNDEFINED;
 }
 
@@ -596,14 +407,14 @@ static JSValue js_fetch_stream_wait(JSContext* ctx, JSValueConst, int argc, JSVa
 // ---------------------------------------------------------------------------
 static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
 {
-    if (!g_multi || g_pending.empty()) return JS_NewInt32(ctx, 0);
+    CtxState* s = findState(ctx);
+    if (!s || !s->multi || s->pending.empty()) return JS_NewInt32(ctx, 0);
 
     int running = 0;
-    curl_multi_perform(g_multi, &running);
+    curl_multi_perform(s->multi, &running);
 
-    // Phase 1: For streaming requests that have received data but haven't resolved yet,
-    // resolve the fetch Promise with a streaming Response (early resolution)
-    for (auto* req : g_pending) {
+    // Phase 1: resolve streaming responses that have received data.
+    for (FetchRequest* req : s->pending) {
         if (!req->headersResolved && req->hasReceivedData) {
             curl_easy_getinfo(req->easy, CURLINFO_RESPONSE_CODE, &req->statusCode);
             char* effectiveUrl = nullptr;
@@ -622,8 +433,10 @@ static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
         }
     }
 
-    // Phase 2: Notify waiting stream readers that data is available
-    for (auto& [id, req] : g_streams) {
+    // Phase 2: notify waiting stream readers.
+    for (auto& [id, reqOwn] : s->streams) {
+        FetchRequest* req = reqOwn.get();
+        if (!req) continue;
         if ((!req->chunks.empty() || req->bodyComplete) &&
             JS_IsFunction(ctx, req->waitCallback)) {
             JSValue cb = req->waitCallback;
@@ -636,37 +449,34 @@ static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
 
     int completed = 0;
 
-    // Phase 3: Handle completed requests
+    // Phase 3: handle completed requests.
     CURLMsg* msg;
     int msgs_in_queue;
-    while ((msg = curl_multi_info_read(g_multi, &msgs_in_queue))) {
+    while ((msg = curl_multi_info_read(s->multi, &msgs_in_queue))) {
         if (msg->msg != CURLMSG_DONE) continue;
 
         CURL* easy = msg->easy_handle;
         FetchRequest* req = nullptr;
-
-        // Find and remove from g_pending
-        for (auto it = g_pending.begin(); it != g_pending.end(); ++it) {
-            if ((*it)->easy == easy) {
-                req = *it;
-                g_pending.erase(it);
-                break;
-            }
+        for (FetchRequest* p : s->pending) {
+            if (p->easy == easy) { req = p; break; }
         }
         if (!req) continue;
+        removePending(*s, req);
 
-        curl_multi_remove_handle(g_multi, easy);
+        curl_multi_remove_handle(s->multi, easy);
         req->bodyComplete = true;
 
+        // If a streaming Response was already handed to JS, JS owns body
+        // draining via stream_read — we must keep the streams entry alive.
+        // Otherwise everything finalizes here.
+        bool wasStreaming = req->headersResolved;
         if (!req->headersResolved) {
-            // Request completed before we resolved (small response, or error)
             if (msg->data.result == CURLE_OK) {
                 curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &req->statusCode);
                 char* effectiveUrl = nullptr;
                 curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
                 if (effectiveUrl) req->url = effectiveUrl;
 
-                // Build complete response (backward compat — body fully available)
                 JSValue response = buildCompleteResponse(ctx, req);
                 JSValue ret = JS_Call(ctx, req->resolving[0], JS_UNDEFINED, 1, &response);
                 JS_FreeValue(ctx, ret);
@@ -687,7 +497,6 @@ static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
             req->headersResolved = true;
         }
 
-        // Notify waiting stream reader that body is complete
         if (JS_IsFunction(ctx, req->waitCallback)) {
             JSValue cb = req->waitCallback;
             req->waitCallback = JS_UNDEFINED;
@@ -699,11 +508,13 @@ static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
         curl_easy_cleanup(easy);
         req->easy = nullptr;
 
-        // If no stream was ever set up (error case), delete now
-        if (g_streams.find(req->streamId) == g_streams.end()) {
-            delete req;
+        // Drop the streams entry unless a streaming Response is still being
+        // drained by JS via stream_read. In the non-streaming success case
+        // the body lives in JS as `__body`; in the error case no Response
+        // was produced. Either way the FetchRequest is safe to free now.
+        if (!wasStreaming) {
+            s->streams.erase(req->streamId);
         }
-        // Otherwise, req stays alive in g_streams until JS drains it
 
         completed++;
     }
@@ -723,11 +534,9 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     std::string url(urlStr);
     JS_FreeCString(ctx, urlStr);
 
-    // Local file fetch — anything that isn't http:// or https://
     if (!isHttpUrl(url)) {
         std::string resolved = resolveLocalPath(ctx, url);
         JSValue response = buildFileResponse(ctx, url, resolved);
-        // Wrap in a resolved Promise to match fetch() API
         JSValue resolving[2];
         JSValue promise = JS_NewPromiseCapability(ctx, resolving);
         if (JS_IsException(promise)) {
@@ -742,36 +551,30 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
         return promise;
     }
 
-    // HTTP fetch via libcurl
-    auto* req = new FetchRequest();
+    CtxState& s = stateOf(ctx);
+
+    auto req = std::make_unique<FetchRequest>();
     req->ctx = ctx;
     req->url = url;
-
-    // Assign stream ID and register
-    req->streamId = g_nextStreamId++;
-    g_streams[req->streamId] = req;
+    req->streamId = s.nextStreamId++;
 
     req->easy = curl_easy_init();
     if (!req->easy) {
-        g_streams.erase(req->streamId);
-        delete req;
         return JS_ThrowInternalError(ctx, "fetch: curl_easy_init failed");
     }
 
     curl_easy_setopt(req->easy, CURLOPT_URL, req->url.c_str());
     curl_easy_setopt(req->easy, CURLOPT_WRITEFUNCTION, writeCallback);
-    curl_easy_setopt(req->easy, CURLOPT_WRITEDATA, req);
+    curl_easy_setopt(req->easy, CURLOPT_WRITEDATA, req.get());
     curl_easy_setopt(req->easy, CURLOPT_HEADERFUNCTION, headerCallback);
-    curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, req);
+    curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, req.get());
     curl_easy_setopt(req->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(req->easy, CURLOPT_MAXREDIRS, 10L);
     curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(req->easy, CURLOPT_USERAGENT, "brokit/0.3");
     curl_easy_setopt(req->easy, CURLOPT_ACCEPT_ENCODING, "");
 
-    // Process options
     if (argc >= 2 && JS_IsObject(argv[1])) {
-        // method
         JSValue methodVal = JS_GetPropertyStr(ctx, argv[1], "method");
         if (JS_IsString(methodVal)) {
             const char* method = JS_ToCString(ctx, methodVal);
@@ -786,7 +589,6 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
         }
         JS_FreeValue(ctx, methodVal);
 
-        // headers
         JSValue headersVal = JS_GetPropertyStr(ctx, argv[1], "headers");
         if (JS_IsObject(headersVal)) {
             JSPropertyEnum* props;
@@ -811,7 +613,6 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
         }
         JS_FreeValue(ctx, headersVal);
 
-        // body — accept string, ArrayBuffer, or TypedArray
         JSValue bodyVal = JS_GetPropertyStr(ctx, argv[1], "body");
         if (JS_IsString(bodyVal)) {
             const char* body = JS_ToCString(ctx, bodyVal);
@@ -823,7 +624,6 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
                 JS_FreeCString(ctx, body);
             }
         } else if (!JS_IsUndefined(bodyVal) && !JS_IsNull(bodyVal)) {
-            // Try TypedArray first, then ArrayBuffer
             size_t byte_offset = 0, byte_len = 0, bpe = 0;
             JSValue buf = JS_GetTypedArrayBuffer(ctx, bodyVal, &byte_offset, &byte_len, &bpe);
             if (!JS_IsException(buf)) {
@@ -835,7 +635,6 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
                 JS_FreeValue(ctx, buf);
             } else {
                 JS_FreeValue(ctx, JS_GetException(ctx));
-                // Try plain ArrayBuffer
                 size_t abLen = 0;
                 uint8_t* ptr = JS_GetArrayBuffer(ctx, &abLen, bodyVal);
                 if (ptr) {
@@ -856,32 +655,33 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
         }
     }
 
-    // Create Promise
     JSValue promise = JS_NewPromiseCapability(ctx, req->resolving);
     if (JS_IsException(promise)) {
-        g_streams.erase(req->streamId);
         curl_easy_cleanup(req->easy);
-        delete req;
+        req->easy = nullptr;
         return promise;
     }
 
-    // Add to multi handle
-    if (!g_multi) {
-        g_multi = curl_multi_init();
+    if (!s.multi) {
+        s.multi = curl_multi_init();
     }
-    curl_multi_add_handle(g_multi, req->easy);
-    g_pending.push_back(req);
+    curl_multi_add_handle(s.multi, req->easy);
+
+    int streamId = req->streamId;
+    FetchRequest* raw = req.get();
+    s.streams.emplace(streamId, std::move(req));
+    s.pending.push_back(raw);
 
     return promise;
 }
 
-// Check if there are pending fetch requests or active streams
 static JSValue js_fetch_has_pending(JSContext* ctx, JSValueConst, int, JSValueConst*)
 {
-    if (!g_pending.empty()) return JS_NewBool(ctx, true);
-    // Also check for streams with pending wait callbacks (reader still consuming)
-    for (auto& [id, req] : g_streams) {
-        if (JS_IsFunction(ctx, req->waitCallback)) return JS_NewBool(ctx, true);
+    CtxState* s = findState(ctx);
+    if (!s) return JS_NewBool(ctx, false);
+    if (!s->pending.empty()) return JS_NewBool(ctx, true);
+    for (auto& [id, req] : s->streams) {
+        if (req && JS_IsFunction(ctx, req->waitCallback)) return JS_NewBool(ctx, true);
     }
     return JS_NewBool(ctx, false);
 }
@@ -894,9 +694,11 @@ void installFetch(JSContext* ctx)
         curlInited = true;
     }
 
+    // Touch the per-context state so it exists before any fetch() call.
+    (void)stateOf(ctx);
+
     JSValue global = JS_GetGlobalObject(ctx);
 
-    // Initialize the base path array
     JS_SetPropertyStr(ctx, global, kFetchBasePathsKey, JS_NewArray(ctx));
 
     JS_SetPropertyStr(ctx, global, "fetch",
@@ -911,6 +713,51 @@ void installFetch(JSContext* ctx)
                       JS_NewCFunction(ctx, js_fetch_stream_wait, "__brokit_fetch_stream_wait", 2));
 
     JS_FreeValue(ctx, global);
+
+    // Install the JS helpers — they expose globalThis.__brokit_fetch_internals
+    // which callInternal() looks up on demand. Caching the JSValue in CtxState
+    // would outlive JS_FreeContext and trip QuickJS's GC assertion.
+    JSValue r = JS_Eval(ctx, js_fetch_helpers, strlen(js_fetch_helpers),
+                        "<fetch_helpers>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(r)) {
+        Runtime::checkException(ctx, r);
+    } else {
+        JS_FreeValue(ctx, r);
+    }
+}
+
+void uninstallFetch(JSContext* ctx)
+{
+    auto it = g_state.find(ctx);
+    if (it == g_state.end()) return;
+    CtxState& s = it->second;
+
+    // Tear down curl handles still in flight, then free the JSValues we own
+    // (promise resolvers, wait callbacks). After this loop, the unique_ptr
+    // destruction below frees the FetchRequest objects themselves.
+    for (auto& [id, reqOwn] : s.streams) {
+        FetchRequest* req = reqOwn.get();
+        if (!req) continue;
+        if (req->easy) {
+            if (s.multi) curl_multi_remove_handle(s.multi, req->easy);
+            curl_easy_cleanup(req->easy);
+            req->easy = nullptr;
+        }
+        if (!JS_IsUndefined(req->resolving[0])) JS_FreeValue(ctx, req->resolving[0]);
+        if (!JS_IsUndefined(req->resolving[1])) JS_FreeValue(ctx, req->resolving[1]);
+        if (JS_IsFunction(ctx, req->waitCallback)) JS_FreeValue(ctx, req->waitCallback);
+        req->resolving[0] = JS_UNDEFINED;
+        req->resolving[1] = JS_UNDEFINED;
+        req->waitCallback = JS_UNDEFINED;
+    }
+    s.pending.clear();
+
+    if (s.multi) {
+        curl_multi_cleanup(s.multi);
+        s.multi = nullptr;
+    }
+
+    g_state.erase(it);
 }
 
 void addFetchBasePath(JSContext* ctx, const std::string& path)
@@ -918,7 +765,6 @@ void addFetchBasePath(JSContext* ctx, const std::string& path)
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue arr = JS_GetPropertyStr(ctx, global, kFetchBasePathsKey);
     if (!JS_IsArray(arr)) {
-        // installFetch not called yet — create the array
         JS_FreeValue(ctx, arr);
         arr = JS_NewArray(ctx);
         JS_SetPropertyStr(ctx, global, kFetchBasePathsKey, JS_DupValue(ctx, arr));
