@@ -56,6 +56,9 @@ void installMessageChannel(JSContext* ctx);
 #ifdef BROKIT_HAS_NOISE
 void installNoise(JSContext* ctx);
 #endif
+#ifdef BROKIT_HAS_IMAGE
+void installImage(JSContext* ctx);
+#endif
 
 /// Add a base path for local file fetch resolution.
 /// Paths are searched in overlay order (last added = checked first).

@@ -94,6 +94,9 @@ void installAll(JSContext* ctx)
 #ifdef BROKIT_HAS_NOISE
     installNoise(ctx);
 #endif
+#ifdef BROKIT_HAS_IMAGE
+    installImage(ctx);
+#endif
 
     // require() must come last — after all modules are installed
     installRequire(ctx);

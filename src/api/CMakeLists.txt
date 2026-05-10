@@ -93,6 +93,11 @@ if(BROKIT_ENABLE_NOISE)
     list(APPEND BROKIT_API_SOURCES noise.cpp)
 endif()
 
+option(BROKIT_ENABLE_IMAGE "Build bro.image typed-array kernels" ON)
+if(BROKIT_ENABLE_IMAGE)
+    list(APPEND BROKIT_API_SOURCES image.cpp)
+endif()
+
 add_library(brokit_api STATIC
     ${BROKIT_API_SOURCES}
     ${GENERATED_HEADERS}
@@ -107,6 +112,10 @@ target_include_directories(brokit_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party/qu
 if(BROKIT_ENABLE_NOISE)
     target_link_libraries(brokit_api PUBLIC FastNoise)
     target_compile_definitions(brokit_api PUBLIC BROKIT_HAS_NOISE)
+endif()
+
+if(BROKIT_ENABLE_IMAGE)
+    target_compile_definitions(brokit_api PUBLIC BROKIT_HAS_IMAGE)
 endif()
 
 # fs.watch — native filesystem watcher uses one OS thread per watcher.
