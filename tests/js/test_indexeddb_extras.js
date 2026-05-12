@@ -99,6 +99,22 @@ try {
 // open with Symbol
 try { globalThis.__brokit_idb_open(sym, 1); } catch (e) {}
 
+// ── idb_put on non-existent store throws InternalError ───────────────────
+indexedDB.deleteDatabase('test_brokit_idb_putfail');
+var pfReq = indexedDB.open('test_brokit_idb_putfail', 1);
+pfReq.onupgradeneeded = function (e) {
+    e.target.result.createObjectStore('exists');
+};
+pfReq.onsuccess = function (e) {
+    var db = e.target.result;
+    // Direct native call to put into a missing store
+    var putThrew = false;
+    try {
+        globalThis.__brokit_idb_put(db.name, 'nope_store', 'k', 'v');
+    } catch (err) { putThrew = true; }
+    assert(putThrew, 'idb_put to missing store throws');
+};
+
 // ── deleteDatabase ────────────────────────────────────────────────────────
 var delReq = indexedDB.deleteDatabase('test_brokit_idb_extras');
 assert(delReq instanceof IDBOpenDBRequest || delReq instanceof IDBRequest, 'deleteDatabase returns request');

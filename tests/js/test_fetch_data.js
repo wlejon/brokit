@@ -54,6 +54,37 @@ fetch('/this_file_definitely_does_not_exist_brokit.xyz')
         assertEqual(r.status, 404, 'missing local file 404');
     });
 
+// ── HTTP POST/headers/etc with unreachable URLs ──────────────────────────
+// Exercises body-parsing and header branches in C++ even when offline.
+var fp1 = fetch('http://127.0.0.1:1/no-such-port-brokit', {
+    method: 'POST',
+    body: new Uint8Array([1, 2, 3, 4, 5])
+});
+assert(fp1 instanceof Promise, 'fetch returns promise for typed-array body');
+fp1.catch(function () {});
+
+var fp2 = fetch('http://127.0.0.1:1/no-such-port-brokit', {
+    method: 'POST',
+    body: new ArrayBuffer(8)
+});
+assert(fp2 instanceof Promise, 'fetch returns promise for ArrayBuffer body');
+fp2.catch(function () {});
+
+var fp3 = fetch('http://127.0.0.1:1/no-such-port-brokit', {
+    method: 'GET',
+    headers: { 'X-Test': 'a', 'X-Other': 'b' }
+});
+assert(fp3 instanceof Promise, 'fetch with header object');
+fp3.catch(function () {});
+
+var fp4 = fetch('http://127.0.0.1:1/no-such-port-brokit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: 'string-body-text'
+});
+assert(fp4 instanceof Promise, 'fetch with string body');
+fp4.catch(function () {});
+
 // ── local file fetch — read self via tmp path ─────────────────────────────
 var fs = globalThis.__brokit_fs;
 var os = globalThis.__brokit_os;

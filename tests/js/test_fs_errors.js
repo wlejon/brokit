@@ -142,5 +142,61 @@ fs.readFile(dir + '/missing2.txt', 'utf8', function(err, data) { cbErr = err; })
 assert(cbErr !== null, 'readFile async surfaces error');
 assertEqual(cbErr.code, 'ENOENT', 'async error code propagated');
 
+// ── writeFileSync/appendFileSync with un-stringifiable data throws ────────
+threw = false;
+try { fs.writeFileSync(dir + '/sym.txt', Symbol('x')); } catch (e) { threw = true; }
+assert(threw, 'writeFileSync with Symbol data throws');
+
+threw = false;
+try { fs.appendFileSync(dir + '/sym.txt', Symbol('x')); } catch (e) { threw = true; }
+assert(threw, 'appendFileSync with Symbol data throws');
+
+// ── rename to a missing dest dir throws ──────────────────────────────────
+fs.writeFileSync(dir + '/src.txt', 'x');
+threw = false;
+try { fs.renameSync(dir + '/src.txt', dir + '/nope_dir/dst.txt'); } catch (e) {
+    threw = true;
+}
+assert(threw, 'renameSync to missing parent throws');
+
+// ── copyFile to a missing dest dir throws ────────────────────────────────
+threw = false;
+try { fs.copyFileSync(dir + '/src.txt', dir + '/nope_dir2/dst.txt'); } catch (e) {
+    threw = true;
+}
+assert(threw, 'copyFileSync to missing parent throws');
+
+// ── chmod missing args ────────────────────────────────────────────────────
+threw = false;
+try { fs.chmodSync(); } catch (e) { threw = true; }
+assert(threw, 'chmodSync missing args throws');
+
+// ── rename missing args ──────────────────────────────────────────────────
+threw = false;
+try { fs.renameSync(dir + '/a'); } catch (e) { threw = true; }
+assert(threw, 'renameSync missing args throws');
+
+// ── readFileSync with options object that has no encoding ─────────────────
+fs.writeFileSync(dir + '/raw.bin', new Uint8Array([1, 2, 3]));
+var rawBuf = fs.readFileSync(dir + '/raw.bin', {});  // empty options
+assert(rawBuf instanceof Uint8Array, 'readFileSync empty options returns buffer');
+
+// ── statSync timestamps available ────────────────────────────────────────
+var s1 = fs.statSync(dir);
+assert(s1.mtime instanceof Date, 'statSync mtime is Date');
+assert(typeof s1.mtimeMs === 'number', 'statSync mtimeMs');
+
+// ── readdirSync with withFileTypes options object ────────────────────────
+fs.writeFileSync(dir + '/inner1.txt', '1');
+fs.writeFileSync(dir + '/inner2.txt', '2');
+var dirents = fs.readdirSync(dir, { withFileTypes: true });
+assert(Array.isArray(dirents), 'readdirSync withFileTypes is array');
+assert(dirents.length > 0, 'readdirSync has entries');
+
+// ── existsSync on path with prefix-mount-like leading slash ──────────────
+// (Hits the resolveFsPath cleanup that strips leading slashes; this just
+// exercises the path-cleaning branches even though there's no mount.)
+assertEqual(fs.existsSync('/nonexistent_prefix_path_brokit'), false, 'existsSync slash-prefixed missing');
+
 // ── Cleanup ───────────────────────────────────────────────────────────────
 fs.rmSync(dir, { recursive: true, force: true });
