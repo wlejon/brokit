@@ -136,6 +136,11 @@ static bool isHttpUrl(const std::string& url)
            (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0);
 }
 
+static bool isDataUrl(const std::string& url)
+{
+    return url.size() >= 5 && url.compare(0, 5, "data:") == 0;
+}
+
 static std::string detectMimeType(const std::string& path)
 {
     auto dot = path.rfind('.');
@@ -212,6 +217,108 @@ static JSValue buildHeaders(JSContext* ctx, const std::vector<std::string>& head
     JSValue result = callInternal(ctx, "headers", 1, args);
     JS_FreeValue(ctx, hdrs);
     return result;
+}
+
+// Build a Response for a data: URL — RFC 2397.
+// Format: data:[<mediatype>][;base64],<data>
+static JSValue buildDataUrlResponse(JSContext* ctx, const std::string& url)
+{
+    std::string rest = url.substr(5); // strip "data:"
+    auto comma = rest.find(',');
+
+    std::string meta;
+    std::string payload;
+    if (comma == std::string::npos) {
+        // Malformed — no comma. Treat the whole thing as payload, no mime.
+        payload = rest;
+    } else {
+        meta    = rest.substr(0, comma);
+        payload = rest.substr(comma + 1);
+    }
+
+    bool isBase64 = false;
+    std::string mime = "text/plain;charset=US-ASCII";
+    if (!meta.empty()) {
+        const std::string b64Tag = ";base64";
+        if (meta.size() >= b64Tag.size() &&
+            meta.compare(meta.size() - b64Tag.size(), b64Tag.size(), b64Tag) == 0) {
+            isBase64 = true;
+            meta = meta.substr(0, meta.size() - b64Tag.size());
+        }
+        if (!meta.empty()) mime = meta;
+    }
+
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+
+    std::vector<uint8_t> data;
+    if (isBase64) {
+        // Strip whitespace and decode standard base64.
+        static const int8_t tbl[128] = {
+            // 0..63 mapping for A-Z, a-z, 0-9, +, /  (others -1)
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+            -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+            52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+            -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+            15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+            -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+            41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        };
+        uint32_t buf = 0;
+        int bits = 0;
+        for (char c : payload) {
+            if (c == '=' || c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+            unsigned uc = static_cast<unsigned char>(c);
+            if (uc >= 128) continue;
+            int v = tbl[uc];
+            if (v < 0) continue;
+            buf = (buf << 6) | static_cast<uint32_t>(v);
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                data.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
+            }
+        }
+    } else {
+        data.reserve(payload.size());
+        for (size_t i = 0; i < payload.size(); ++i) {
+            if (payload[i] == '%' && i + 2 < payload.size()) {
+                int hi = hexVal(payload[i+1]);
+                int lo = hexVal(payload[i+2]);
+                if (hi >= 0 && lo >= 0) {
+                    data.push_back(static_cast<uint8_t>((hi << 4) | lo));
+                    i += 2;
+                    continue;
+                }
+            }
+            data.push_back(static_cast<uint8_t>(payload[i]));
+        }
+    }
+
+    JSValue resp = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 200));
+    JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, "OK"));
+    JS_SetPropertyStr(ctx, resp, "ok", JS_TRUE);
+    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
+
+    std::vector<std::string> headerLines = {
+        "content-type: " + mime,
+        "content-length: " + std::to_string(data.size()),
+    };
+    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, headerLines));
+
+    JSValue bodyAB = JS_NewArrayBufferCopy(ctx, data.data(), data.size());
+    JS_SetPropertyStr(ctx, resp, "__body", bodyAB);
+
+    JSValueConst args[1] = { resp };
+    JSValue ret = callInternal(ctx, "applyFileBody", 1, args);
+    JS_FreeValue(ctx, ret);
+    return resp;
 }
 
 // Build a Response for a local file read
@@ -410,6 +517,15 @@ static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
     CtxState* s = findState(ctx);
     if (!s || !s->multi || s->pending.empty()) return JS_NewInt32(ctx, 0);
 
+    // Poll socket readiness for a small real-time window. curl_multi_perform
+    // alone does not check FD signal state — without this, a non-blocking
+    // connect that fails (e.g. connection refused) is never observed and the
+    // request hangs forever. A 0ms poll is not enough either: the kernel
+    // needs wall-clock time to detect TCP failure and update the socket
+    // state. 50ms returns early on any activity, so the cost is only paid
+    // when truly idle.
+    curl_multi_poll(s->multi, nullptr, 0, 50, nullptr);
+
     int running = 0;
     curl_multi_perform(s->multi, &running);
 
@@ -535,8 +651,13 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     JS_FreeCString(ctx, urlStr);
 
     if (!isHttpUrl(url)) {
-        std::string resolved = resolveLocalPath(ctx, url);
-        JSValue response = buildFileResponse(ctx, url, resolved);
+        JSValue response;
+        if (isDataUrl(url)) {
+            response = buildDataUrlResponse(ctx, url);
+        } else {
+            std::string resolved = resolveLocalPath(ctx, url);
+            response = buildFileResponse(ctx, url, resolved);
+        }
         JSValue resolving[2];
         JSValue promise = JS_NewPromiseCapability(ctx, resolving);
         if (JS_IsException(promise)) {
