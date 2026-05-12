@@ -52,18 +52,21 @@
         this._queue = [];
     };
 
-    // MessageEvent
+    // MessageEvent — use class syntax so we work whether globalThis.Event is
+    // a class (e.g. bro's dom polyfills) or a function constructor (brokit
+    // standalone). Calling `Event.call(this, ...)` on a class constructor
+    // throws "class constructors must be invoked with 'new'".
     if (typeof globalThis.MessageEvent === 'undefined') {
-        globalThis.MessageEvent = function MessageEvent(type, init) {
-            Event.call(this, type, init);
-            this.data = (init && init.data !== undefined) ? init.data : null;
-            this.origin = (init && init.origin) || '';
-            this.lastEventId = (init && init.lastEventId) || '';
-            this.source = (init && init.source) || null;
-            this.ports = (init && init.ports) || [];
+        globalThis.MessageEvent = class MessageEvent extends Event {
+            constructor(type, init) {
+                super(type, init);
+                this.data = (init && init.data !== undefined) ? init.data : null;
+                this.origin = (init && init.origin) || '';
+                this.lastEventId = (init && init.lastEventId) || '';
+                this.source = (init && init.source) || null;
+                this.ports = (init && init.ports) || [];
+            }
         };
-        MessageEvent.prototype = Object.create(Event.prototype);
-        MessageEvent.prototype.constructor = MessageEvent;
     }
 
     function MessageChannel() {
