@@ -66,6 +66,35 @@ try { fs.realpathSync(dir + '/nope_realpath'); } catch (e) {
 }
 assert(threw, 'realpathSync throws on missing');
 
+// ── readFileSync with non-utf8 encoding hits the "any other encoding" path
+fs.writeFileSync(dir + '/enc.txt', 'plain');
+var asAscii = fs.readFileSync(dir + '/enc.txt', 'ascii');
+assertEqual(asAscii, 'plain', 'readFileSync ascii encoding');
+var asLatin = fs.readFileSync(dir + '/enc.txt', 'latin1');
+assertEqual(asLatin, 'plain', 'readFileSync latin1 encoding');
+
+// ── writeFileSync to an unwritable path triggers throwErrno
+//   On Windows, opening a file inside a non-existent parent dir fails.
+threw = false;
+try { fs.writeFileSync(dir + '/nope_subdir/file.txt', 'x'); } catch (e) {
+    threw = true;
+    assertEqual(e.code, 'ENOENT', 'writeFileSync ENOENT');
+}
+assert(threw, 'writeFileSync throws when parent dir missing');
+
+// ── mkdirSync on existing path without recursive is a silent no-op too
+// (fs::create_directory returns false but doesn't set an error_code)
+fs.mkdirSync(dir);
+assert(true, 'mkdirSync on existing path returns cleanly');
+
+// ── readFileSync passes options-object encoding ───────────────────────────
+var withObj = fs.readFileSync(dir + '/enc.txt', { encoding: 'ascii' });
+assertEqual(withObj, 'plain', 'readFileSync object-encoding works');
+
+// ── writeFileSync with options object containing encoding ─────────────────
+fs.writeFileSync(dir + '/opt.txt', 'x', { encoding: 'utf8' });
+assertEqual(fs.readFileSync(dir + '/opt.txt', 'utf8'), 'x', 'writeFileSync options encoding');
+
 // ── lstatSync on dir works ────────────────────────────────────────────────
 var ls = fs.lstatSync(dir);
 assert(ls.isDirectory(), 'lstatSync on directory');

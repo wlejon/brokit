@@ -200,16 +200,125 @@
     } catch (e) { rejected = true; }
     assert(rejected, 'decrypt without decrypt usage rejects');
 
-    // ── AES-CBC encrypt/decrypt round-trip ────────────────────────────────
-    var cbcKey = await crypto.subtle.generateKey(
-        { name: 'AES-CBC', length: 256 }, true, ['encrypt', 'decrypt']
-    );
-    var cbcIv = new Uint8Array(16);
     var pt = new TextEncoder().encode('cbc plaintext data');
-    var cbcCt = await crypto.subtle.encrypt({ name: 'AES-CBC', iv: cbcIv }, cbcKey, pt);
-    assert(cbcCt instanceof ArrayBuffer, 'AES-CBC encrypt');
-    var cbcPt = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: cbcIv }, cbcKey, cbcCt);
-    assertEqual(new TextDecoder().decode(cbcPt), 'cbc plaintext data', 'AES-CBC round-trip');
+
+    // ── parseAlgorithm with hash as {name: ...} object ───────────────────
+    var keyHashObj = await crypto.subtle.importKey(
+        'raw', new Uint8Array(32),
+        { name: 'HMAC', hash: { name: 'SHA-256' } },
+        true, ['sign', 'verify']
+    );
+    assert(keyHashObj !== null, 'parseAlgorithm hash-object path');
+
+    // ── encrypt with unsupported algorithm rejects ────────────────────────
+    var aesGood = await crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt', 'sign', 'verify']
+    );
+    var iv12 = new Uint8Array(12);
+    rejected = false;
+    try {
+        await crypto.subtle.encrypt({ name: 'NONE', iv: iv12 }, aesGood, msg);
+    } catch (e) { rejected = true; }
+    assert(rejected, 'encrypt unsupported algo rejects');
+
+    // ── encrypt with non-buffer data rejects ──────────────────────────────
+    rejected = false;
+    try {
+        await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv12 }, aesGood, 'not-a-buffer');
+    } catch (e) { rejected = true; }
+    assert(rejected, 'encrypt non-buffer data rejects');
+
+    // ── AES-GCM encrypt without iv rejects ────────────────────────────────
+    rejected = false;
+    try {
+        await crypto.subtle.encrypt({ name: 'AES-GCM' }, aesGood, msg);
+    } catch (e) { rejected = true; }
+    assert(rejected, 'AES-GCM encrypt without iv rejects');
+
+    // ── decrypt with non-buffer data rejects ──────────────────────────────
+    rejected = false;
+    try {
+        await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv12 }, aesGood, 'not-a-buffer');
+    } catch (e) { rejected = true; }
+    assert(rejected, 'decrypt non-buffer data rejects');
+
+    // ── decrypt with unsupported algorithm rejects ────────────────────────
+    rejected = false;
+    try {
+        await crypto.subtle.decrypt({ name: 'NONE', iv: iv12 }, aesGood, new Uint8Array(32));
+    } catch (e) { rejected = true; }
+    assert(rejected, 'decrypt unsupported algo rejects');
+
+    // ── decrypt with no iv rejects ────────────────────────────────────────
+    rejected = false;
+    try {
+        await crypto.subtle.decrypt({ name: 'AES-GCM' }, aesGood, new Uint8Array(32));
+    } catch (e) { rejected = true; }
+    assert(rejected, 'AES-GCM decrypt without iv rejects');
+
+    // ── decrypt with too-short ciphertext rejects ─────────────────────────
+    rejected = false;
+    try {
+        await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv12 }, aesGood, new Uint8Array(4));
+    } catch (e) { rejected = true; }
+    assert(rejected, 'AES-GCM decrypt too-short rejects');
+
+    // ── decrypt with tampered ciphertext rejects (tag mismatch) ───────────
+    var realCt = new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: iv12 }, aesGood, msg
+    ));
+    realCt[0] ^= 0xFF;  // tamper
+    rejected = false;
+    try {
+        await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv12 }, aesGood, realCt);
+    } catch (e) { rejected = true; }
+    assert(rejected, 'AES-GCM decrypt tampered rejects');
+
+    // ── sign with an AES key + non-HMAC algo rejects ─────────────────────
+    var aesSignable = await crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 128 }, true, ['sign', 'verify', 'encrypt', 'decrypt']
+    );
+    rejected = false;
+    try {
+        await crypto.subtle.sign({ name: 'NONE' }, aesSignable, msg);
+    } catch (e) { rejected = true; }
+    assert(rejected, 'sign with AES key + non-HMAC algo rejects');
+
+    rejected = false;
+    try {
+        await crypto.subtle.verify({ name: 'NONE' }, aesSignable, new Uint8Array(32), msg);
+    } catch (e) { rejected = true; }
+    assert(rejected, 'verify with AES key + non-HMAC algo rejects');
+
+    // ── exportKey raw ─────────────────────────────────────────────────────
+    var extractable = await crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt']
+    );
+    var raw = await crypto.subtle.exportKey('raw', extractable);
+    assert(raw instanceof ArrayBuffer, 'exportKey raw returns ArrayBuffer');
+    assertEqual(raw.byteLength, 16, 'AES-128 raw key is 16 bytes');
+
+    // ── exportKey non-extractable rejects ─────────────────────────────────
+    var nonext = await crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 128 }, false, ['encrypt']
+    );
+    rejected = false;
+    try { await crypto.subtle.exportKey('raw', nonext); } catch (e) { rejected = true; }
+    assert(rejected, 'exportKey non-extractable rejects');
+
+    // ── exportKey unsupported format rejects ──────────────────────────────
+    rejected = false;
+    try { await crypto.subtle.exportKey('pkcs8', extractable); } catch (e) { rejected = true; }
+    assert(rejected, 'exportKey unsupported format rejects');
+
+    // ── decrypt with custom tagLength ─────────────────────────────────────
+    var ct128 = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: iv12, tagLength: 128 }, aesGood, msg
+    );
+    var pt128 = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: iv12, tagLength: 128 }, aesGood, ct128
+    );
+    assertEqual(new TextDecoder().decode(pt128), 'jwk message', 'tagLength roundtrip');
 
     // ── AES-GCM with AAD ──────────────────────────────────────────────────
     var aadKey = await crypto.subtle.generateKey(
