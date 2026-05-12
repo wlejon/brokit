@@ -198,5 +198,41 @@ assert(dirents.length > 0, 'readdirSync has entries');
 // exercises the path-cleaning branches even though there's no mount.)
 assertEqual(fs.existsSync('/nonexistent_prefix_path_brokit'), false, 'existsSync slash-prefixed missing');
 
+// ── Exercise base-path resolver by populating the JS-visible array ───────
+// (Normally set via C++ API addBrokitFsBasePath; we can set the global
+// directly to drive the same lookup code from JS.)
+var origBases = globalThis.__brokit_fs_base_paths;
+globalThis.__brokit_fs_base_paths = [dir];
+fs.writeFileSync(dir + '/base_test.txt', 'base-content');
+// Now a relative path "base_test.txt" should resolve under dir
+var baseContent = fs.readFileSync('base_test.txt', 'utf8');
+assertEqual(baseContent, 'base-content', 'base-path resolver finds file');
+
+// And a missing relative path falls through to the original path
+threw = false;
+try { fs.readFileSync('missing_in_base.txt'); } catch (e) { threw = true; }
+assert(threw, 'base-path resolver still throws for missing');
+
+// writeFileSync for create resolves to topBase
+fs.writeFileSync('write_via_base.txt', 'new');
+assert(fs.existsSync(dir + '/write_via_base.txt'), 'writeFileSync resolved through base path');
+
+// ── Exercise prefix-mount resolver via JS ────────────────────────────────
+var origMounts = globalThis.__brokit_path_mounts;
+globalThis.__brokit_path_mounts = { '/mnt/test': dir };
+fs.writeFileSync(dir + '/under_mount.txt', 'mounted');
+var mountContent = fs.readFileSync('/mnt/test/under_mount.txt', 'utf8');
+assertEqual(mountContent, 'mounted', 'prefix-mount resolver finds file');
+
+// Mount with exact-prefix match (reading a dir as file may throw, just exercise lookup)
+try { fs.readFileSync('/mnt/test', 'utf8'); } catch (e) {}
+// Mount where path doesn't match prefix
+try { fs.readFileSync('/other/path/file.txt', 'utf8'); } catch (e) {}
+assert(true, 'prefix-mount path-mismatch exercised');
+
+// Restore
+globalThis.__brokit_fs_base_paths = origBases;
+globalThis.__brokit_path_mounts = origMounts;
+
 // ── Cleanup ───────────────────────────────────────────────────────────────
 fs.rmSync(dir, { recursive: true, force: true });

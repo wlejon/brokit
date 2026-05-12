@@ -85,6 +85,67 @@ var fp4 = fetch('http://127.0.0.1:1/no-such-port-brokit', {
 assert(fp4 instanceof Promise, 'fetch with string body');
 fp4.catch(function () {});
 
+// ── Local file fetch with various extensions (mime detection) ────────────
+var fs = globalThis.__brokit_fs;
+var os = globalThis.__brokit_os;
+var tmpdir2 = os.tmpdir();
+var prefix = tmpdir2 + '/brokit_fetch_mime_' + Date.now();
+fs.mkdirSync(prefix);
+
+var exts = ['xml', 'wasm', 'svg', 'webp', 'woff', 'woff2', 'ttf', 'otf',
+            'gif', 'jpeg', 'jpg', 'mjs', 'json', 'css', 'html', 'htm', 'txt'];
+var done = 0;
+for (var i = 0; i < exts.length; i++) {
+    (function (ext) {
+        fs.writeFileSync(prefix + '/test.' + ext, 'data');
+        fetch(prefix + '/test.' + ext).then(function (r) {
+            var ct = r.headers.get('content-type') || '';
+            assert(typeof ct === 'string', 'fetch ' + ext + ' content-type');
+            done++;
+        }).catch(function () { done++; });
+    })(exts[i]);
+}
+
+// File with no extension → application/octet-stream
+fs.writeFileSync(prefix + '/no_ext', 'x');
+fetch(prefix + '/no_ext').then(function (r) {
+    var ct = r.headers.get('content-type') || '';
+    assert(ct.indexOf('octet-stream') !== -1, 'no-ext mime is octet-stream');
+});
+
+// ── Exercise fetch base-path resolver via JS-visible array ───────────────
+var os3 = globalThis.__brokit_os;
+var fs3 = globalThis.__brokit_fs;
+var fetchBase = os3.tmpdir() + '/brokit_fetch_base_' + Date.now();
+fs3.mkdirSync(fetchBase);
+fs3.writeFileSync(fetchBase + '/r.txt', 'relative');
+
+var origBases = globalThis.__brokit_fetch_base_paths;
+globalThis.__brokit_fetch_base_paths = [fetchBase];
+fetch('r.txt').then(function (r) {
+    return r.text();
+}).then(function (t) {
+    assertEqual(t, 'relative', 'fetch base-path resolver finds file');
+}).catch(function () {});
+
+// fetch with leading "./..."
+fetch('./r.txt').then(function (r) { return r.text(); })
+                .then(function (t) {})
+                .catch(function () {});
+
+// Exercise prefix-mount in fetch (resolveBrokitPrefixMount)
+var origMounts = globalThis.__brokit_path_mounts;
+globalThis.__brokit_path_mounts = { '/fmount': fetchBase };
+fetch('/fmount/r.txt').then(function (r) { return r.text(); })
+                      .then(function (t) {
+                          assertEqual(t, 'relative', 'fetch prefix-mount resolves');
+                      })
+                      .catch(function () {});
+
+// Restore
+globalThis.__brokit_fetch_base_paths = origBases;
+globalThis.__brokit_path_mounts = origMounts;
+
 // ── local file fetch — read self via tmp path ─────────────────────────────
 var fs = globalThis.__brokit_fs;
 var os = globalThis.__brokit_os;

@@ -152,6 +152,100 @@ try {
 } catch (e) { threw = true; }
 assert(threw, 'stencil non-Float32 rejects');
 
+// ── alloc dtype uint32 ───────────────────────────────────────────────────
+var au32 = img.alloc(2, 2, 1, 'uint32');
+assert(au32 instanceof Uint32Array, 'alloc uint32');
+
+// ── alloc unknown dtype rejects ──────────────────────────────────────────
+threw = false;
+try { img.alloc(2, 2, 1, 'not_a_dtype'); } catch (e) { threw = true; }
+assert(threw, 'alloc unknown dtype rejects');
+
+// ── lookup with wrap and negative fi (force fi < 0 branch) ───────────────
+var lut3 = img.gradient([[0, 0, 0, 0], [1, 255, 0, 0]], 8);
+var negSrc = new Float32Array([-2.5, -1.5, 3.5]);
+var negOut = new Uint8ClampedArray(negSrc.length * 4);
+img.lookup(negOut, negSrc, lut3, { lo: 0, hi: 1, wrap: true });
+assert(negOut[3] === 255, 'lookup wrap negative alpha 255');
+
+// ── lookup with single-channel src (non-RGBA src is invalid? or fine) ────
+// (Source is a typed array of scalars; output is RGBA.)
+var oneCh = new Float32Array([0, 0.5, 1]);
+var ocOut = new Uint8ClampedArray(12);
+img.lookup(ocOut, oneCh, lut3, { lo: 0, hi: 1 });
+assert(ocOut[11] === 255, 'lookup 1-ch src works');
+
+// ── stencil missing srcW/srcH rejects ────────────────────────────────────
+threw = false;
+try {
+    img.stencil(new Float32Array(16), new Float32Array(16),
+                { data: new Float32Array(9), w: 3, h: 3 },
+                {});
+} catch (e) { threw = true; }
+assert(threw, 'stencil missing srcW/srcH rejects');
+
+// ── stencil kernel.data too small ────────────────────────────────────────
+threw = false;
+try {
+    img.stencil(new Float32Array(16), new Float32Array(16),
+                { data: new Float32Array(4), w: 3, h: 3 },  // 4 < 3*3
+                { srcW: 4, srcH: 4 });
+} catch (e) { threw = true; }
+assert(threw, 'stencil kernel too small rejects');
+
+// ── stencil with edge='wrap' ─────────────────────────────────────────────
+var wrapSrc = new Float32Array(16);
+for (var i = 0; i < 16; i++) wrapSrc[i] = i;
+var wrapDst = new Float32Array(16);
+img.stencil(wrapDst, wrapSrc,
+            { data: new Float32Array([0, 0, 0, 0, 1, 0, 0, 0, 0]), w: 3, h: 3 },
+            { srcW: 4, srcH: 4, edge: 'wrap' });
+assert(wrapDst[0] === wrapSrc[0], 'stencil wrap identity');
+
+// ── stencil with bias ────────────────────────────────────────────────────
+var biasDst = new Float32Array(16);
+img.stencil(biasDst, wrapSrc,
+            { data: new Float32Array([0, 0, 0, 0, 1, 0, 0, 0, 0]), w: 3, h: 3 },
+            { srcW: 4, srcH: 4, bias: 5 });
+assertEqual(biasDst[5], wrapSrc[5] + 5, 'stencil bias adds');
+
+// ── stencil bad edge rejects ─────────────────────────────────────────────
+threw = false;
+try {
+    img.stencil(new Float32Array(16), new Float32Array(16),
+                { data: new Float32Array(9), w: 3, h: 3 },
+                { srcW: 4, srcH: 4, edge: 'invalid_edge_xyz' });
+} catch (e) { threw = true; }
+assert(threw, 'stencil bad edge rejects');
+
+// ── resample with src too small rejects ─────────────────────────────────
+threw = false;
+try {
+    img.resample(new Float32Array(16), new Float32Array(2),
+                 { srcW: 4, srcH: 4, dstW: 4, dstH: 4, channels: 1, filter: 'nearest' });
+} catch (e) { threw = true; }
+assert(threw, 'resample src too small rejects');
+
+// ── resample with dst too small rejects ─────────────────────────────────
+threw = false;
+try {
+    img.resample(new Float32Array(2), new Float32Array(16),
+                 { srcW: 4, srcH: 4, dstW: 4, dstH: 4, channels: 1, filter: 'nearest' });
+} catch (e) { threw = true; }
+assert(threw, 'resample dst too small rejects');
+
+// ── resample with multi-channel (RGBA) ──────────────────────────────────
+var rgbaSrc = new Float32Array(2 * 2 * 4);
+for (var i = 0; i < rgbaSrc.length; i++) rgbaSrc[i] = i % 256;
+var rgbaDst = new Float32Array(4 * 4 * 4);
+img.resample(rgbaDst, rgbaSrc, { srcW: 2, srcH: 2, dstW: 4, dstH: 4, channels: 4, filter: 'nearest' });
+assert(rgbaDst[0] === rgbaSrc[0], 'resample rgba nearest');
+
+// ── reduce histogram with bins > 0 produces output ───────────────────────
+var hist = img.reduce(new Float32Array([0.1, 0.3, 0.7, 0.9]), 'histogram',
+                       { bins: 4, lo: 0, hi: 1 });
+assert(hist.length === 4, 'histogram bin count');
+
 // ── stencil with even kernel rejects ─────────────────────────────────────
 threw = false;
 try {
