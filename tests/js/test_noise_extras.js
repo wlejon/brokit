@@ -129,6 +129,24 @@ function tryPerDim(list) {
 }
 tryPerDim(mems.variables) || tryPerDim(mems.hybrids);
 
+// Test wrong-suffix per-dim names — exercises queryIdx==-1 branch
+try { domOff.set('OffsetX', 1.0); } catch (e) {}   // no space
+try { domOff.set('Offset Q', 1.0); } catch (e) {}  // unknown dim letter
+try { domOff.set('Offset XY', 1.0); } catch (e) {} // trailing chars
+
+// Setting node source with mismatched node-type — try with a DomainOffset
+// supplied where a generator is expected. The "type mismatch" branch fires
+// when setFunc returns false.
+var bigFbm = FastNoise.create('FractalFBm');
+var domainOnly = FastNoise.create('DomainOffset');
+try { bigFbm.set('Source', domainOnly); } catch (e) {}
+
+// Hybrid type mismatch — set Gain to a non-FastNoise object via JS_GetOpaque
+// returning null path is already covered. Try setting hybrid to NaN to exercise
+// the failure return from setValueFunc.
+try { bigFbm.set('Gain', NaN); } catch (e) {}
+try { bigFbm.set('Gain', Infinity); } catch (e) {}
+
 // set with a name longer than baseLen but no space — exercises early reject
 try { domOff.set('OffsetXextra', 1.0); } catch (e) {}
 

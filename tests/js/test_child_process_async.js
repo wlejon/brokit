@@ -137,6 +137,21 @@ if (isWin) {
 }
 assert(bufSpawn.stdout instanceof Uint8Array, 'spawnSync encoding buffer');
 
+// ── spawnAsync with args containing spaces (exercises quote helper) ──────
+var spaceHandle;
+if (isWin) {
+    spaceHandle = spawnAsync('cmd', ['/c', 'echo', 'hello world spawnasync']);
+} else {
+    spaceHandle = spawnAsync('echo', ['hello world spawnasync']);
+}
+// drain
+for (var i = 0; i < 200; i++) {
+    var r = childPoll(spaceHandle.id);
+    if (r !== null) break;
+    var t0 = Date.now();
+    while (Date.now() - t0 < 25) {}
+}
+
 // ── spawnAsync of nonexistent binary throws ──────────────────────────────
 var badSpawnThrew = false;
 try {

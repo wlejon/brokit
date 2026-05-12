@@ -51,6 +51,34 @@ try { fs.chmodSync(dir + '/nope', 0o644); } catch (e) {
 }
 assert(threw, 'chmodSync throws on missing');
 
+// ── rmdir on non-empty dir throws ─────────────────────────────────────────
+var subdir = dir + '/notempty';
+fs.mkdirSync(subdir);
+fs.writeFileSync(subdir + '/file.txt', 'x');
+threw = false;
+try { fs.rmdirSync(subdir); } catch (e) {
+    threw = true;
+    assert(typeof e.code === 'string', 'rmdir non-empty error has code');
+}
+assert(threw, 'rmdirSync on non-empty dir throws');
+
+// ── unlinkSync on a directory throws ──────────────────────────────────────
+// (fs::remove on a non-empty dir sets an error_code → EISDIR or similar)
+threw = false;
+try { fs.unlinkSync(subdir); } catch (e) {
+    threw = true;
+    assert(typeof e.code === 'string', 'unlink-on-dir error has code');
+}
+// May or may not throw depending on platform; just exercise
+
+// ── mkdir of nested without recursive throws ──────────────────────────────
+threw = false;
+try { fs.mkdirSync(dir + '/x/y/z'); } catch (e) {
+    threw = true;
+    assert(typeof e.code === 'string', 'mkdir nested error has code');
+}
+assert(threw, 'mkdirSync nested without recursive throws');
+
 // ── unlink/rmdir/rm of missing path are no-ops on this platform ──────────
 // std::filesystem::remove() returns false without an error_code if missing,
 // so these calls silently succeed. Just exercise the code path.
