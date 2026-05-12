@@ -98,6 +98,40 @@ assert(threw, 'set with no args throws');
 var domScale = FastNoise.create('DomainScale');
 domScale.set('Source', src);
 
+// Enum set with neither int nor string rejects ("Enum expects int or string")
+var cell = FastNoise.create('CellularDistance');
+threw = false;
+try { cell.set('Distance Function', true); } catch (e) { threw = true; }
+assert(threw, 'enum with bool rejects');
+
+threw = false;
+try { cell.set('Distance Function', {}); } catch (e) { threw = true; }
+assert(threw, 'enum with object rejects');
+
+// Per-dimension matching: DomainAxisScale has Scale X / Y / Z / W
+// (If the type doesn't exist we just skip — exercise getMembers regardless.)
+var domOff = FastNoise.create('DomainOffset');
+var mems = domOff.getMembers();
+assert(typeof mems === 'object' && mems !== null, 'getMembers returns object');
+// Per-dimension members appear in variables and/or hybrids with "X/Y/Z/W" suffix
+function tryPerDim(list) {
+    if (!Array.isArray(list)) return;
+    for (var mi = 0; mi < list.length; mi++) {
+        var nm = list[mi].name;
+        if (nm.length > 2 && nm.charAt(nm.length - 2) === ' ' &&
+            'XYZW'.indexOf(nm.charAt(nm.length - 1)) >= 0) {
+            try { domOff.set(nm, 1.5); } catch (e) {}
+            try { domOff.set(nm + ' bogus', 1.5); } catch (e) {}
+            return true;
+        }
+    }
+    return false;
+}
+tryPerDim(mems.variables) || tryPerDim(mems.hybrids);
+
+// set with a name longer than baseLen but no space — exercises early reject
+try { domOff.set('OffsetXextra', 1.0); } catch (e) {}
+
 // Generate from a configured fbm
 var v = fbm.genSingle2D(1.0, 2.0, 42);
 assert(typeof v === 'number', 'configured FBm generates value');

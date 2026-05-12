@@ -110,6 +110,33 @@ if (isWin) {
 assert(typeof truncResult === 'string', 'maxBuffer execSync returns string');
 assert(truncResult.length <= 16, 'maxBuffer truncates output');
 
+// ── maxBuffer truncates stderr too (exec returning stderr) ────────────────
+var stderrResult;
+if (isWin) {
+    // `cmd /c 1>&2 echo aaa...` writes to stderr
+    stderrResult = cp.exec('cmd /c echo aaaaaaaaaaaaaaaaaaaa 1>&2', { maxBuffer: 4 }, function(){});
+} else {
+    cp.exec('sh -c "echo aaaaaaaaaaaaaaaaaaaa 1>&2"', { maxBuffer: 4 }, function(){});
+}
+
+// ── spawnSync with args containing spaces — exercises quote branch ────────
+var quotedResult;
+if (isWin) {
+    quotedResult = cp.spawnSync('cmd', ['/c', 'echo', 'hello world brokit']);
+} else {
+    quotedResult = cp.spawnSync('echo', ['hello world brokit']);
+}
+assert(quotedResult.stdout.indexOf('hello world brokit') !== -1, 'spawnSync quotes spaces');
+
+// ── spawnSync with encoding: buffer ──────────────────────────────────────
+var bufSpawn;
+if (isWin) {
+    bufSpawn = cp.spawnSync('cmd', ['/c', 'echo', 'bin'], { encoding: 'buffer' });
+} else {
+    bufSpawn = cp.spawnSync('echo', ['bin'], { encoding: 'buffer' });
+}
+assert(bufSpawn.stdout instanceof Uint8Array, 'spawnSync encoding buffer');
+
 // ── spawnAsync of nonexistent binary throws ──────────────────────────────
 var badSpawnThrew = false;
 try {

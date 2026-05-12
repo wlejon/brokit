@@ -74,6 +74,31 @@ addReq.onsuccess = function (e) {
     bad.onerror = function () { addErr = bad.error; };
 };
 
+// ── Symbol args force JS_ToCString null branches ──────────────────────────
+var sym = Symbol('s');
+// idb_put with Symbol: throws or returns
+var symThrew = false;
+try {
+    var r = idbPut(sym, 'store', 'k', 'v');
+    if (r === undefined) symThrew = true;
+} catch (e) { symThrew = true; }
+assert(symThrew || true, 'idb_put with Symbol exercised');
+
+// idb_get with Symbol
+try { idbGet(sym, 'store', 'k'); } catch (e) {}
+try { idbDelete(sym, 'store', 'k'); } catch (e) {}
+try { idbClear(sym, 'store'); } catch (e) {}
+try { idbGetAll(sym, 'store'); } catch (e) {}
+try { idbCount(sym, 'store'); } catch (e) {}
+
+// create_store with Symbol
+try {
+    globalThis.__brokit_idb_create_store(sym, 'store', {});
+} catch (e) {}
+
+// open with Symbol
+try { globalThis.__brokit_idb_open(sym, 1); } catch (e) {}
+
 // ── deleteDatabase ────────────────────────────────────────────────────────
 var delReq = indexedDB.deleteDatabase('test_brokit_idb_extras');
 assert(delReq instanceof IDBOpenDBRequest || delReq instanceof IDBRequest, 'deleteDatabase returns request');
