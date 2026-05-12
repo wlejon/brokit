@@ -142,6 +142,14 @@ fs.readFile(dir + '/missing2.txt', 'utf8', function(err, data) { cbErr = err; })
 assert(cbErr !== null, 'readFile async surfaces error');
 assertEqual(cbErr.code, 'ENOENT', 'async error code propagated');
 
+// ── appendFileSync to a missing parent throws ─────────────────────────────
+threw = false;
+try { fs.appendFileSync(dir + '/nope_dir3/file.txt', 'x'); } catch (e) {
+    threw = true;
+    assertEqual(e.code, 'ENOENT', 'appendFile ENOENT code');
+}
+assert(threw, 'appendFileSync throws when parent missing');
+
 // ── writeFileSync/appendFileSync with un-stringifiable data throws ────────
 threw = false;
 try { fs.writeFileSync(dir + '/sym.txt', Symbol('x')); } catch (e) { threw = true; }

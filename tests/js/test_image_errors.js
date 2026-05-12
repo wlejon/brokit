@@ -241,6 +241,24 @@ var rgbaDst = new Float32Array(4 * 4 * 4);
 img.resample(rgbaDst, rgbaSrc, { srcW: 2, srcH: 2, dstW: 4, dstH: 4, channels: 4, filter: 'nearest' });
 assert(rgbaDst[0] === rgbaSrc[0], 'resample rgba nearest');
 
+// ── lookup with non-Float32 src + wrap (general path, wrap branch) ───────
+var int16Src = new Int16Array([-100, 0, 100, 300]);
+var int16Out = new Uint8ClampedArray(int16Src.length * 4);
+img.lookup(int16Out, int16Src, lut3, { lo: 0, hi: 100, edge: 'wrap' });
+assert(int16Out[3] === 255, 'lookup int16+wrap');
+
+// lookup with uint16 src + wrap
+var u16Src = new Uint16Array([0, 50, 100, 200]);
+var u16Out = new Uint8ClampedArray(u16Src.length * 4);
+img.lookup(u16Out, u16Src, lut3, { lo: 0, hi: 100, edge: 'wrap' });
+assert(u16Out[3] === 255, 'lookup uint16+wrap');
+
+// lookup with float64 src
+var f64Src = new Float64Array([0.1, 0.5, 0.9]);
+var f64Out = new Uint8ClampedArray(f64Src.length * 4);
+img.lookup(f64Out, f64Src, lut3, { lo: 0, hi: 1 });
+assert(f64Out[3] === 255, 'lookup float64');
+
 // ── reduce histogram with bins > 0 produces output ───────────────────────
 var hist = img.reduce(new Float32Array([0.1, 0.3, 0.7, 0.9]), 'histogram',
                        { bins: 4, lo: 0, hi: 1 });
