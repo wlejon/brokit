@@ -436,6 +436,16 @@ static JSValue image_reduce(JSContext* ctx, JSValueConst /*this_val*/,
     size_t n = src.byte_len / src.bpe;
     if (n == 0) return JS_ThrowRangeError(ctx, "reduce: src is empty");
 
+    // Optional stride for subsampling. stride=8 visits every 8th element.
+    // Cheap range/sum estimate when full accuracy isn't needed (e.g. driving
+    // a smoothed EMA from a million-pixel float field).
+    int32_t stride = 1;
+    if (argc >= 3 && JS_IsObject(argv[2])) {
+        if (!get_prop_i32(ctx, argv[2], "stride", &stride, 1)) return JS_EXCEPTION;
+        if (stride < 1) return JS_ThrowRangeError(ctx, "reduce: stride must be >= 1");
+    }
+    const size_t step = (size_t)stride;
+
     auto read_at = [&](size_t i) -> float {
         return read_scalar(src.data + i * src.bpe, src.bpe, kind.is_float, kind.is_signed);
     };
@@ -444,13 +454,13 @@ static JSValue image_reduce(JSContext* ctx, JSValueConst /*this_val*/,
         float mn = read_at(0), mx = mn;
         if (kind.is_float && src.bpe == 4) {
             const float* sp = reinterpret_cast<const float*>(src.data);
-            for (size_t i = 1; i < n; i++) {
+            for (size_t i = step; i < n; i += step) {
                 float v = sp[i];
                 if (v < mn) mn = v;
                 if (v > mx) mx = v;
             }
         } else {
-            for (size_t i = 1; i < n; i++) {
+            for (size_t i = step; i < n; i += step) {
                 float v = read_at(i);
                 if (v < mn) mn = v;
                 if (v > mx) mx = v;
@@ -463,13 +473,14 @@ static JSValue image_reduce(JSContext* ctx, JSValueConst /*this_val*/,
     }
     if (op == "sum" || op == "mean") {
         double sum = 0;
+        size_t count = 0;
         if (kind.is_float && src.bpe == 4) {
             const float* sp = reinterpret_cast<const float*>(src.data);
-            for (size_t i = 0; i < n; i++) sum += sp[i];
+            for (size_t i = 0; i < n; i += step) { sum += sp[i]; count++; }
         } else {
-            for (size_t i = 0; i < n; i++) sum += read_at(i);
+            for (size_t i = 0; i < n; i += step) { sum += read_at(i); count++; }
         }
-        if (op == "mean") sum /= (double)n;
+        if (op == "mean") sum /= (double)count;
         return JS_NewFloat64(ctx, sum);
     }
     if (op == "histogram") {
@@ -486,7 +497,7 @@ static JSValue image_reduce(JSContext* ctx, JSValueConst /*this_val*/,
         std::vector<uint32_t> counts((size_t)bins, 0);
         float lo_f = (float)lo;
         float inv_span = 1.0f / (float)(hi - lo);
-        for (size_t i = 0; i < n; i++) {
+        for (size_t i = 0; i < n; i += step) {
             float v = read_at(i);
             float t = (v - lo_f) * inv_span;
             int idx = (int)(t * (float)bins);

@@ -62,6 +62,30 @@ assertEqual(hist[1], 1); // 1
 assertEqual(hist[2], 1); // 2
 assertEqual(hist[3], 1); // 3 ; 4 is out of range (idx==bins)
 
+// stride: subsample every Nth element. Indices visited at stride=2 are 0,2,4 -> values 1,3,-1
+var mm2 = bro.image.reduce(src, "minmax", { stride: 2 });
+assertEqual(mm2.min, -1);
+assertEqual(mm2.max, 3);
+assertEqual(bro.image.reduce(src, "sum", { stride: 2 }), 3);   // 1+3+(-1) = 3
+assertEqual(bro.image.reduce(src, "mean", { stride: 2 }), 1);  // (1+3-1)/3 = 1
+
+// stride=1 must match unstrided
+var mm3 = bro.image.reduce(src, "minmax", { stride: 1 });
+assertEqual(mm3.min, -1);
+assertEqual(mm3.max, 4);
+
+// stride histogram: only visit even indices -> values 1,3,-1 -> bins=[0,1,0,1]
+var hist2 = bro.image.reduce(src, "histogram", { bins: 4, lo: 0, hi: 4, stride: 2 });
+assertEqual(hist2[0], 0);
+assertEqual(hist2[1], 1);
+assertEqual(hist2[2], 0);
+assertEqual(hist2[3], 1);
+
+// stride < 1 is rejected
+var threw = false;
+try { bro.image.reduce(src, "minmax", { stride: 0 }); } catch (e) { threw = true; }
+assert(threw, "stride < 1 should throw");
+
 // ==========================================================================
 // lookup — 2-stop black-to-white gradient, src normalized to [0,1]
 // ==========================================================================
