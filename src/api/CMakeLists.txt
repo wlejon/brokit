@@ -96,6 +96,29 @@ endif()
 option(BROKIT_ENABLE_IMAGE "Build bro.image typed-array kernels" ON)
 if(BROKIT_ENABLE_IMAGE)
     list(APPEND BROKIT_API_SOURCES image.cpp)
+    # broimage provides the kernel implementations; image.cpp is the JS glue
+    # that delegates to it. Standalone repo at ../broimage preferred, with a
+    # third_party/broimage submodule fallback. When brokit builds inside bro,
+    # broimage is already a target (added by bro/third_party/CMakeLists.txt
+    # before brokit) and this block reuses it via the NOT TARGET guard.
+    if(NOT TARGET broimage)
+        set(BROIMAGE_DIR "${CMAKE_SOURCE_DIR}/../broimage" CACHE PATH
+            "Path to standalone broimage repo")
+        if(EXISTS "${BROIMAGE_DIR}/CMakeLists.txt")
+            message(STATUS "broimage: using standalone repo at ${BROIMAGE_DIR}")
+            add_subdirectory("${BROIMAGE_DIR}" "${CMAKE_BINARY_DIR}/broimage"
+                             EXCLUDE_FROM_ALL)
+        elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/broimage/CMakeLists.txt")
+            message(STATUS "broimage: using submodule at third_party/broimage")
+            add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/broimage"
+                             "${CMAKE_BINARY_DIR}/broimage" EXCLUDE_FROM_ALL)
+        else()
+            message(FATAL_ERROR
+                "BROKIT_ENABLE_IMAGE=ON requires broimage at ${BROIMAGE_DIR} "
+                "or ${CMAKE_SOURCE_DIR}/third_party/broimage. Clone broimage "
+                "next to brokit, or override with -DBROIMAGE_DIR=...")
+        endif()
+    endif()
 endif()
 
 add_library(brokit_api STATIC
@@ -116,6 +139,7 @@ endif()
 
 if(BROKIT_ENABLE_IMAGE)
     target_compile_definitions(brokit_api PUBLIC BROKIT_HAS_IMAGE)
+    target_link_libraries(brokit_api PRIVATE broimage::broimage)
 endif()
 
 # fs.watch — native filesystem watcher uses one OS thread per watcher.
