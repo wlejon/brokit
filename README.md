@@ -15,6 +15,7 @@ Built as a dependency for [bro](https://github.com/wlejon/bro).
 | **URL / URLSearchParams** | Full WHATWG URL parsing, resolution, path normalization; URLSearchParams with iterators |
 | **URL.createObjectURL** | Blob URL registry with createObjectURL/revokeObjectURL |
 | **crypto** | randomUUID (v4), getRandomValues (BCryptGenRandom / /dev/urandom) |
+| **crypto.subtle** | SubtleCrypto: digest (SHA-1/256/384/512), sign/verify (HMAC), encrypt/decrypt (AES-GCM, AES-CBC), generateKey, importKey, exportKey. CryptoKey class with usage masks |
 | **TextEncoder / TextDecoder** | Native C++ UTF-8 encode/decode |
 | **TreeWalker / NodeFilter** | Full DOM traversal with SHOW_* flags and custom filter functions |
 | **AbortController / AbortSignal** | abort(), throwIfAborted(), static abort/timeout/any factories, DOMException |
@@ -43,16 +44,19 @@ Built as a dependency for [bro](https://github.com/wlejon/bro).
 | API | Implementation |
 |-----|---------------|
 | **FastNoise** | SIMD-accelerated noise via FastNoise2. `FastNoise.create(type)` for ~50 node types, `node.set(name, value)` metadata-driven config, `genUniformGrid2D/3D` (+ `Into` variants for zero-alloc reuse), `genSingle2D/3D`, `genTileable2D`. Generators, fractals, cellular, domain warp, operators (Add/Multiply/Min/Max/Fade), modifiers (Remap/Terrace/DomainScale). Gated by `BROKIT_ENABLE_NOISE` (ON by default) |
+| **bro.image** | Composable typed-array kernels backed by the broimage sibling. Six verbs — `reduce` (sum/mean/minmax/histogram), `map` (affine/pow/sqrt/log/exp/abs), `combine` (add/sub/mul/min/max/lerp/wsum), `lookup`, `stencil`, `resample` — plus `gradient` and `alloc` builders. Caller-supplied dst buffers; op behavior is a struct, never a JS callback. Mounted as `bro.image.*`. Gated by `BROKIT_ENABLE_IMAGE` (ON by default) |
 
 ### System (Node.js-style)
 
 | API | Implementation |
 |-----|---------------|
 | **fs** | readFileSync/writeFileSync/appendFileSync, stat/lstat, readdirSync (withFileTypes), existsSync, mkdirSync (recursive), rmSync (recursive+force), renameSync, copyFileSync, chmodSync, realpathSync. Async wrappers + fs.promises |
+| **fs.watch** | Cross-platform native filesystem watcher (FSWatcher). One OS thread per watcher with a lock-free event ring; backends are ReadDirectoryChangesW (Windows), inotify (Linux), FSEvents (macOS). 'rename'/'change' events, recursive option, overflow surfaced as an error event |
 | **child_process** | execSync, exec, execFileSync, execFile, spawnSync. Cross-platform (CreateProcess / fork+exec), stdout/stderr capture, stdin, cwd, timeout |
 | **path** | join, resolve, dirname, basename, extname, parse, format, isAbsolute, normalize, sep, delimiter |
 | **os** | platform(), type(), arch(), homedir(), tmpdir(), hostname(), EOL |
 | **process** | process.env (read/write/delete), process.cwd(), process.exit(), process.platform |
+| **require** | Node-style synchronous module resolver for the built-in modules: `require('fs')`, `'path'`, `'os'`, `'child_process'` (and their `node:` prefixes). Installed last by `installAll()`, after the modules it maps to |
 
 ## Build
 
@@ -63,15 +67,18 @@ cmake -B build
 cmake --build build --config Debug    # or Release
 ```
 
-Dependencies (all bundled):
-- **QuickJS** — JavaScript engine (git submodule)
-- **libcurl 8.19.0** — HTTP/WebSocket (git submodule, static, Schannel TLS on Windows)
-- **SQLite** — IndexedDB persistence (amalgamation)
-- **FastNoise2** — SIMD noise generation (git submodule, gated by `BROKIT_ENABLE_NOISE`)
+Dependencies:
+- **QuickJS** — JavaScript engine (bundled git submodule)
+- **libcurl** — HTTP/WebSocket (bundled git submodule, static, Schannel TLS on Windows)
+- **SQLite** — IndexedDB persistence (bundled amalgamation)
+- **FastNoise2** — SIMD noise generation (bundled git submodule, gated by `BROKIT_ENABLE_NOISE`)
+- **broimage** — typed-array image kernels backing `bro.image` (sibling repo at `../broimage`, or `third_party/broimage` submodule; gated by `BROKIT_ENABLE_IMAGE`). When brokit builds inside bro, the existing `broimage` target is reused.
+
+Optional features are gated by CMake options (both default ON): `BROKIT_ENABLE_NOISE` compiles `noise.cpp` and defines `BROKIT_HAS_NOISE`; `BROKIT_ENABLE_IMAGE` compiles `image.cpp`, links broimage, and defines `BROKIT_HAS_IMAGE`.
 
 ## Test
 
-2307 tests across 29 test files.
+42 test files under `tests/js/`, one per API. The C++ harness (`tests/main.cpp`) evals each file, pumps the async subsystems (timers, fetch, sockets), and tallies per-file pass/fail.
 
 ```bash
 # Windows (MSVC)
@@ -116,8 +123,9 @@ brokit::api::installFS(rt.context());
 src/runtime/   Runtime class: QuickJS wrapper, ES module loader, exception handling
 src/api/       Modular API installers (one .cpp per API, optional .js polyfill)
 src/api/js/    JS polyfills embedded into C++ at build time via cmake/embed_js.cmake
-tests/         C++ test harness that evals JS test files and pumps async subsystems
-third_party/   QuickJS, libcurl, SQLite, FastNoise2
+tests/         C++ test harness (tests/main.cpp) that evals JS test files and pumps async subsystems
+tests/js/      JavaScript test files, one per API
+third_party/   QuickJS, libcurl, SQLite, FastNoise2 (broimage links from the sibling repo)
 ```
 
 **Design principles:**

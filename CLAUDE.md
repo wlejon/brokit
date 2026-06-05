@@ -35,11 +35,18 @@ Linux:
 
 ```
 src/runtime/   — QuickJS runtime wrapper (Runtime class)
-src/api/       — Web/system API implementations (console, timers, URL, crypto, encoding, noise, etc.)
-tests/         — C++ test harness
+src/api/       — Web/system API implementations (console, timers, URL, crypto + crypto.subtle,
+                 encoding, fetch, streams, storage, IndexedDB, fs, fs.watch, child_process,
+                 WebSocket, EventSource, noise, image, etc.)
+src/api/js/    — JS polyfills embedded into C++ at build time (cmake/embed_js.cmake)
+tests/         — C++ test harness (tests/main.cpp)
 tests/js/      — JavaScript test files (one per API)
-third_party/   — QuickJS, libcurl, SQLite, FastNoise2 (bundled)
+third_party/   — QuickJS, libcurl, SQLite, FastNoise2 (bundled); broimage links from ../broimage
 ```
+
+Optional, both default ON: `BROKIT_ENABLE_NOISE` (FastNoise2 → `BROKIT_HAS_NOISE`) and
+`BROKIT_ENABLE_IMAGE` (broimage-backed `bro.image` → `BROKIT_HAS_IMAGE`). The matching
+installers are guarded by those `BROKIT_HAS_*` defines in `api.h` and `installAll()`.
 
 ## Namespace
 
@@ -52,7 +59,8 @@ third_party/   — QuickJS, libcurl, SQLite, FastNoise2 (bundled)
 - **Pick-and-choose APIs** — consumers can call `installAll(ctx)` or individual `installConsole(ctx)`, `installTimers(ctx)`, etc.
 - **No global state** — all state is per-JSContext.
 - **No rendering, no windowing** — purely JS runtime + platform APIs.
-- **JS polyfills backed by native C++** — complex logic (URL parsing, TreeWalker traversal) is in JS for readability and debuggability. Performance-critical operations (crypto, encoding) are native C++.
+- **JS polyfills backed by native C++** — complex logic (URL parsing, TreeWalker traversal) is in JS for readability and debuggability. Performance-critical operations (crypto, encoding, image kernels) are native C++.
+- **Node-style `require()`** — a synchronous resolver mapping `fs`/`path`/`os`/`child_process` (and `node:` prefixes) to their `__brokit_*` globals. Installed *last* by `installAll()`, after the modules it maps to.
 
 ## Adding New APIs
 
@@ -60,8 +68,14 @@ third_party/   — QuickJS, libcurl, SQLite, FastNoise2 (bundled)
 2. Add the declaration to `src/api/api.h`
 3. Call it from `installAll()` in `src/api/api.cpp`
 4. Add the .cpp to `src/api/CMakeLists.txt`
-5. Write `tests/js/test_myapi.js` using the `assert()` and `assertEqual()` test helpers
+5. Write `tests/js/test_myapi.js` using the `assert()` and `assertEqual()` test helpers (the harness auto-discovers files in `tests/js/`)
 6. Build and run tests
+
+For an optional API that depends on a heavy library, gate it behind a `BROKIT_ENABLE_*`
+CMake option that defines a `BROKIT_HAS_*` macro, wrap the installer declaration/call in
+`#ifdef BROKIT_HAS_*` (see `installNoise` / `installImage`), and append the `.cpp`
+conditionally in `src/api/CMakeLists.txt`. If the API should be reachable via `require()`,
+add the name mapping in `installRequire()` in `src/api/api.cpp`.
 
 ## Integration with bro
 
