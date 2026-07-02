@@ -83,4 +83,17 @@ void addFsBasePath(JSContext* ctx, const std::string& path);
 void addFsPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath);
 void addFetchPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath);
 
+/// Resolve a path the same way fs.* does: /<prefix>/... mounts and absolute
+/// paths are returned as-is; a relative path is checked against registered fs
+/// base paths (most-recently-added first) and rewritten to the first existing
+/// candidate, or returned unchanged if none exist (so it then resolves
+/// against the process's OS working directory).
+///
+/// For native bindings that take a path/dir argument straight from a JS
+/// string and hand it to C++ file I/O without going through fs.* (e.g. model
+/// loaders like bro.tts.loadKokoro) — resolve through this at the JS call
+/// boundary so their behavior matches fs.existsSync() regardless of which
+/// directory the process was actually launched from.
+std::string resolveAssetPath(JSContext* ctx, const std::string& path);
+
 } // namespace brokit::api

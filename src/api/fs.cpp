@@ -144,6 +144,11 @@ static std::string resolveFsPath(JSContext* ctx, const char* path,
     return path;
 }
 
+std::string resolveAssetPath(JSContext* ctx, const std::string& path)
+{
+    return resolveFsPath(ctx, path.c_str(), false);
+}
+
 // Helper: read encoding arg (default nullptr = buffer mode)
 static const char* getEncoding(JSContext* ctx, int argc, JSValueConst* argv, int idx)
 {
