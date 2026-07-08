@@ -47,6 +47,10 @@ embed_js(event_target.js    js_event_target)
 embed_js(message_channel.js js_message_channel)
 embed_js(fs_watch.js        js_fs_watch)
 embed_js(fetch_helpers.js   js_fetch_helpers)
+embed_js(process.js         js_process)
+embed_js(buffer.js          js_buffer)
+embed_js(events.js          js_events)
+embed_js(util.js            js_util)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -87,6 +91,9 @@ set(BROKIT_API_SOURCES
     navigator.cpp
     event_target.cpp
     message_channel.cpp
+    buffer.cpp
+    events.cpp
+    util.cpp
 )
 
 if(BROKIT_ENABLE_NOISE)

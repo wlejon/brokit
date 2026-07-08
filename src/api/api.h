@@ -53,6 +53,9 @@ void installBase64(JSContext* ctx);
 void installNavigator(JSContext* ctx);
 void installEventTarget(JSContext* ctx);
 void installMessageChannel(JSContext* ctx);
+void installBuffer(JSContext* ctx);
+void installEvents(JSContext* ctx);
+void installUtil(JSContext* ctx);
 #ifdef BROKIT_HAS_NOISE
 void installNoise(JSContext* ctx);
 #endif

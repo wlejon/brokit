@@ -294,4 +294,127 @@
 
     globalThis.URL = URL;
     globalThis.URLSearchParams = URLSearchParams;
+
+    // =========================================================================
+    // Node-compat helpers: fileURLToPath / pathToFileURL / parse / format / resolve
+    // =========================================================================
+    // Evaluated lazily (per call): url.js installs before process in installAll,
+    // so `process` may not exist yet at module-eval time.
+    function isWindows() {
+        return (typeof process !== 'undefined' && process.platform === 'win32');
+    }
+
+    function fileURLToPath(url) {
+        var u = (url instanceof URL) ? url : new URL(String(url));
+        if (u.protocol !== 'file:') {
+            throw new TypeError('The URL must be of scheme file');
+        }
+        // Decode percent-encoding (e.g. %20 -> space)
+        var decoded = decodeURIComponent(u.pathname);
+        if (isWindows()) {
+            // "/D:/x/y.js" -> "D:/x/y.js" (strip leading slash before a drive letter)
+            if (/^\/[a-zA-Z]:(\/|$)/.test(decoded)) {
+                decoded = decoded.substring(1);
+            }
+            decoded = decoded.replace(/\//g, '\\');
+        }
+        return decoded;
+    }
+
+    function pathToFileURL(p) {
+        if (typeof p !== 'string') p = String(p);
+        var resultPath;
+        if (isWindows()) {
+            var normalized = p.replace(/\\/g, '/');
+            var driveMatch = normalized.match(/^([a-zA-Z]):(\/.*)?$/);
+            if (driveMatch) {
+                var rest = driveMatch[2] || '/';
+                if (rest.charAt(0) !== '/') rest = '/' + rest;
+                resultPath = '/' + driveMatch[1] + ':' + rest;
+            } else if (normalized.charAt(0) === '/') {
+                resultPath = normalized;
+            } else {
+                resultPath = '/' + normalized;
+            }
+        } else {
+            resultPath = (p.charAt(0) === '/') ? p : '/' + p;
+        }
+
+        // Percent-encode each path segment, preserving '/' separators and a
+        // drive-letter colon (e.g. "/D:/x" must stay "/D:/x", not "/D%3A/x").
+        var segments = resultPath.split('/');
+        for (var i = 0; i < segments.length; i++) {
+            if (segments[i] === '') continue;
+            segments[i] = encodeURIComponent(segments[i]).replace(/%3A/gi, ':');
+        }
+        return new URL('file://' + segments.join('/'));
+    }
+
+    function parse(urlString) {
+        try {
+            var u = new URL(urlString);
+            return {
+                href: u.href,
+                protocol: u.protocol,
+                host: u.host,
+                hostname: u.hostname,
+                port: u.port,
+                pathname: u.pathname,
+                search: u.search,
+                hash: u.hash,
+                query: u.search.charAt(0) === '?' ? u.search.substring(1) : u.search
+            };
+        } catch (e) {
+            // Relative / unparseable input: best-effort, mirror legacy Node
+            // behavior of not throwing from url.parse().
+            return {
+                href: urlString,
+                protocol: null,
+                host: null,
+                hostname: null,
+                port: null,
+                pathname: urlString,
+                search: null,
+                hash: null,
+                query: null
+            };
+        }
+    }
+
+    function format(urlObject) {
+        if (urlObject instanceof URL) return urlObject.href;
+        if (urlObject && typeof urlObject === 'object') {
+            var protocol = urlObject.protocol || '';
+            if (protocol && protocol.charAt(protocol.length - 1) !== ':') protocol += ':';
+            var host = urlObject.host || '';
+            if (!host && urlObject.hostname) {
+                host = urlObject.hostname + (urlObject.port ? ':' + urlObject.port : '');
+            }
+            var pathname = urlObject.pathname || '';
+            var search = urlObject.search || (urlObject.query ? '?' + urlObject.query : '');
+            var hash = urlObject.hash || '';
+            var s = '';
+            if (protocol) s += protocol + (host ? '//' : '');
+            s += host + pathname + search + hash;
+            return s;
+        }
+        return String(urlObject);
+    }
+
+    function resolve(from, to) {
+        return new URL(to, from).href;
+    }
+
+    globalThis.__brokit_modules = globalThis.__brokit_modules || {};
+    globalThis.__brokit_modules['url'] = {
+        URL: globalThis.URL,
+        URLSearchParams: globalThis.URLSearchParams,
+        fileURLToPath: fileURLToPath,
+        pathToFileURL: pathToFileURL,
+        parse: parse,
+        format: format,
+        resolve: resolve,
+        domainToASCII: function(s) { return s; },
+        domainToUnicode: function(s) { return s; }
+    };
 })();

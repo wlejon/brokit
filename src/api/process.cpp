@@ -1,5 +1,6 @@
 #include "api/api.h"
 #include "runtime/runtime.h"
+#include "process.js.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -120,6 +121,39 @@ void installProcess(JSContext* ctx)
     JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "unknown"));
 #endif
 
+    // process.arch
+#if defined(_M_X64) || defined(__x86_64__)
+    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "x64"));
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "arm64"));
+#elif defined(_M_IX86) || defined(__i386__)
+    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "ia32"));
+#elif defined(_M_ARM) || defined(__arm__)
+    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "arm"));
+#else
+    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "x64"));
+#endif
+
+    // process.argv — argv[0] is the "node" executable stand-in, argv[1] the "script"
+    JSValue argv = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, argv, 0, JS_NewString(ctx, "bro"));
+    JS_SetPropertyUint32(ctx, argv, 1, JS_NewString(ctx, ""));
+    JS_SetPropertyStr(ctx, process, "argv", argv);
+
+    // process.version / process.versions
+    JS_SetPropertyStr(ctx, process, "version", JS_NewString(ctx, "v20.0.0"));
+    JSValue versions = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, versions, "node", JS_NewString(ctx, "20.0.0"));
+    JS_SetPropertyStr(ctx, versions, "v8", JS_NewString(ctx, "0.0.0"));
+    JS_SetPropertyStr(ctx, versions, "brokit", JS_NewString(ctx, "1.0.0"));
+    JS_SetPropertyStr(ctx, process, "versions", versions);
+
+    // process.pid
+    JS_SetPropertyStr(ctx, process, "pid", JS_NewInt32(ctx, 1));
+
+    // process.execPath
+    JS_SetPropertyStr(ctx, process, "execPath", JS_NewString(ctx, "bro"));
+
     JS_SetPropertyStr(ctx, global, "process", process);
     JS_FreeValue(ctx, global);
 
@@ -152,6 +186,13 @@ void installProcess(JSContext* ctx)
         Runtime::checkException(ctx, r);
     }
     JS_FreeValue(ctx, r);
+
+    // JS-layer augmentation: process.nextTick, process.hrtime, process.stdout/stderr, etc.
+    JSValue r2 = JS_Eval(ctx, js_process, strlen(js_process), "<process>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(r2)) {
+        Runtime::checkException(ctx, r2);
+    }
+    JS_FreeValue(ctx, r2);
 }
 
 } // namespace brokit::api
