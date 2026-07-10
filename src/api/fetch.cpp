@@ -510,6 +510,73 @@ static JSValue js_fetch_stream_wait(JSContext* ctx, JSValueConst, int argc, JSVa
 }
 
 // ---------------------------------------------------------------------------
+// AbortSignal support
+// ---------------------------------------------------------------------------
+static JSValue makeAbortError(JSContext* ctx)
+{
+    JSValue err = JS_NewError(ctx);
+    JS_SetPropertyStr(ctx, err, "message",
+                      JS_NewString(ctx, "The operation was aborted."));
+    JS_SetPropertyStr(ctx, err, "name", JS_NewString(ctx, "AbortError"));
+    return err;
+}
+
+// Cancel an in-flight request: detach it from curl, reject its pending
+// promise with an AbortError, and wake any stream reader so it observes the
+// end of the body. Safe to call for a streamId that already completed.
+static void abortRequest(JSContext* ctx, int streamId)
+{
+    CtxState* s = findState(ctx);
+    if (!s) return;
+    auto it = s->streams.find(streamId);
+    if (it == s->streams.end() || !it->second) return;
+    FetchRequest* req = it->second.get();
+
+    if (req->easy) {
+        removePending(*s, req);
+        if (s->multi) curl_multi_remove_handle(s->multi, req->easy);
+        curl_easy_cleanup(req->easy);
+        req->easy = nullptr;
+    }
+    req->bodyComplete = true;
+    req->chunks.clear();
+
+    const bool hadPromise = !req->headersResolved;
+    if (hadPromise) {
+        JSValue err = makeAbortError(ctx);
+        JSValue ret = JS_Call(ctx, req->resolving[1], JS_UNDEFINED, 1, &err);
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, err);
+        JS_FreeValue(ctx, req->resolving[0]);
+        JS_FreeValue(ctx, req->resolving[1]);
+        req->resolving[0] = JS_UNDEFINED;
+        req->resolving[1] = JS_UNDEFINED;
+        req->headersResolved = true;
+    }
+    if (JS_IsFunction(ctx, req->waitCallback)) {
+        JSValue cb = req->waitCallback;
+        req->waitCallback = JS_UNDEFINED;
+        JSValue ret = JS_Call(ctx, cb, JS_UNDEFINED, 0, nullptr);
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, cb);
+    }
+    // No streaming Response was handed out, so no reader can exist — free
+    // now. Otherwise stream_read sees bodyComplete + !easy and cleans up.
+    if (hadPromise) s->streams.erase(it);
+}
+
+// 'abort' listener registered on the request's AbortSignal; func_data[0]
+// holds the streamId.
+static JSValue js_fetch_abort_handler(JSContext* ctx, JSValueConst, int,
+                                      JSValueConst*, int, JSValue* func_data)
+{
+    int streamId = 0;
+    JS_ToInt32(ctx, &streamId, func_data[0]);
+    abortRequest(ctx, streamId);
+    return JS_UNDEFINED;
+}
+
+// ---------------------------------------------------------------------------
 // Tick: pump curl_multi, resolve streaming responses, notify waiting readers
 // ---------------------------------------------------------------------------
 static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
@@ -674,6 +741,34 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
 
     CtxState& s = stateOf(ctx);
 
+    // AbortSignal: an already-aborted signal rejects before any work; a live
+    // one gets a native 'abort' listener that cancels the transfer.
+    JSValue signal = JS_UNDEFINED;
+    if (argc >= 2 && JS_IsObject(argv[1])) {
+        signal = JS_GetPropertyStr(ctx, argv[1], "signal");
+        if (JS_IsObject(signal)) {
+            JSValue abortedVal = JS_GetPropertyStr(ctx, signal, "aborted");
+            const bool aborted = JS_ToBool(ctx, abortedVal);
+            JS_FreeValue(ctx, abortedVal);
+            if (aborted) {
+                JS_FreeValue(ctx, signal);
+                JSValue resolving[2];
+                JSValue promise = JS_NewPromiseCapability(ctx, resolving);
+                if (JS_IsException(promise)) return promise;
+                JSValue err = makeAbortError(ctx);
+                JSValue ret = JS_Call(ctx, resolving[1], JS_UNDEFINED, 1, &err);
+                JS_FreeValue(ctx, ret);
+                JS_FreeValue(ctx, err);
+                JS_FreeValue(ctx, resolving[0]);
+                JS_FreeValue(ctx, resolving[1]);
+                return promise;
+            }
+        } else {
+            JS_FreeValue(ctx, signal);
+            signal = JS_UNDEFINED;
+        }
+    }
+
     auto req = std::make_unique<FetchRequest>();
     req->ctx = ctx;
     req->url = url;
@@ -681,6 +776,7 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
 
     req->easy = curl_easy_init();
     if (!req->easy) {
+        JS_FreeValue(ctx, signal);
         return JS_ThrowInternalError(ctx, "fetch: curl_easy_init failed");
     }
 
@@ -691,7 +787,11 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, req.get());
     curl_easy_setopt(req->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(req->easy, CURLOPT_MAXREDIRS, 10L);
-    curl_easy_setopt(req->easy, CURLOPT_TIMEOUT, 30L);
+    // Connect-phase timeout only. A hard total timeout breaks legitimate
+    // long transfers (non-streaming LLM completions, SSE, large downloads) —
+    // standard fetch semantics is no transfer deadline; callers cancel via
+    // AbortSignal (or AbortSignal.timeout).
+    curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(req->easy, CURLOPT_USERAGENT, "brokit/0.3");
     curl_easy_setopt(req->easy, CURLOPT_ACCEPT_ENCODING, "");
 
@@ -778,6 +878,7 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
 
     JSValue promise = JS_NewPromiseCapability(ctx, req->resolving);
     if (JS_IsException(promise)) {
+        JS_FreeValue(ctx, signal);
         curl_easy_cleanup(req->easy);
         req->easy = nullptr;
         return promise;
@@ -792,6 +893,24 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     FetchRequest* raw = req.get();
     s.streams.emplace(streamId, std::move(req));
     s.pending.push_back(raw);
+
+    if (JS_IsObject(signal)) {
+        JSValue idVal = JS_NewInt32(ctx, streamId);
+        JSValue handler =
+            JS_NewCFunctionData(ctx, js_fetch_abort_handler, 0, 0, 1, &idVal);
+        JS_FreeValue(ctx, idVal); // NewCFunctionData dups func_data
+        JSValue addFn = JS_GetPropertyStr(ctx, signal, "addEventListener");
+        if (JS_IsFunction(ctx, addFn)) {
+            JSValue typeStr = JS_NewString(ctx, "abort");
+            JSValue args[2] = { typeStr, handler };
+            JSValue ret = JS_Call(ctx, addFn, signal, 2, args);
+            JS_FreeValue(ctx, ret);
+            JS_FreeValue(ctx, typeStr);
+        }
+        JS_FreeValue(ctx, addFn);
+        JS_FreeValue(ctx, handler);
+        JS_FreeValue(ctx, signal);
+    }
 
     return promise;
 }

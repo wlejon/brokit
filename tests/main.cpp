@@ -1,6 +1,7 @@
 #include "runtime/runtime.h"
 #include "api/api.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -116,10 +117,12 @@ static TestResult runTestFile(const std::string& path) {
         JSValue wsTick = JS_GetPropertyStr(ctx, global2, "__brokit_ws_tick");
         JSValue fwHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_has_pending");
         JSValue fwTick = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_tick");
+        JSValue timersTick = JS_GetPropertyStr(ctx, global2, "__brokit_tick_timers");
 
         bool haveFetch = JS_IsFunction(ctx, fetchHasPending) && JS_IsFunction(ctx, fetchTick);
         bool haveWs = JS_IsFunction(ctx, wsHasPending) && JS_IsFunction(ctx, wsTick);
         bool haveFw = JS_IsFunction(ctx, fwHasPending) && JS_IsFunction(ctx, fwTick);
+        bool haveTimers = JS_IsFunction(ctx, timersTick);
 
         if (haveFetch || haveWs || haveFw) {
             for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
@@ -152,6 +155,19 @@ static TestResult runTestFile(const std::string& path) {
                     JS_FreeValue(ctx, tr);
                 }
 
+                // Fire due setTimeout/setInterval callbacks so async tests can
+                // schedule work (e.g. aborting an in-flight fetch).
+                if (haveTimers) {
+                    JSValue nowV = JS_NewFloat64(
+                        ctx, static_cast<double>(
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count()));
+                    JSValue tr = JS_Call(ctx, timersTick, global2, 1, &nowV);
+                    JS_FreeValue(ctx, tr);
+                    JS_FreeValue(ctx, nowV);
+                }
+
                 rt.executePendingJobs();
                 if (!anyPending) break;
 
@@ -163,6 +179,7 @@ static TestResult runTestFile(const std::string& path) {
             }
         }
 
+        JS_FreeValue(ctx, timersTick);
         JS_FreeValue(ctx, fwTick);
         JS_FreeValue(ctx, fwHasPending);
         JS_FreeValue(ctx, wsTick);

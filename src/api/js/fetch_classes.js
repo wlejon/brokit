@@ -334,6 +334,7 @@
                     options.headers = h._toObject();
                 }
                 if (init.body !== undefined) options.body = init.body;
+                if (init.signal) options.signal = init.signal;
             }
         } else {
             url = String(input);
@@ -348,6 +349,7 @@
                     options.headers = {};
                 }
                 options.body = init.body;
+                if (init.signal) options.signal = init.signal;
             }
         }
 
