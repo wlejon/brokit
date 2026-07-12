@@ -57,10 +57,41 @@ struct ExecResult {
     std::string error;
 };
 
+// options.env, when present, REPLACES the child environment (Node semantics).
+using EnvList = std::vector<std::pair<std::string, std::string>>;
+
+#ifdef _WIN32
+// Double-NUL-terminated "KEY=VALUE\0" block for CreateProcessA.
+static std::string buildEnvBlock(const EnvList& env)
+{
+    std::string block;
+    for (const auto& [k, v] : env) {
+        block += k;
+        block += '=';
+        block += v;
+        block += '\0';
+    }
+    block += '\0';
+    return block;
+}
+#else
+extern "C" char** environ;
+
+// "KEY=VALUE" strings + char* view for execve-family calls.
+static std::vector<std::string> buildEnvStrings(const EnvList& env)
+{
+    std::vector<std::string> out;
+    out.reserve(env.size());
+    for (const auto& [k, v] : env) out.push_back(k + "=" + v);
+    return out;
+}
+#endif
+
 #ifdef _WIN32
 
 static ExecResult runCommand(const std::string& command, const std::string& cwd,
-                             const std::string& input, int timeoutMs, int maxBuffer)
+                             const std::string& input, int timeoutMs, int maxBuffer,
+                             const EnvList* env)
 {
     ExecResult result;
 
@@ -111,13 +142,16 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
     // Build command line: cmd /c "command"
     std::string cmdLine = "cmd /c " + command;
 
+    std::string envBlock;
+    if (env) envBlock = buildEnvBlock(*env);
+
     BOOL ok = CreateProcessA(
         nullptr,
         cmdLine.data(),
         nullptr, nullptr,
         TRUE, // inherit handles
         CREATE_NO_WINDOW,
-        nullptr,
+        env ? const_cast<char*>(envBlock.data()) : nullptr,
         cwd.empty() ? nullptr : cwd.c_str(),
         &si, &pi
     );
@@ -195,7 +229,8 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 #else // Linux/macOS
 
 static ExecResult runCommand(const std::string& command, const std::string& cwd,
-                             const std::string& input, int timeoutMs, int maxBuffer)
+                             const std::string& input, int timeoutMs, int maxBuffer,
+                             const EnvList* env)
 {
     ExecResult result;
 
@@ -227,6 +262,17 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 
         if (!cwd.empty()) {
             if (chdir(cwd.c_str()) != 0) _exit(127);
+        }
+
+        if (env) {
+            auto envStrs = buildEnvStrings(*env);
+            std::vector<char*> envp;
+            for (auto& s : envStrs) envp.push_back(const_cast<char*>(s.c_str()));
+            envp.push_back(nullptr);
+            char* const shArgv[] = { const_cast<char*>("sh"), const_cast<char*>("-c"),
+                                     const_cast<char*>(command.c_str()), nullptr };
+            execve("/bin/sh", shArgv, envp.data());
+            _exit(127);
         }
 
         execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
@@ -320,6 +366,10 @@ struct ExecOptions {
     int timeout = 0;        // 0 = no timeout
     int maxBuffer = 1024 * 1024; // 1MB default
     bool shell = true;
+    bool hasEnv = false;
+    EnvList env;            // replaces the child environment when hasEnv
+    std::string stdoutFile; // spawn only: redirect child stdout to this file
+    std::string stderrFile; // spawn only: redirect child stderr (may equal stdoutFile)
 };
 
 static ExecOptions parseOptions(JSContext* ctx, int argc, JSValueConst* argv, int optIdx)
@@ -364,6 +414,47 @@ static ExecOptions parseOptions(JSContext* ctx, int argc, JSValueConst* argv, in
     }
     JS_FreeValue(ctx, val);
 
+    val = JS_GetPropertyStr(ctx, argv[optIdx], "env");
+    if (JS_IsObject(val)) {
+        opts.hasEnv = true;
+        JSPropertyEnum* props = nullptr;
+        uint32_t count = 0;
+        if (JS_GetOwnPropertyNames(ctx, &props, &count, val,
+                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+            for (uint32_t i = 0; i < count; i++) {
+                const char* key = JS_AtomToCString(ctx, props[i].atom);
+                if (!key) continue;
+                JSValue pv = JS_GetProperty(ctx, val, props[i].atom);
+                if (!JS_IsUndefined(pv) && !JS_IsNull(pv)) {
+                    const char* pvs = JS_ToCString(ctx, pv);
+                    if (pvs) {
+                        opts.env.emplace_back(key, pvs);
+                        JS_FreeCString(ctx, pvs);
+                    }
+                }
+                JS_FreeValue(ctx, pv);
+                JS_FreeCString(ctx, key);
+            }
+            for (uint32_t i = 0; i < count; i++) JS_FreeAtom(ctx, props[i].atom);
+            js_free(ctx, props);
+        }
+    }
+    JS_FreeValue(ctx, val);
+
+    val = JS_GetPropertyStr(ctx, argv[optIdx], "stdoutFile");
+    if (JS_IsString(val)) {
+        const char* s = JS_ToCString(ctx, val);
+        if (s) { opts.stdoutFile = s; JS_FreeCString(ctx, s); }
+    }
+    JS_FreeValue(ctx, val);
+
+    val = JS_GetPropertyStr(ctx, argv[optIdx], "stderrFile");
+    if (JS_IsString(val)) {
+        const char* s = JS_ToCString(ctx, val);
+        if (s) { opts.stderrFile = s; JS_FreeCString(ctx, s); }
+    }
+    JS_FreeValue(ctx, val);
+
     return opts;
 }
 
@@ -392,7 +483,8 @@ static JSValue js_execSync(JSContext* ctx, JSValueConst, int argc, JSValueConst*
 
     auto opts = parseOptions(ctx, argc, argv, 1);
 
-    ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer);
+    ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
+                                opts.hasEnv ? &opts.env : nullptr);
 
     if (!res.error.empty()) {
         return JS_ThrowInternalError(ctx, "execSync: %s", res.error.c_str());
@@ -438,7 +530,8 @@ static JSValue js_cp_exec(JSContext* ctx, JSValueConst, int argc, JSValueConst* 
 
     auto opts = parseOptions(ctx, argc, argv, 1);
 
-    ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer);
+    ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
+                                opts.hasEnv ? &opts.env : nullptr);
 
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "stdout", stringToOutput(ctx, res.stdoutData, opts.encoding));
@@ -493,7 +586,8 @@ static JSValue js_spawnSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
     int optIdx = (argc >= 2 && JS_IsArray(argv[1])) ? 2 : 1;
     auto opts = parseOptions(ctx, argc, argv, optIdx);
 
-    ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer);
+    ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
+                                opts.hasEnv ? &opts.env : nullptr);
 
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "stdout", stringToOutput(ctx, res.stdoutData, opts.encoding));
@@ -560,23 +654,67 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     std::string cmdLine = quote(file);
     for (auto& a : args) { cmdLine += " "; cmdLine += quote(a); }
 
+    std::string envBlock;
+    if (opts.hasEnv) envBlock = buildEnvBlock(opts.env);
+
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
+
+    // stdoutFile / stderrFile redirect the child's output; the handles must be
+    // inheritable and passed via STARTF_USESTDHANDLES.
+    HANDLE hOut = nullptr, hErr = nullptr, hIn = nullptr;
+    BOOL inheritHandles = FALSE;
+    if (!opts.stdoutFile.empty() || !opts.stderrFile.empty()) {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+        if (!opts.stdoutFile.empty()) {
+            hOut = CreateFileA(opts.stdoutFile.c_str(), GENERIC_WRITE,
+                               FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hOut == INVALID_HANDLE_VALUE)
+                return JS_ThrowInternalError(ctx, "spawn: cannot open stdoutFile '%s'",
+                                             opts.stdoutFile.c_str());
+        }
+        if (!opts.stderrFile.empty()) {
+            if (opts.stderrFile == opts.stdoutFile) {
+                hErr = hOut;
+            } else {
+                hErr = CreateFileA(opts.stderrFile.c_str(), GENERIC_WRITE,
+                                   FILE_SHARE_READ, &sa, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hErr == INVALID_HANDLE_VALUE) {
+                    if (hOut) CloseHandle(hOut);
+                    return JS_ThrowInternalError(ctx, "spawn: cannot open stderrFile '%s'",
+                                                 opts.stderrFile.c_str());
+                }
+            }
+        }
+        hIn = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdOutput = hOut ? hOut : GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = hErr ? hErr : GetStdHandle(STD_ERROR_HANDLE);
+        si.hStdInput = hIn;
+        inheritHandles = TRUE;
+    }
 
     BOOL ok = CreateProcessA(
         nullptr,
         cmdLine.data(),
         nullptr, nullptr,
-        FALSE,
+        inheritHandles,
         0, // no CREATE_NO_WINDOW — let GUI children show their window
-        nullptr,
+        opts.hasEnv ? const_cast<char*>(envBlock.data()) : nullptr,
         opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
         &si, &pi);
 
+    DWORD createErr = ok ? 0 : GetLastError();
+    if (hOut) CloseHandle(hOut);
+    if (hErr && hErr != hOut) CloseHandle(hErr);
+    if (hIn && hIn != INVALID_HANDLE_VALUE) CloseHandle(hIn);
+
     if (!ok) {
-        DWORD err = GetLastError();
-        return JS_ThrowInternalError(ctx, "spawn failed: CreateProcess error %lu", err);
+        return JS_ThrowInternalError(ctx, "spawn failed: CreateProcess error %lu", createErr);
     }
     CloseHandle(pi.hThread);
     handle->process = pi.hProcess;
@@ -591,10 +729,30 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         if (!opts.cwd.empty()) {
             if (chdir(opts.cwd.c_str()) != 0) _exit(127);
         }
+        if (!opts.stdoutFile.empty()) {
+            int fd = open(opts.stdoutFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) _exit(127);
+            dup2(fd, STDOUT_FILENO);
+            if (opts.stderrFile == opts.stdoutFile) dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
+        if (!opts.stderrFile.empty() && opts.stderrFile != opts.stdoutFile) {
+            int fd = open(opts.stderrFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) _exit(127);
+            dup2(fd, STDERR_FILENO);
+            close(fd);
+        }
         std::vector<char*> argv;
         argv.push_back(const_cast<char*>(file.c_str()));
         for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
         argv.push_back(nullptr);
+        if (opts.hasEnv) {
+            auto envStrs = buildEnvStrings(opts.env);
+            std::vector<char*> envp;
+            for (auto& s : envStrs) envp.push_back(const_cast<char*>(s.c_str()));
+            envp.push_back(nullptr);
+            environ = envp.data();   // pre-exec in the forked child; execvp keeps PATH search
+        }
         execvp(file.c_str(), argv.data());
         _exit(127);
     }

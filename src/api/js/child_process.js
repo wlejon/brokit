@@ -125,6 +125,12 @@
 
     // ── spawn (async) ─────────────────────────────────────────────────────────
     // spawn(file[, args[, options]])
+    // options: { cwd, env, stdoutFile, stderrFile }
+    //   env         — REPLACES the child environment (Node semantics); spread
+    //                 process.env in yourself to extend rather than replace
+    //   stdoutFile / stderrFile — redirect child output to files (truncate on
+    //                 open; pass the same path for a combined log). Without
+    //                 them the child inherits no stdio pipes.
     // Starts a detached child process. Returns a ChildProcess with:
     //   .pid          — OS process id
     //   .killed       — boolean, true after .kill() is called
