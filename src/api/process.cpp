@@ -9,6 +9,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+extern "C" char** environ;
 #endif
 
 namespace brokit::api {
@@ -47,6 +48,35 @@ static JSValue js_env_set(JSContext* ctx, JSValueConst, int argc, JSValueConst* 
     JS_FreeCString(ctx, key);
     JS_FreeCString(ctx, val);
     return JS_UNDEFINED;
+}
+
+// process.env enumeration — all variable names, for the Proxy's ownKeys trap
+// (Object.keys / spread / Object.assign on process.env need this)
+static JSValue js_env_keys(JSContext* ctx, JSValueConst, int, JSValueConst*)
+{
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t n = 0;
+#ifdef _WIN32
+    char* block = GetEnvironmentStringsA();
+    if (block) {
+        for (char* p = block; *p; p += strlen(p) + 1) {
+            if (p[0] == '=') continue;   // cmd's hidden per-drive cwd entries
+            const char* eq = strchr(p, '=');
+            if (!eq) continue;
+            JS_SetPropertyUint32(ctx, arr, n++,
+                                 JS_NewStringLen(ctx, p, static_cast<size_t>(eq - p)));
+        }
+        FreeEnvironmentStringsA(block);
+    }
+#else
+    for (char** e = environ; e && *e; e++) {
+        const char* eq = strchr(*e, '=');
+        if (!eq) continue;
+        JS_SetPropertyUint32(ctx, arr, n++,
+                             JS_NewStringLen(ctx, *e, static_cast<size_t>(eq - *e)));
+    }
+#endif
+    return arr;
 }
 
 // process.env.KEY delete — unset an environment variable
@@ -103,6 +133,8 @@ void installProcess(JSContext* ctx)
                       JS_NewCFunction(ctx, js_env_set, "__brokit_env_set", 2));
     JS_SetPropertyStr(ctx, global, "__brokit_env_delete",
                       JS_NewCFunction(ctx, js_env_delete, "__brokit_env_delete", 1));
+    JS_SetPropertyStr(ctx, global, "__brokit_env_keys",
+                      JS_NewCFunction(ctx, js_env_keys, "__brokit_env_keys", 0));
 
     // process.cwd, process.exit
     JS_SetPropertyStr(ctx, process, "cwd",
@@ -175,6 +207,14 @@ void installProcess(JSContext* ctx)
         },
         has: function(target, prop) {
             return globalThis.__brokit_env_get(prop) !== undefined;
+        },
+        ownKeys: function(target) {
+            return globalThis.__brokit_env_keys();
+        },
+        getOwnPropertyDescriptor: function(target, prop) {
+            var v = globalThis.__brokit_env_get(prop);
+            if (v === undefined) return undefined;
+            return { value: v, writable: true, enumerable: true, configurable: true };
         }
     };
     process.env = new Proxy({}, handler);
