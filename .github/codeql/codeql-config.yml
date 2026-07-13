@@ -1,0 +1,15 @@
+name: brokit CodeQL config
+
+queries:
+  - uses: security-extended
+
+# The bundled engines (quickjs, curl, FastNoise2, sqlite) and the broimage
+# sibling are kept out of the analysis by build order (see the pre-build step in
+# codeql.yml) — that is what excludes their compiled TUs. This paths-ignore is
+# the complement: it drops any finding that originates in a vendored/sibling
+# *header* pulled into a brokit translation unit, which build order cannot
+# catch. Together they scope the Security tab to brokit's own code.
+paths-ignore:
+  - brokit/third_party
+  - broimage
+  - bromath

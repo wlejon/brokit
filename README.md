@@ -1,5 +1,9 @@
 # brokit
 
+[![CI](https://github.com/wlejon/brokit/actions/workflows/ci.yml/badge.svg)](https://github.com/wlejon/brokit/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/wlejon/brokit/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brokit/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 brokit (broke-it) is a standalone C++20 JavaScript runtime library built on [QuickJS](https://bellard.org/quickjs/). Provides web-standard APIs (WinterCG-aligned) and system APIs (Node.js conventions) without owning a DOM or rendering engine.
 
 Built as a dependency for [bro](https://github.com/wlejon/bro).

@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# brokit bundles quickjs, curl and FastNoise2 as submodules and builds them from
+# source, vendors a SQLite amalgamation, and delegates its bro.image kernels to
+# the broimage sibling (which itself needs the header-only bromath). broimage's
+# brotensor adapter is switched off (BROIMAGE_WITH_TENSOR=OFF) — brokit's image
+# glue only uses the host-pointer kernels — so the heavy tensor stack is not
+# pulled in.
+#
+#   $GITHUB_WORKSPACE/
+#     brokit/     <- this repo; quickjs/curl/FastNoise2 submodules initialised
+#     broimage/   <- sibling, image kernels
+#     bromath/    <- sibling, header-only
+#
+# The broimage submodule is pinned to an ssh:// URL for push access, so it is
+# NOT initialised here (it would need a deploy key); brokit prefers the sibling
+# checkout at ../broimage anyway. Only the three https submodules are fetched.
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
+          - { name: windows-msvc, os: windows-2022 }
+          - { name: macos-arm64,  os: macos-14 }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brokit
+
+      - name: Initialise the https submodules (skip the ssh broimage submodule)
+        shell: bash
+        run: |
+          git -C brokit submodule update --init --recursive \
+            third_party/quickjs third_party/curl third_party/FastNoise2
+
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/broimage
+          path: broimage
+
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/bromath
+          path: bromath
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S brokit -B build -DCMAKE_BUILD_TYPE=Release -DBROIMAGE_WITH_TENSOR=OFF
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 120
+
+  # ── Coverage ──────────────────────────────────────────────────────────────
+  #
+  # Debug + --coverage on Linux. --filter scopes the numbers to brokit's own
+  # code (src/); quickjs / curl / FastNoise2 / sqlite / broimage / bromath are
+  # excluded.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brokit
+
+      - name: Initialise the https submodules (skip the ssh broimage submodule)
+        shell: bash
+        run: |
+          git -C brokit submodule update --init --recursive \
+            third_party/quickjs third_party/curl third_party/FastNoise2
+
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/broimage
+          path: broimage
+
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/bromath
+          path: bromath
+
+      - name: Install gcovr
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr
+
+      - name: Configure (instrumented)
+        run: |
+          cmake -S brokit -B build -DCMAKE_BUILD_TYPE=Debug -DBROIMAGE_WITH_TENSOR=OFF \
+            -DCMAKE_C_FLAGS="--coverage" \
+            -DCMAKE_CXX_FLAGS="--coverage" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      # pipefail: piping gcovr into tee otherwise hands the step tee's exit
+      # status, so a gcovr crash produces no report and the job still goes green.
+      - name: Report
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p coverage-html
+          gcovr --root . \
+            --filter 'brokit/src/' \
+            --exclude-unreachable-branches \
+            --gcov-ignore-errors=no_working_dir_found \
+            --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+            --print-summary \
+            --html-details coverage-html/index.html \
+            | tee coverage-summary.txt
+          test -s coverage-html/index.html
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage — `src/`'
+            echo
+            echo 'The bundled quickjs/curl/FastNoise2/sqlite and the siblings are filtered out.'
+            echo
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-html
+          path: coverage-html/
+          retention-days: 14

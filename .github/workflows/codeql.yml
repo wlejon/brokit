@@ -1,0 +1,87 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+# brokit is a JS runtime embedding QuickJS: it marshals untrusted script values
+# across the native boundary (typed arrays, fetch/URL parsing, SQLite binds) and
+# does a lot of pointer + length arithmetic in the C++ glue. That marshalling
+# layer is where a bounds slip or type-confusion hides, so that is what the
+# analysis targets — the bundled engines are excluded.
+jobs:
+  analyze:
+    name: Analyze C++
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brokit
+
+      - name: Initialise the https submodules (skip the ssh broimage submodule)
+        shell: bash
+        run: |
+          git -C brokit submodule update --init --recursive \
+            third_party/quickjs third_party/curl third_party/FastNoise2
+
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/broimage
+          path: broimage
+
+      - uses: actions/checkout@v7
+        with:
+          repository: wlejon/bromath
+          path: bromath
+
+      # Debug / -O0 keeps the extracted IR close to the source so dataflow paths
+      # in the results point at code a human can act on.
+      - name: Configure
+        run: cmake -S brokit -B build -DCMAKE_BUILD_TYPE=Debug -DBROIMAGE_WITH_TENSOR=OFF
+
+      # The bundled engines and the broimage sibling are compiled here, ahead of
+      # `init`. For a compiled language CodeQL only extracts what it observes the
+      # compiler build while tracing, so anything already built when `init` runs
+      # is never analysed. That is the exclusion mechanism — paths-ignore does not
+      # filter compiled sources — and it keeps quickjs / curl / FastNoise2 /
+      # sqlite / broimage out of brokit's Security tab, where they do not belong
+      # (each is upstream with its own maintainers). bromath is header-only.
+      - name: Pre-build the bundled engines and broimage (outside the traced build)
+        run: |
+          cmake --build build --parallel 4 --target \
+            qjs libcurl_static FastNoise sqlite3 broimage
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: security-extended
+          # Relative to the workspace root; this repo is checked out into brokit/
+          # (not the root) so the siblings can sit beside it. paths-ignore is the
+          # second line of defence, catching any finding that originates in a
+          # vendored/sibling *header* pulled into a brokit TU.
+          config-file: brokit/.github/codeql/codeql-config.yml
+
+      # Only brokit's own library TUs are left to compile, so only they are
+      # traced.
+      - name: Build brokit (traced)
+        run: cmake --build build --parallel 4 --target brokit_runtime brokit_api
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:c-cpp
