@@ -720,12 +720,25 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     handle->process = pi.hProcess;
     handle->pid = pi.dwProcessId;
 #else
+    // Self-pipe so an execvp failure in the child (e.g. a missing binary)
+    // surfaces synchronously here, matching Windows' CreateProcess failure. The
+    // write end is close-on-exec: a successful exec closes it (parent reads EOF);
+    // a failed exec writes errno through it before _exit.
+    int execPipe[2] = {-1, -1};
+    if (pipe(execPipe) != 0) {
+        return JS_ThrowInternalError(ctx, "spawn failed: pipe");
+    }
+    fcntl(execPipe[1], F_SETFD, fcntl(execPipe[1], F_GETFD) | FD_CLOEXEC);
+
     pid_t pid = fork();
     if (pid < 0) {
+        close(execPipe[0]);
+        close(execPipe[1]);
         return JS_ThrowInternalError(ctx, "spawn failed: fork");
     }
     if (pid == 0) {
         // Child
+        close(execPipe[0]);
         if (!opts.cwd.empty()) {
             if (chdir(opts.cwd.c_str()) != 0) _exit(127);
         }
@@ -754,9 +767,33 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
             environ = envp.data();   // pre-exec in the forked child; execvp keeps PATH search
         }
         execvp(file.c_str(), argv.data());
+        int execErrno = errno;
+        // Report the exec failure to the parent, then exit. Loop guards against
+        // a short write; the parent only inspects the first int.
+        const char* p = reinterpret_cast<const char*>(&execErrno);
+        size_t left = sizeof(execErrno);
+        while (left > 0) {
+            ssize_t n = write(execPipe[1], p, left);
+            if (n <= 0) break;
+            p += n;
+            left -= static_cast<size_t>(n);
+        }
         _exit(127);
     }
     handle->pid = pid;
+
+    // Parent: wait for the child to either exec (EOF) or report an errno.
+    close(execPipe[1]);
+    int childErrno = 0;
+    ssize_t got = read(execPipe[0], &childErrno, sizeof(childErrno));
+    close(execPipe[0]);
+    if (got == static_cast<ssize_t>(sizeof(childErrno)) && childErrno != 0) {
+        // exec failed in the child — reap the transient process and throw.
+        int status = 0;
+        waitpid(pid, &status, 0);
+        return JS_ThrowInternalError(ctx, "spawn failed: %s: %s",
+                                     file.c_str(), strerror(childErrno));
+    }
 #endif
 
     int id = g_nextChildId.fetch_add(1);
