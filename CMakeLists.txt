@@ -70,6 +70,16 @@ if(BROKIT_ENABLE_NOISE)
     endif()
 endif()
 
+# miniz — amalgamation build (single file, no submodule); DEFLATE backend
+# for CompressionStream / DecompressionStream
+if(NOT TARGET miniz)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniz/CMakeLists.txt")
+        add_subdirectory(third_party/miniz EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR "miniz not found. Place miniz.c/h in third_party/miniz/")
+    endif()
+endif()
+
 # SQLite — amalgamation build (single file, no submodule)
 if(NOT TARGET sqlite3)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite/CMakeLists.txt")

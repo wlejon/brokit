@@ -48,6 +48,12 @@
             self._closedResolve = resolve;
             self._closedReject = reject;
         });
+
+        // The spec stores ready/closed with [[PromiseIsHandled]] = true: a
+        // stream erroring must not fire an unhandled rejection just because
+        // nobody awaited writer.closed. Callers who do await still see it.
+        this._readyPromise.then(null, function() {});
+        this._closedPromise.then(null, function() {});
     }
 
     Object.defineProperties(WritableStreamDefaultWriter.prototype, {

@@ -54,6 +54,7 @@ void installNavigator(JSContext* ctx);
 void installEventTarget(JSContext* ctx);
 void installMessageChannel(JSContext* ctx);
 void installBuffer(JSContext* ctx);
+void installCompression(JSContext* ctx);
 void installEvents(JSContext* ctx);
 void installUtil(JSContext* ctx);
 #ifdef BROKIT_HAS_NOISE

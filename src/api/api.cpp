@@ -289,6 +289,7 @@ void installAll(JSContext* ctx)
     installEventSource(ctx);
     installFormData(ctx);
     installFetchClasses(ctx);
+    installCompression(ctx);
     installBase64(ctx);
     installNavigator(ctx);
     installEventTarget(ctx);

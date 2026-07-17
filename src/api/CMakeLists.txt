@@ -51,6 +51,7 @@ embed_js(process.js         js_process)
 embed_js(buffer.js          js_buffer)
 embed_js(events.js          js_events)
 embed_js(util.js            js_util)
+embed_js(compression.js     js_compression)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -94,6 +95,7 @@ set(BROKIT_API_SOURCES
     buffer.cpp
     events.cpp
     util.cpp
+    compression.cpp
 )
 
 if(BROKIT_ENABLE_NOISE)
@@ -137,6 +139,7 @@ target_include_directories(brokit_api PRIVATE ${GEN_DIR})
 target_link_libraries(brokit_api PUBLIC brokit_runtime)
 target_link_libraries(brokit_api PUBLIC libcurl_static)
 target_link_libraries(brokit_api PUBLIC sqlite3)
+target_link_libraries(brokit_api PRIVATE miniz)
 target_include_directories(brokit_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party/quickjs)
 
 if(BROKIT_ENABLE_NOISE)

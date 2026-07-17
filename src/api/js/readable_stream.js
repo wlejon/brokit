@@ -92,6 +92,10 @@
             self._closedResolve = resolve;
             self._closedReject = reject;
         });
+        // The spec stores closed with [[PromiseIsHandled]] = true: a stream
+        // erroring must not fire an unhandled rejection just because nobody
+        // awaited reader.closed. Callers who do await still see it.
+        this._closedPromise.then(null, function() {});
     }
 
     Object.defineProperty(ReadableStreamDefaultReader.prototype, 'closed', {
@@ -294,13 +298,25 @@
             : null;
 
         if (writer) {
+            // Errors surface on transform.readable (the transform errors it);
+            // the handlers here only stop the pump and silence what would
+            // otherwise be unhandled rejections (e.g. a codec transform
+            // rejecting a write, or a flush failing at close).
+            var noop = function() {};
             function pump() {
                 reader.read().then(function(result) {
                     if (result.done) {
-                        writer.close();
+                        var p = writer.close();
+                        if (p && p.then) p.then(null, noop);
                         return;
                     }
-                    writer.write(result.value).then(pump);
+                    writer.write(result.value).then(pump, function(e) {
+                        var p = reader.cancel(e);
+                        if (p && p.then) p.then(null, noop);
+                    });
+                }, function(e) {
+                    var p = writer.abort(e);
+                    if (p && p.then) p.then(null, noop);
                 });
             }
             pump();
