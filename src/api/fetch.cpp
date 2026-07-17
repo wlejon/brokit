@@ -182,6 +182,12 @@ static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
 
     if (clean.size() >= 2 && clean[1] == ':') return clean;
     if (!clean.empty() && (clean[0] == '/' || clean[0] == '\\')) {
+        // A leading slash is ambiguous: it may be a genuine absolute POSIX path
+        // (e.g. /tmp/foo.txt) or a web-root-relative path to resolve against the
+        // base paths. Honor a real absolute file first; only strip-and-search
+        // when nothing exists at the rooted location.
+        std::ifstream absTest(clean, std::ios::binary);
+        if (absTest.good()) return clean;
         clean = clean.substr(1);
     }
 

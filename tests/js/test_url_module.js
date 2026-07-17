@@ -10,20 +10,24 @@ assertEqual(urlMod.URL, URL, "require('url').URL === URL");
 assertEqual(urlMod.URLSearchParams, URLSearchParams, "require('url').URLSearchParams === URLSearchParams");
 
 // --- pathToFileURL / fileURLToPath round-trip ---
+// fileURLToPath / pathToFileURL are platform-dependent (as in Node): a drive
+// path is absolute only on Windows, a leading-slash path only on POSIX. Use an
+// input that is actually absolute on the host OS so the round-trip is identity.
 var fileURLToPath = urlMod.fileURLToPath;
 var pathToFileURL = urlMod.pathToFileURL;
+var absPath = (typeof process !== 'undefined' && process.platform === 'win32') ? 'D:/x/y.js' : '/x/y.js';
 
-var roundTripped = fileURLToPath(pathToFileURL('D:/x/y.js')).replace(/\\/g, '/');
-assertEqual(roundTripped, 'D:/x/y.js', 'fileURLToPath(pathToFileURL(...)) round-trips');
+var roundTripped = fileURLToPath(pathToFileURL(absPath)).replace(/\\/g, '/');
+assertEqual(roundTripped, absPath, 'fileURLToPath(pathToFileURL(...)) round-trips');
 
 // pathToFileURL returns a URL instance with a file: protocol
-var fu = pathToFileURL('D:/x/y.js');
+var fu = pathToFileURL(absPath);
 assert(fu instanceof URL, 'pathToFileURL returns a URL instance');
 assertEqual(fu.protocol, 'file:', 'pathToFileURL URL has file: protocol');
 
 // fileURLToPath accepts a URL object directly (not just a string)
 var pathFromUrlObj = fileURLToPath(fu).replace(/\\/g, '/');
-assertEqual(pathFromUrlObj, 'D:/x/y.js', 'fileURLToPath accepts a URL object');
+assertEqual(pathFromUrlObj, absPath, 'fileURLToPath accepts a URL object');
 
 // --- new (require('url').URL) works and behaves like the global URL ---
 var u = new (urlMod.URL)('https://a.com/p?q=1');
