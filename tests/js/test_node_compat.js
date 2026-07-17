@@ -36,9 +36,12 @@ assert(util.promisify(function (v, cb) { cb(null, v); })(1) instanceof Promise, 
 assertEqual(util.format('%s-%d', 'a', 3), 'a-3', 'util.format specifiers');
 
 // --- url: fileURLToPath <-> pathToFileURL round-trip ------------------------
+// Platform-dependent (as in Node): use an input that is absolute on the host OS
+// so the round-trip is identity (drive path on Windows, /-rooted on POSIX).
 var url = require('url');
-var rt = url.fileURLToPath(url.pathToFileURL('D:/x/y.js')).replace(/\\/g, '/');
-assertEqual(rt, 'D:/x/y.js', 'url fileURLToPath(pathToFileURL()) round-trips');
+var urlAbsPath = (typeof process !== 'undefined' && process.platform === 'win32') ? 'D:/x/y.js' : '/x/y.js';
+var rt = url.fileURLToPath(url.pathToFileURL(urlAbsPath)).replace(/\\/g, '/');
+assertEqual(rt, urlAbsPath, 'url fileURLToPath(pathToFileURL()) round-trips');
 assertEqual(url.URL, URL, "require('url').URL === global URL");
 
 // --- process: shims agents/deps probe --------------------------------------

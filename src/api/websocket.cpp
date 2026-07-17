@@ -44,6 +44,13 @@ struct WSConnection {
 
     // Error message if connection failed
     std::string errorMsg;
+
+    // Ticks a closed (state 3) connection has survived without a JS reader
+    // claiming its close event. A connection wrapped by a WebSocket instance is
+    // drained and erased in the same tick it closes; anything still counting up
+    // here is orphaned (opened through the raw __brokit_ws_* bindings) and gets
+    // reaped so it stops holding __brokit_ws_has_pending() true forever.
+    int closedSweeps = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -471,6 +478,25 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
         }
         JS_FreeValue(ctx, drainFn);
         JS_FreeValue(ctx, global);
+    }
+
+    // Reap orphaned closed connections. When a connection reaches state 3 its
+    // close event is delivered to a bound WebSocket instance within this same
+    // tick (drain → recv → erase, above). Any connection still in state 3 on a
+    // later tick has no instance draining it — it was opened through the raw
+    // __brokit_ws_* bindings with no WebSocket wrapper — and would otherwise keep
+    // __brokit_ws_has_pending() true forever, pinning the event-loop pump until
+    // it hits its iteration budget. Give the close event one tick to be claimed,
+    // then drop it.
+    for (auto it = g_ws_conns.begin(); it != g_ws_conns.end();) {
+        WSConnection* conn = it->second;
+        if (conn->state == 3 && conn->inbox.empty() && ++conn->closedSweeps > 1) {
+            if (conn->easy) curl_easy_cleanup(conn->easy);
+            delete conn;
+            it = g_ws_conns.erase(it);
+        } else {
+            ++it;
+        }
     }
 
     return JS_NewInt32(ctx, 0);
