@@ -6,8 +6,10 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <atomic>
 
@@ -89,6 +91,35 @@ static std::vector<std::string> buildEnvStrings(const EnvList& env)
 
 #ifdef _WIN32
 
+// Build a PROC_THREAD_ATTRIBUTE_HANDLE_LIST restricting inheritance to exactly
+// the given handles. bInheritHandles=TRUE alone leaks EVERY inheritable handle
+// in the process into the child — a concurrently spawned child then inherits
+// another child's pipe write end, and that pipe's ReadFile never sees EOF
+// until the unrelated child exits (the classic cross-spawn EOF hang).
+// Returns false (with attrBuf left empty) if the attribute list cannot be
+// built; callers then fall back to plain inheritance.
+static bool buildHandleList(std::vector<uint8_t>& attrBuf,
+                            const HANDLE* handles, size_t count)
+{
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+    if (attrSize == 0) return false;
+    attrBuf.resize(attrSize);
+    auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    if (!InitializeProcThreadAttributeList(list, 1, 0, &attrSize)) {
+        attrBuf.clear();
+        return false;
+    }
+    if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   const_cast<HANDLE*>(handles),
+                                   count * sizeof(HANDLE), nullptr, nullptr)) {
+        DeleteProcThreadAttributeList(list);
+        attrBuf.clear();
+        return false;
+    }
+    return true;
+}
+
 static ExecResult runCommand(const std::string& command, const std::string& cwd,
                              const std::string& input, int timeoutMs, int maxBuffer,
                              const EnvList* env)
@@ -130,12 +161,20 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
     }
     SetHandleInformation(hStdinWrite, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si = {};
-    si.cb = sizeof(si);
-    si.hStdOutput = hStdoutWrite;
-    si.hStdError = hStderrWrite;
-    si.hStdInput = hStdinRead;
-    si.dwFlags |= STARTF_USESTDHANDLES;
+    STARTUPINFOEXA six = {};
+    six.StartupInfo.cb = sizeof(six);
+    six.StartupInfo.hStdOutput = hStdoutWrite;
+    six.StartupInfo.hStdError = hStderrWrite;
+    six.StartupInfo.hStdInput = hStdinRead;
+    six.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+
+    // Restrict inheritance to exactly this child's three pipe ends so
+    // concurrent spawns can't cross-inherit each other's write ends.
+    HANDLE inheritList[3] = { hStdoutWrite, hStderrWrite, hStdinRead };
+    std::vector<uint8_t> attrBuf;
+    bool haveAttrList = buildHandleList(attrBuf, inheritList, 3);
+    if (haveAttrList)
+        six.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
 
     PROCESS_INFORMATION pi = {};
 
@@ -149,12 +188,16 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
         nullptr,
         cmdLine.data(),
         nullptr, nullptr,
-        TRUE, // inherit handles
-        CREATE_NO_WINDOW,
+        TRUE, // inherit handles (limited by the attribute list when present)
+        CREATE_NO_WINDOW | (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0),
         env ? const_cast<char*>(envBlock.data()) : nullptr,
         cwd.empty() ? nullptr : cwd.c_str(),
-        &si, &pi
+        &six.StartupInfo, &pi
     );
+
+    if (haveAttrList)
+        DeleteProcThreadAttributeList(
+            reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data()));
 
     // Close write ends of pipes in parent
     CloseHandle(hStdoutWrite);
@@ -177,6 +220,28 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
     }
     CloseHandle(hStdinWrite);
 
+    // Drain stdout/stderr on their own threads BEFORE waiting on the process.
+    // Waiting first deadlocks when the child fills a pipe (~4 KB kernel
+    // buffer) and blocks in write() while we block in WaitForSingleObject.
+    // Past maxBuffer we keep reading and discard, so a chatty child is never
+    // back-pressured into the same deadlock either.
+    std::atomic<bool> outDone{false}, errDone{false};
+    auto drain = [maxBuffer](HANDLE h, std::string* out, std::atomic<bool>* done) {
+        char buf[4096];
+        DWORD bytesRead = 0;
+        while (ReadFile(h, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
+            if (maxBuffer > 0 && out->size() >= static_cast<size_t>(maxBuffer))
+                continue;  // cap reached: keep draining, discard
+            size_t take = bytesRead;
+            if (maxBuffer > 0 && out->size() + take > static_cast<size_t>(maxBuffer))
+                take = static_cast<size_t>(maxBuffer) - out->size();
+            out->append(buf, take);
+        }
+        done->store(true, std::memory_order_release);
+    };
+    std::thread outThread(drain, hStdoutRead, &result.stdoutData, &outDone);
+    std::thread errThread(drain, hStderrRead, &result.stderrData, &errDone);
+
     // Wait for process
     DWORD waitTime = (timeoutMs > 0) ? static_cast<DWORD>(timeoutMs) : INFINITE;
     DWORD waitResult = WaitForSingleObject(pi.hProcess, waitTime);
@@ -192,31 +257,24 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
         result.exitCode = static_cast<int>(exitCode);
     }
 
-    // Read stdout
-    {
-        char buf[4096];
-        DWORD bytesRead;
-        while (ReadFile(hStdoutRead, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
-            if (maxBuffer > 0 && result.stdoutData.size() + bytesRead > static_cast<size_t>(maxBuffer)) {
-                result.stdoutData.append(buf, static_cast<size_t>(maxBuffer) - result.stdoutData.size());
-                break;
+    // The readers exit at EOF, which arrives once every write-end copy is
+    // closed. After a timeout kill, a surviving grandchild (cmd /c children
+    // inherit the std handles) can hold a write end open indefinitely —
+    // cancel the blocked reads instead of joining forever. CancelSynchronousIo
+    // only lands while the thread is inside ReadFile (ERROR_NOT_FOUND
+    // otherwise), so retry briefly until the reader reports done.
+    if (result.timedOut) {
+        auto cancelReader = [](std::thread& t, std::atomic<bool>& done) {
+            for (int i = 0; i < 200 && !done.load(std::memory_order_acquire); ++i) {
+                CancelSynchronousIo(t.native_handle());
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
-            result.stdoutData.append(buf, bytesRead);
-        }
+        };
+        cancelReader(outThread, outDone);
+        cancelReader(errThread, errDone);
     }
-
-    // Read stderr
-    {
-        char buf[4096];
-        DWORD bytesRead;
-        while (ReadFile(hStderrRead, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
-            if (maxBuffer > 0 && result.stderrData.size() + bytesRead > static_cast<size_t>(maxBuffer)) {
-                result.stderrData.append(buf, static_cast<size_t>(maxBuffer) - result.stderrData.size());
-                break;
-            }
-            result.stderrData.append(buf, bytesRead);
-        }
-    }
+    outThread.join();
+    errThread.join();
 
     CloseHandle(hStdoutRead);
     CloseHandle(hStderrRead);
@@ -657,14 +715,16 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     std::string envBlock;
     if (opts.hasEnv) envBlock = buildEnvBlock(opts.env);
 
-    STARTUPINFOA si = {};
-    si.cb = sizeof(si);
+    STARTUPINFOEXA six = {};
+    six.StartupInfo.cb = sizeof(six);
     PROCESS_INFORMATION pi = {};
 
     // stdoutFile / stderrFile redirect the child's output; the handles must be
     // inheritable and passed via STARTF_USESTDHANDLES.
     HANDLE hOut = nullptr, hErr = nullptr, hIn = nullptr;
     BOOL inheritHandles = FALSE;
+    std::vector<uint8_t> attrBuf;
+    bool haveAttrList = false;
     if (!opts.stdoutFile.empty() || !opts.stderrFile.empty()) {
         SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
         if (!opts.stdoutFile.empty()) {
@@ -691,11 +751,28 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         }
         hIn = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                           &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdOutput = hOut ? hOut : GetStdHandle(STD_OUTPUT_HANDLE);
-        si.hStdError = hErr ? hErr : GetStdHandle(STD_ERROR_HANDLE);
-        si.hStdInput = hIn;
+        six.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        six.StartupInfo.hStdOutput = hOut ? hOut : GetStdHandle(STD_OUTPUT_HANDLE);
+        six.StartupInfo.hStdError = hErr ? hErr : GetStdHandle(STD_ERROR_HANDLE);
+        six.StartupInfo.hStdInput = hIn;
         inheritHandles = TRUE;
+
+        // Restrict inheritance to this child's own std handles — same
+        // cross-spawn hazard as runCommand: without a handle list a child
+        // spawned here also inherits every concurrently live pipe end.
+        // Only when all three std handles are ones we created: a GetStdHandle
+        // fallback handle may not be inheritable, and putting it in the list
+        // (or omitting it) would break the child's stdio.
+        if (hOut && hErr) {
+            HANDLE inheritList[3];
+            size_t n = 0;
+            inheritList[n++] = hOut;
+            if (hErr != hOut) inheritList[n++] = hErr;
+            if (hIn && hIn != INVALID_HANDLE_VALUE) inheritList[n++] = hIn;
+            haveAttrList = buildHandleList(attrBuf, inheritList, n);
+            if (haveAttrList)
+                six.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+        }
     }
 
     BOOL ok = CreateProcessA(
@@ -703,12 +780,16 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         cmdLine.data(),
         nullptr, nullptr,
         inheritHandles,
-        0, // no CREATE_NO_WINDOW — let GUI children show their window
+        // no CREATE_NO_WINDOW — let GUI children show their window
+        haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0,
         opts.hasEnv ? const_cast<char*>(envBlock.data()) : nullptr,
         opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
-        &si, &pi);
+        &six.StartupInfo, &pi);
 
     DWORD createErr = ok ? 0 : GetLastError();
+    if (haveAttrList)
+        DeleteProcThreadAttributeList(
+            reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data()));
     if (hOut) CloseHandle(hOut);
     if (hErr && hErr != hOut) CloseHandle(hErr);
     if (hIn && hIn != INVALID_HANDLE_VALUE) CloseHandle(hIn);
