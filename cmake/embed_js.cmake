@@ -18,14 +18,19 @@
 file(READ "${INPUT}" JS_HEX HEX)
 get_filename_component(INPUT_NAME "${INPUT}" NAME)
 
-# Turn the flat hex string ("2f2a...") into "0xNN," byte initializers, wrapping
-# lines periodically so the generated header stays readable.
-string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," JS_BYTES "${JS_HEX}")
-string(REGEX REPLACE "((0x..,){20})" "\\1\n" JS_BYTES "${JS_BYTES}")
+# Turn the flat hex string ("2f2a...") into "char(0xNN)," initializers, wrapping
+# lines periodically so the generated header stays readable. Each element is
+# cast to char explicitly: bytes >= 0x80 (UTF-8 lead/continuation bytes in the
+# source) do not fit in a signed char, so a bare `0xE2` initializer narrows and
+# GCC/Clang reject it in a braced-init list (MSVC only warns). `char(0xNN)` is
+# already char-typed, so no narrowing occurs, and the symbol stays `const char[]`
+# for the strlen/sizeof consumers.
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "char(0x\\1)," JS_BYTES "${JS_HEX}")
+string(REGEX REPLACE "((char\\(0x..\\),){20})" "\\1\n" JS_BYTES "${JS_BYTES}")
 
 file(WRITE "${OUTPUT}"
 "// Auto-generated from ${INPUT_NAME} — do not edit.\n\
 #pragma once\n\
 static const char ${VAR_NAME}[] = {\n\
-${JS_BYTES} 0x00 };\n"
+${JS_BYTES} char(0x00) };\n"
 )
