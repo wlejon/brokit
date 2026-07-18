@@ -308,10 +308,12 @@ void installAll(JSContext* ctx)
     installUtil(ctx);
     installBuffer(ctx);
 
-    // Raw sockets. net.js extends EventEmitter and prefers Buffer for
-    // delivered chunks, so it follows the Node-compat block.
+    // Raw sockets + WebSocket server. net.js/dgram.js extend EventEmitter and
+    // prefer Buffer for delivered chunks, so these follow the Node-compat
+    // block; websocket_server.js requires the net module in turn.
     installNet(ctx);
     installNetJS(ctx);
+    installWebSocketServerJS(ctx);
 
     // require() must come last — after all modules are installed
     installRequire(ctx);

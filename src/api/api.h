@@ -52,6 +52,9 @@ void installNet(JSContext* ctx);
 /// Node-compat `net` + `dgram` modules over installNet. Requires
 /// installEvents (EventEmitter) to have run first.
 void installNetJS(JSContext* ctx);
+/// RFC 6455 WebSocketServer over the `net` module. Requires installNetJS,
+/// installEncoding, installBase64, and installTimers to have run first.
+void installWebSocketServerJS(JSContext* ctx);
 void installEventSource(JSContext* ctx);
 void installFormData(JSContext* ctx);
 void installFetchClasses(JSContext* ctx);

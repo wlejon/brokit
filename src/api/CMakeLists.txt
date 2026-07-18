@@ -54,6 +54,7 @@ embed_js(util.js            js_util)
 embed_js(compression.js     js_compression)
 embed_js(net.js             js_net)
 embed_js(dgram.js           js_dgram)
+embed_js(websocket_server.js js_websocket_server)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -100,6 +101,7 @@ set(BROKIT_API_SOURCES
     compression.cpp
     net.cpp
     net_js.cpp
+    websocket_server_js.cpp
 )
 
 if(BROKIT_ENABLE_NOISE)
