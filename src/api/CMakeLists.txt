@@ -52,6 +52,7 @@ embed_js(buffer.js          js_buffer)
 embed_js(events.js          js_events)
 embed_js(util.js            js_util)
 embed_js(compression.js     js_compression)
+embed_js(net.js             js_net)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +97,8 @@ set(BROKIT_API_SOURCES
     events.cpp
     util.cpp
     compression.cpp
+    net.cpp
+    net_js.cpp
 )
 
 if(BROKIT_ENABLE_NOISE)
@@ -157,6 +160,10 @@ endif()
 # framework for FSEvents.
 find_package(Threads REQUIRED)
 target_link_libraries(brokit_api PUBLIC Threads::Threads)
+# net.cpp — raw TCP/UDP sockets need Winsock on Windows.
+if(WIN32)
+    target_link_libraries(brokit_api PUBLIC ws2_32)
+endif()
 if(APPLE)
     target_link_libraries(brokit_api PUBLIC "-framework CoreServices" "-framework CoreFoundation")
 endif()

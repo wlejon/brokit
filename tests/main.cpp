@@ -117,14 +117,17 @@ static TestResult runTestFile(const std::string& path) {
         JSValue wsTick = JS_GetPropertyStr(ctx, global2, "__brokit_ws_tick");
         JSValue fwHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_has_pending");
         JSValue fwTick = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_tick");
+        JSValue netHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_net_has_pending");
+        JSValue netTick = JS_GetPropertyStr(ctx, global2, "__brokit_net_tick");
         JSValue timersTick = JS_GetPropertyStr(ctx, global2, "__brokit_tick_timers");
 
         bool haveFetch = JS_IsFunction(ctx, fetchHasPending) && JS_IsFunction(ctx, fetchTick);
         bool haveWs = JS_IsFunction(ctx, wsHasPending) && JS_IsFunction(ctx, wsTick);
         bool haveFw = JS_IsFunction(ctx, fwHasPending) && JS_IsFunction(ctx, fwTick);
+        bool haveNet = JS_IsFunction(ctx, netHasPending) && JS_IsFunction(ctx, netTick);
         bool haveTimers = JS_IsFunction(ctx, timersTick);
 
-        if (haveFetch || haveWs || haveFw) {
+        if (haveFetch || haveWs || haveFw || haveNet) {
             for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
                 bool anyPending = false;
 
@@ -155,6 +158,15 @@ static TestResult runTestFile(const std::string& path) {
                     JS_FreeValue(ctx, tr);
                 }
 
+                if (haveNet) {
+                    JSValue p = JS_Call(ctx, netHasPending, global2, 0, nullptr);
+                    if (JS_ToBool(ctx, p)) anyPending = true;
+                    JS_FreeValue(ctx, p);
+
+                    JSValue tr = JS_Call(ctx, netTick, global2, 0, nullptr);
+                    JS_FreeValue(ctx, tr);
+                }
+
                 // Fire due setTimeout/setInterval callbacks so async tests can
                 // schedule work (e.g. aborting an in-flight fetch).
                 if (haveTimers) {
@@ -180,6 +192,8 @@ static TestResult runTestFile(const std::string& path) {
         }
 
         JS_FreeValue(ctx, timersTick);
+        JS_FreeValue(ctx, netTick);
+        JS_FreeValue(ctx, netHasPending);
         JS_FreeValue(ctx, fwTick);
         JS_FreeValue(ctx, fwHasPending);
         JS_FreeValue(ctx, wsTick);

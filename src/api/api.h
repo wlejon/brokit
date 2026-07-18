@@ -46,6 +46,12 @@ void cleanupIndexedDB(JSContext* ctx);
 void installWritableStream(JSContext* ctx);
 void installWebSocket(JSContext* ctx);
 void installWebSocketJS(JSContext* ctx);
+/// Raw TCP/UDP sockets: native __brokit_net_* bindings (nonblocking, pumped
+/// by the host via __brokit_net_tick like fetch/websocket).
+void installNet(JSContext* ctx);
+/// Node-compat `net` module over installNet. Requires installEvents
+/// (EventEmitter) to have run first.
+void installNetJS(JSContext* ctx);
 void installEventSource(JSContext* ctx);
 void installFormData(JSContext* ctx);
 void installFetchClasses(JSContext* ctx);

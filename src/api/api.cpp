@@ -308,6 +308,11 @@ void installAll(JSContext* ctx)
     installUtil(ctx);
     installBuffer(ctx);
 
+    // Raw sockets. net.js extends EventEmitter and prefers Buffer for
+    // delivered chunks, so it follows the Node-compat block.
+    installNet(ctx);
+    installNetJS(ctx);
+
     // require() must come last — after all modules are installed
     installRequire(ctx);
 }
