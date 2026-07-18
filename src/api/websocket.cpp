@@ -301,9 +301,12 @@ static JSValue js_ws_recv(JSContext* ctx, JSValueConst, int argc, JSValueConst* 
         JS_SetPropertyStr(ctx, result, "code", JS_NewInt32(ctx, conn->closeCode));
         JS_SetPropertyStr(ctx, result, "reason",
             JS_NewString(ctx, conn->closeReason.c_str()));
-        // Clean up
+        // Clean up (established handles are still in the multi — see js_ws_tick)
         g_ws_conns.erase(it);
-        if (conn->easy) curl_easy_cleanup(conn->easy);
+        if (conn->easy) {
+            if (g_ws_multi) curl_multi_remove_handle(g_ws_multi, conn->easy);
+            curl_easy_cleanup(conn->easy);
+        }
         delete conn;
         return result;
     }
@@ -353,7 +356,16 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
             }
             if (!conn) continue;
 
-            curl_multi_remove_handle(g_ws_multi, easy);
+            // NOTE: on success the easy handle STAYS in the multi. With
+            // CONNECT_ONLY=2 the upgraded TCP connection is owned by the
+            // multi's pool; curl_multi_remove_handle here makes curl return
+            // the connection to the pool and close it ("left intact" then
+            // "closing connection"), after which every curl_ws_recv/send
+            // fails with CURLE_BAD_FUNCTION_ARGUMENT ("[WS] connection not
+            // found"). Removal happens at teardown, right before
+            // curl_easy_cleanup.
+            if (msg->data.result != CURLE_OK)
+                curl_multi_remove_handle(g_ws_multi, easy);
 
             if (msg->data.result == CURLE_OK) {
                 conn->state = 1; // open
@@ -407,10 +419,14 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
 
             if (rc == CURLE_AGAIN) break; // no data available
             if (rc != CURLE_OK) {
-                // Connection error or closed
+                // Connection error or closed — surface WHICH error so the JS
+                // side can report something better than a bare 1006.
                 if (conn->state != 3) {
                     conn->state = 3;
                     if (conn->closeCode == 0) conn->closeCode = 1006; // abnormal
+                    if (conn->errorMsg.empty())
+                        conn->errorMsg = std::string("curl_ws_recv: ") +
+                                         curl_easy_strerror(rc);
                 }
                 break;
             }
@@ -491,7 +507,10 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
     for (auto it = g_ws_conns.begin(); it != g_ws_conns.end();) {
         WSConnection* conn = it->second;
         if (conn->state == 3 && conn->inbox.empty() && ++conn->closedSweeps > 1) {
-            if (conn->easy) curl_easy_cleanup(conn->easy);
+            if (conn->easy) {
+                if (g_ws_multi) curl_multi_remove_handle(g_ws_multi, conn->easy);
+                curl_easy_cleanup(conn->easy);
+            }
             delete conn;
             it = g_ws_conns.erase(it);
         } else {
