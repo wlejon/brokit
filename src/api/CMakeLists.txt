@@ -53,6 +53,7 @@ embed_js(events.js          js_events)
 embed_js(util.js            js_util)
 embed_js(compression.js     js_compression)
 embed_js(net.js             js_net)
+embed_js(dgram.js           js_dgram)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
