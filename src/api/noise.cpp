@@ -4,6 +4,7 @@
 #include <FastNoise/FastNoise.h>
 #include <FastNoise/Metadata.h>
 #include <vector>
+#include <cstdint>
 #include <cstring>
 
 namespace brokit::api {
@@ -40,6 +41,38 @@ static JSValue make_float32_array(JSContext* ctx, const float* data, size_t coun
 static NoiseWrapper* get_noise(JSContext* ctx, JSValueConst this_val)
 {
     return static_cast<NoiseWrapper*>(JS_GetOpaque2(ctx, this_val, noise_class_id));
+}
+
+// Resolve a Float32Array argument to a raw pointer and element count. Returns
+// false with a pending exception on failure. `name` names the argument in the
+// error, since the position-array entry points take four of these and a bare
+// "must be a Float32Array" would not say which.
+static bool resolve_f32(JSContext* ctx, JSValueConst v, const char* name,
+                        float** out, size_t* count)
+{
+    size_t byte_offset = 0, byte_len = 0, bpe = 0;
+    JSValue buf = JS_GetTypedArrayBuffer(ctx, v, &byte_offset, &byte_len, &bpe);
+    if (JS_IsException(buf)) {
+        // Clear the pending TypedArray exception so we can throw our own.
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_ThrowTypeError(ctx, "%s must be a Float32Array", name);
+        return false;
+    }
+    if (bpe != sizeof(float)) {
+        JS_FreeValue(ctx, buf);
+        JS_ThrowTypeError(ctx, "%s must be a Float32Array", name);
+        return false;
+    }
+    size_t ab_len = 0;
+    uint8_t* ab_ptr = JS_GetArrayBuffer(ctx, &ab_len, buf);
+    JS_FreeValue(ctx, buf);
+    if (!ab_ptr) {
+        JS_ThrowTypeError(ctx, "%s has a detached or invalid buffer", name);
+        return false;
+    }
+    *out   = reinterpret_cast<float*>(ab_ptr + byte_offset);
+    *count = byte_len / sizeof(float);
+    return true;
 }
 
 static JSValue wrap_node(JSContext* ctx, FastNoise::SmartNode<> node)
@@ -275,6 +308,103 @@ static JSValue noise_gen_uniform_grid_3d_into(JSContext* ctx, JSValueConst this_
                                static_cast<float>(zOff),
                                xSize, ySize, zSize,
                                step, step, step, seed);
+    return JS_UNDEFINED;
+}
+
+// Signature: genPositionArray2D(dest, xs, ys, xOffset, yOffset, seed)
+//
+// Samples at arbitrary 2D positions rather than on a lattice. See the 3D
+// variant below for why the lattice entry points are not always enough.
+//
+// Positions are consumed as given. There is no `frequency` argument, unlike
+// genUniformGrid2D, because there is no step to scale — pre-multiply the
+// positions by whatever frequency you want.
+static JSValue noise_gen_position_array_2d(JSContext* ctx, JSValueConst this_val,
+                                            int argc, JSValueConst* argv)
+{
+    auto* w = get_noise(ctx, this_val);
+    if (!w) return JS_EXCEPTION;
+    if (argc < 6)
+        return JS_ThrowTypeError(ctx, "genPositionArray2D(dest, xs, ys, xOffset, yOffset, seed)");
+
+    float *dest = nullptr, *xs = nullptr, *ys = nullptr;
+    size_t n_dest = 0, nx = 0, ny = 0;
+    if (!resolve_f32(ctx, argv[0], "dest", &dest, &n_dest)) return JS_EXCEPTION;
+    if (!resolve_f32(ctx, argv[1], "xs", &xs, &nx)) return JS_EXCEPTION;
+    if (!resolve_f32(ctx, argv[2], "ys", &ys, &ny)) return JS_EXCEPTION;
+
+    double x_off, y_off;
+    int32_t seed;
+    if (JS_ToFloat64(ctx, &x_off, argv[3])) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &y_off, argv[4])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &seed, argv[5])) return JS_EXCEPTION;
+
+    size_t count = nx < ny ? nx : ny;
+    if (count == 0) return JS_UNDEFINED;
+    if (n_dest < count)
+        return JS_ThrowRangeError(ctx, "dest too small: %zu floats required", count);
+    if (count > static_cast<size_t>(INT32_MAX))
+        return JS_ThrowRangeError(ctx, "position count exceeds INT_MAX");
+
+    w->node->GenPositionArray2D(dest, static_cast<int>(count), xs, ys,
+                                 static_cast<float>(x_off), static_cast<float>(y_off),
+                                 seed);
+    return JS_UNDEFINED;
+}
+
+// Signature: genPositionArray3D(dest, xs, ys, zs, xOffset, yOffset, zOffset, seed)
+//
+// Samples at arbitrary 3D positions rather than on a lattice. The uniform-grid
+// entry points can only express an axis-aligned box, which rules out any
+// sample set that is regular in some other space — the motivating case is a
+// cube-sphere, whose vertices form a regular grid in face space but an
+// irregular point set in 3D.
+//
+// It is also what makes spherical noise seamless: sampling a 3D field on the
+// sphere surface involves no projection at all, so there is no wrap seam, no
+// pole singularity, and no discontinuity where cube faces meet.
+//
+// Positions are consumed as given. There is no `frequency` argument, unlike
+// genUniformGrid3D, because there is no step to scale — pre-multiply the
+// positions by whatever frequency you want.
+static JSValue noise_gen_position_array_3d(JSContext* ctx, JSValueConst this_val,
+                                            int argc, JSValueConst* argv)
+{
+    auto* w = get_noise(ctx, this_val);
+    if (!w) return JS_EXCEPTION;
+    if (argc < 8)
+        return JS_ThrowTypeError(ctx,
+            "genPositionArray3D(dest, xs, ys, zs, xOffset, yOffset, zOffset, seed)");
+
+    float *dest = nullptr, *xs = nullptr, *ys = nullptr, *zs = nullptr;
+    size_t n_dest = 0, nx = 0, ny = 0, nz = 0;
+    if (!resolve_f32(ctx, argv[0], "dest", &dest, &n_dest)) return JS_EXCEPTION;
+    if (!resolve_f32(ctx, argv[1], "xs", &xs, &nx)) return JS_EXCEPTION;
+    if (!resolve_f32(ctx, argv[2], "ys", &ys, &ny)) return JS_EXCEPTION;
+    if (!resolve_f32(ctx, argv[3], "zs", &zs, &nz)) return JS_EXCEPTION;
+
+    double x_off, y_off, z_off;
+    int32_t seed;
+    if (JS_ToFloat64(ctx, &x_off, argv[4])) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &y_off, argv[5])) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &z_off, argv[6])) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &seed, argv[7])) return JS_EXCEPTION;
+
+    // The shortest of the three position arrays bounds the run, so a caller
+    // that over-allocates one axis gets the intersection rather than a read
+    // past the end of another.
+    size_t count = nx;
+    if (ny < count) count = ny;
+    if (nz < count) count = nz;
+    if (count == 0) return JS_UNDEFINED;
+    if (n_dest < count)
+        return JS_ThrowRangeError(ctx, "dest too small: %zu floats required", count);
+    if (count > static_cast<size_t>(INT32_MAX))
+        return JS_ThrowRangeError(ctx, "position count exceeds INT_MAX");
+
+    w->node->GenPositionArray3D(dest, static_cast<int>(count), xs, ys, zs,
+                                 static_cast<float>(x_off), static_cast<float>(y_off),
+                                 static_cast<float>(z_off), seed);
     return JS_UNDEFINED;
 }
 
@@ -624,6 +754,10 @@ void installNoise(JSContext* ctx)
         JS_NewCFunction(ctx, noise_gen_uniform_grid_3d, "genUniformGrid3D", 8));
     JS_SetPropertyStr(ctx, proto, "genUniformGrid3DInto",
         JS_NewCFunction(ctx, noise_gen_uniform_grid_3d_into, "genUniformGrid3DInto", 9));
+    JS_SetPropertyStr(ctx, proto, "genPositionArray2D",
+        JS_NewCFunction(ctx, noise_gen_position_array_2d, "genPositionArray2D", 6));
+    JS_SetPropertyStr(ctx, proto, "genPositionArray3D",
+        JS_NewCFunction(ctx, noise_gen_position_array_3d, "genPositionArray3D", 8));
     JS_SetPropertyStr(ctx, proto, "genTileable2D",
         JS_NewCFunction(ctx, noise_gen_tileable_2d, "genTileable2D", 4));
 
