@@ -48,6 +48,48 @@
         return wrapStats(globalThis.__brokit_fs_statSync(path));
     }
 
+    // ── File descriptors ──────────────────────────────────────────────────────
+    // readSync(fd, buffer, offset, length, position) is the only way to read
+    // part of a file. `position` of null means "continue from the last read",
+    // matching Node; a number seeks first.
+
+    function openSync(path, flags) {
+        return globalThis.__brokit_fs_openSync(path, flags === undefined ? 'r' : flags);
+    }
+
+    function readSync(fd, buffer, offset, length, position) {
+        if (offset !== null && typeof offset === 'object') {
+            // Node's options-object form: readSync(fd, buffer, { offset, length, position })
+            var o = offset;
+            return globalThis.__brokit_fs_readSync(
+                fd, buffer,
+                o.offset === undefined ? 0 : o.offset,
+                o.length === undefined ? buffer.byteLength : o.length,
+                o.position === undefined ? null : o.position);
+        }
+        return globalThis.__brokit_fs_readSync(
+            fd, buffer,
+            offset === undefined ? 0 : offset,
+            length === undefined ? buffer.byteLength : length,
+            position === undefined ? null : position);
+    }
+
+    function writeSync(fd, buffer, offset, length, position) {
+        return globalThis.__brokit_fs_writeSync(
+            fd, buffer,
+            offset === undefined ? 0 : offset,
+            length === undefined ? buffer.byteLength : length,
+            position === undefined ? null : position);
+    }
+
+    function fstatSync(fd) {
+        return wrapStats(globalThis.__brokit_fs_fstatSync(fd));
+    }
+
+    function closeSync(fd) {
+        return globalThis.__brokit_fs_closeSync(fd);
+    }
+
     function lstatSync(path) {
         return wrapStats(globalThis.__brokit_fs_lstatSync(path));
     }
@@ -175,6 +217,13 @@
         copyFileSync:    copyFileSync,
         chmodSync:       chmodSync,
         realpathSync:    realpathSync,
+
+        // File descriptors
+        openSync:        openSync,
+        readSync:        readSync,
+        writeSync:       writeSync,
+        fstatSync:       fstatSync,
+        closeSync:       closeSync,
 
         // Async (callback or Promise)
         readFile:    wrapAsync(readFileSync),

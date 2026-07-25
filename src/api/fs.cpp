@@ -3,6 +3,9 @@
 #include "fs.js.h"
 
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -241,6 +244,253 @@ static JSValue js_readFileSync(JSContext* ctx, JSValueConst, int argc, JSValueCo
 
     if (encoding) JS_FreeCString(ctx, encoding);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// File descriptors: openSync / readSync / writeSync / fstatSync / closeSync
+//
+// readFileSync is the only way to get bytes out of a file without these, and it
+// reads the whole file. That is a hard ceiling rather than an inefficiency: a
+// script that wants eight columns out of a multi-gigabyte HDF5 or a frame out
+// of a video container has no way to ask for a range, and no amount of JS can
+// work around a missing syscall.
+//
+// The descriptor table is process-wide and mutex-guarded because workers each
+// get their own JSContext but share the address space; a per-context table
+// would hand two workers the same small integer for different files.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct OpenFile {
+    std::fstream stream;
+    std::string path;
+    bool writable = false;
+};
+
+std::mutex g_fdMutex;
+std::map<int, std::unique_ptr<OpenFile>> g_fds;
+int g_nextFd = 3;                    // 0/1/2 are conventionally the std streams
+
+OpenFile* lookupFd(int fd)
+{
+    auto it = g_fds.find(fd);
+    return it == g_fds.end() ? nullptr : it->second.get();
+}
+
+} // namespace
+
+// openSync(path[, flags]) -> fd
+static JSValue js_openSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "openSync: path required");
+
+    const char* rawPath = JS_ToCString(ctx, argv[0]);
+    if (!rawPath) return JS_EXCEPTION;
+    std::string resolved = resolveFsPath(ctx, rawPath);
+    JS_FreeCString(ctx, rawPath);
+
+    std::string flags = "r";
+    if (argc >= 2 && JS_IsString(argv[1])) {
+        const char* f = JS_ToCString(ctx, argv[1]);
+        if (f) { flags = f; JS_FreeCString(ctx, f); }
+    }
+
+    std::ios::openmode mode = std::ios::binary;
+    bool writable = false;
+    if (flags == "r") {
+        mode |= std::ios::in;
+    } else if (flags == "r+") {
+        mode |= std::ios::in | std::ios::out;
+        writable = true;
+    } else if (flags == "w") {
+        mode |= std::ios::out | std::ios::trunc;
+        writable = true;
+    } else if (flags == "w+") {
+        mode |= std::ios::in | std::ios::out | std::ios::trunc;
+        writable = true;
+    } else if (flags == "a" || flags == "a+") {
+        mode |= std::ios::out | std::ios::app;
+        if (flags == "a+") mode |= std::ios::in;
+        writable = true;
+    } else {
+        return JS_ThrowTypeError(ctx, "openSync: unsupported flags '%s'", flags.c_str());
+    }
+
+    // std::fstream will not create a file for "r+"; open it first if needed.
+    if (flags == "r+" && !fs::exists(resolved)) {
+        return throwErrno(ctx, "open", resolved.c_str(), "ENOENT",
+                          ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
+    }
+
+    auto file = std::make_unique<OpenFile>();
+    file->stream.open(resolved, mode);
+    if (!file->stream.is_open()) {
+        return throwErrno(ctx, "open", resolved.c_str(), "ENOENT",
+                          ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
+    }
+    file->path = resolved;
+    file->writable = writable;
+
+    std::lock_guard<std::mutex> lock(g_fdMutex);
+    int fd = g_nextFd++;
+    g_fds[fd] = std::move(file);
+    return JS_NewInt32(ctx, fd);
+}
+
+// readSync(fd, buffer, offset, length[, position]) -> bytes read
+//
+// `position` is where in the FILE to read from; null or omitted means "carry on
+// from wherever the last read stopped". Node's contract, and the reason this
+// function exists at all.
+static JSValue js_readSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 2) return JS_ThrowTypeError(ctx, "readSync: fd and buffer required");
+
+    int32_t fd = 0;
+    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+
+    size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
+    JSValue arrayBuffer = JS_GetTypedArrayBuffer(ctx, argv[1], &byteOffset, &byteLength,
+                                                 &bytesPerElement);
+    if (JS_IsException(arrayBuffer)) return JS_EXCEPTION;
+    size_t bufSize = 0;
+    uint8_t* base = JS_GetArrayBuffer(ctx, &bufSize, arrayBuffer);
+    JS_FreeValue(ctx, arrayBuffer);
+    if (!base) return JS_ThrowTypeError(ctx, "readSync: buffer must be a typed array");
+
+    int64_t offset = 0, length = static_cast<int64_t>(byteLength);
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        if (JS_ToInt64(ctx, &offset, argv[2])) return JS_EXCEPTION;
+    }
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+        if (JS_ToInt64(ctx, &length, argv[3])) return JS_EXCEPTION;
+    }
+    if (offset < 0 || length < 0 || offset + length > static_cast<int64_t>(byteLength)) {
+        return JS_ThrowRangeError(ctx, "readSync: offset/length out of buffer bounds");
+    }
+
+    bool seek = false;
+    int64_t position = 0;
+    if (argc >= 5 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
+        if (JS_ToInt64(ctx, &position, argv[4])) return JS_EXCEPTION;
+        if (position >= 0) seek = true;
+    }
+
+    std::lock_guard<std::mutex> lock(g_fdMutex);
+    OpenFile* file = lookupFd(fd);
+    if (!file) return throwErrno(ctx, "read", nullptr, "EBADF", "EBADF: bad file descriptor, read");
+
+    // A stream that hit EOF on a previous read refuses to seek until cleared,
+    // which would turn one short read into a permanently dead descriptor.
+    file->stream.clear();
+    if (seek) file->stream.seekg(static_cast<std::streamoff>(position), std::ios::beg);
+    if (!file->stream) {
+        return throwErrno(ctx, "read", file->path.c_str(), "EINVAL",
+                          "EINVAL: invalid position, read");
+    }
+
+    file->stream.read(reinterpret_cast<char*>(base + byteOffset + offset),
+                      static_cast<std::streamsize>(length));
+    std::streamsize got = file->stream.gcount();
+    file->stream.clear();
+    return JS_NewInt64(ctx, static_cast<int64_t>(got));
+}
+
+// writeSync(fd, buffer, offset, length[, position]) -> bytes written
+static JSValue js_writeSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 2) return JS_ThrowTypeError(ctx, "writeSync: fd and buffer required");
+
+    int32_t fd = 0;
+    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+
+    size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
+    JSValue arrayBuffer = JS_GetTypedArrayBuffer(ctx, argv[1], &byteOffset, &byteLength,
+                                                 &bytesPerElement);
+    if (JS_IsException(arrayBuffer)) return JS_EXCEPTION;
+    size_t bufSize = 0;
+    uint8_t* base = JS_GetArrayBuffer(ctx, &bufSize, arrayBuffer);
+    JS_FreeValue(ctx, arrayBuffer);
+    if (!base) return JS_ThrowTypeError(ctx, "writeSync: buffer must be a typed array");
+
+    int64_t offset = 0, length = static_cast<int64_t>(byteLength);
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        if (JS_ToInt64(ctx, &offset, argv[2])) return JS_EXCEPTION;
+    }
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+        if (JS_ToInt64(ctx, &length, argv[3])) return JS_EXCEPTION;
+    }
+    if (offset < 0 || length < 0 || offset + length > static_cast<int64_t>(byteLength)) {
+        return JS_ThrowRangeError(ctx, "writeSync: offset/length out of buffer bounds");
+    }
+
+    bool seek = false;
+    int64_t position = 0;
+    if (argc >= 5 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
+        if (JS_ToInt64(ctx, &position, argv[4])) return JS_EXCEPTION;
+        if (position >= 0) seek = true;
+    }
+
+    std::lock_guard<std::mutex> lock(g_fdMutex);
+    OpenFile* file = lookupFd(fd);
+    if (!file) return throwErrno(ctx, "write", nullptr, "EBADF", "EBADF: bad file descriptor, write");
+    if (!file->writable) {
+        return throwErrno(ctx, "write", file->path.c_str(), "EBADF",
+                          "EBADF: file descriptor is not open for writing, write");
+    }
+
+    file->stream.clear();
+    if (seek) file->stream.seekp(static_cast<std::streamoff>(position), std::ios::beg);
+    file->stream.write(reinterpret_cast<const char*>(base + byteOffset + offset),
+                       static_cast<std::streamsize>(length));
+    if (!file->stream) {
+        return throwErrno(ctx, "write", file->path.c_str(), "EIO", "EIO: write failed");
+    }
+    return JS_NewInt64(ctx, length);
+}
+
+// fstatSync(fd) -> { size, ... }, in the same shape statSync returns
+static JSValue js_fstatSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "fstatSync: fd required");
+    int32_t fd = 0;
+    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(g_fdMutex);
+        OpenFile* file = lookupFd(fd);
+        if (!file) return throwErrno(ctx, "fstat", nullptr, "EBADF", "EBADF: bad file descriptor, fstat");
+        path = file->path;
+    }
+
+    std::error_code ec;
+    auto size = fs::file_size(path, ec);
+    if (ec) return throwFsError(ctx, "fstat", path.c_str(), ec);
+
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, static_cast<int64_t>(size)));
+    JS_SetPropertyStr(ctx, obj, "_isFile", JS_NewBool(ctx, true));
+    JS_SetPropertyStr(ctx, obj, "_isDirectory", JS_NewBool(ctx, false));
+    JS_SetPropertyStr(ctx, obj, "_isSymbolicLink", JS_NewBool(ctx, false));
+    return obj;
+}
+
+// closeSync(fd)
+static JSValue js_closeSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "closeSync: fd required");
+    int32_t fd = 0;
+    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+
+    std::lock_guard<std::mutex> lock(g_fdMutex);
+    auto it = g_fds.find(fd);
+    if (it == g_fds.end()) {
+        return throwErrno(ctx, "close", nullptr, "EBADF", "EBADF: bad file descriptor, close");
+    }
+    it->second->stream.close();
+    g_fds.erase(it);
+    return JS_UNDEFINED;
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +1032,16 @@ void installFS(JSContext* ctx)
                       JS_NewCFunction(ctx, js_chmodSync, "chmodSync", 2));
     JS_SetPropertyStr(ctx, global, "__brokit_fs_realpathSync",
                       JS_NewCFunction(ctx, js_realpathSync, "realpathSync", 1));
+    JS_SetPropertyStr(ctx, global, "__brokit_fs_openSync",
+                      JS_NewCFunction(ctx, js_openSync, "openSync", 2));
+    JS_SetPropertyStr(ctx, global, "__brokit_fs_readSync",
+                      JS_NewCFunction(ctx, js_readSync, "readSync", 5));
+    JS_SetPropertyStr(ctx, global, "__brokit_fs_writeSync",
+                      JS_NewCFunction(ctx, js_writeSync, "writeSync", 5));
+    JS_SetPropertyStr(ctx, global, "__brokit_fs_fstatSync",
+                      JS_NewCFunction(ctx, js_fstatSync, "fstatSync", 1));
+    JS_SetPropertyStr(ctx, global, "__brokit_fs_closeSync",
+                      JS_NewCFunction(ctx, js_closeSync, "closeSync", 1));
 
     JS_FreeValue(ctx, global);
 
