@@ -153,6 +153,21 @@ static std::vector<std::string> buildEnvStrings(const EnvList& env)
 
 #ifdef _WIN32
 
+// Quote one argv entry for a CreateProcess command line. Only spaces, tabs and
+// embedded quotes need it; anything else passes through so a plain path stays
+// readable in a process listing.
+static std::string quoteArg(const std::string& s)
+{
+    if (s.find_first_of(" \t\"") == std::string::npos) return s;
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else out += c;
+    }
+    out += "\"";
+    return out;
+}
+
 // Build a PROC_THREAD_ATTRIBUTE_HANDLE_LIST restricting inheritance to exactly
 // the given handles. bInheritHandles=TRUE alone leaks EVERY inheritable handle
 // in the process into the child — a concurrently spawned child then inherits
@@ -182,9 +197,19 @@ static bool buildHandleList(std::vector<uint8_t>& attrBuf,
     return true;
 }
 
+// Blocking run, capturing stdout/stderr.
+//
+// `argv` decides whether a shell is involved. When it is null the `command`
+// string goes to `cmd /c` (exec/execSync semantics: the caller wrote a shell
+// line and wants pipes, redirects and builtins). When it is non-null the
+// entries are the literal argv — argv[0] is the executable — and the child is
+// started directly, so nothing in a filename can be read as shell syntax.
+// That is the split Node draws between exec and execFile/spawn, and it matters:
+// argv here routinely holds user-chosen media paths.
 static ExecResult runCommand(const std::string& command, const std::string& cwd,
                              const std::string& input, int timeoutMs, int maxBuffer,
-                             const EnvList* env)
+                             const EnvList* env,
+                             const std::vector<std::string>* argv = nullptr)
 {
     ExecResult result;
 
@@ -240,8 +265,17 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 
     PROCESS_INFORMATION pi = {};
 
-    // Build command line: cmd /c "command"
-    std::string cmdLine = "cmd /c " + command;
+    // Build the command line. With argv, quote each entry and start the
+    // executable directly; without it, hand the string to the shell.
+    std::string cmdLine;
+    if (argv && !argv->empty()) {
+        for (const auto& a : *argv) {
+            if (!cmdLine.empty()) cmdLine += " ";
+            cmdLine += quoteArg(a);
+        }
+    } else {
+        cmdLine = "cmd /c " + command;
+    }
 
     std::string envBlock;
     if (env) envBlock = buildEnvBlock(*env);
@@ -348,9 +382,12 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 
 #else // Linux/macOS
 
+// See the Windows overload above for what `argv` means: null runs `command`
+// through /bin/sh, non-null execs argv[0] directly with no shell in between.
 static ExecResult runCommand(const std::string& command, const std::string& cwd,
                              const std::string& input, int timeoutMs, int maxBuffer,
-                             const EnvList* env)
+                             const EnvList* env,
+                             const std::vector<std::string>* argv = nullptr)
 {
     ExecResult result;
 
@@ -384,14 +421,24 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
             if (chdir(cwd.c_str()) != 0) _exit(127);
         }
 
+        // env REPLACES the child environment, so install it before exec.
+        // Assigning `environ` rather than using execve/execvpe keeps one exec
+        // path for both the shell and the argv case (execvpe is glibc-only).
+        std::vector<std::string> envStrs;
+        std::vector<char*> envp;
         if (env) {
-            auto envStrs = buildEnvStrings(*env);
-            std::vector<char*> envp;
+            envStrs = buildEnvStrings(*env);
             for (auto& s : envStrs) envp.push_back(const_cast<char*>(s.c_str()));
             envp.push_back(nullptr);
-            char* const shArgv[] = { const_cast<char*>("sh"), const_cast<char*>("-c"),
-                                     const_cast<char*>(command.c_str()), nullptr };
-            execve("/bin/sh", shArgv, envp.data());
+            environ = envp.data();
+        }
+
+        if (argv && !argv->empty()) {
+            std::vector<char*> cargv;
+            cargv.reserve(argv->size() + 1);
+            for (const auto& a : *argv) cargv.push_back(const_cast<char*>(a.c_str()));
+            cargv.push_back(nullptr);
+            execvp(cargv[0], cargv.data());   // PATH search, no shell
             _exit(127);
         }
 
@@ -612,7 +659,10 @@ struct ExecOptions {
     std::string input;
     int timeout = 0;        // 0 = no timeout
     int maxBuffer = 1024 * 1024; // 1MB default
-    bool shell = true;
+    // spawn/spawnSync: run the argv through a shell instead of exec'ing it
+    // directly. Off by default (Node semantics) so an argument can never be
+    // read as shell syntax; opt in when you actually want builtins/redirects.
+    bool shell = false;
     bool hasEnv = false;
     EnvList env;            // replaces the child environment when hasEnv
     std::string stdoutFile; // spawn only: redirect child stdout to this file
@@ -648,6 +698,10 @@ static ExecOptions parseOptions(JSContext* ctx, int argc, JSValueConst* argv, in
     if (JS_IsNumber(val)) {
         JS_ToInt32(ctx, &opts.timeout, val);
     }
+    JS_FreeValue(ctx, val);
+
+    val = JS_GetPropertyStr(ctx, argv[optIdx], "shell");
+    if (!JS_IsUndefined(val)) opts.shell = JS_ToBool(ctx, val) == 1;
     JS_FreeValue(ctx, val);
 
     val = JS_GetPropertyStr(ctx, argv[optIdx], "maxBuffer");
@@ -823,7 +877,10 @@ static JSValue js_spawnSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
     std::string command(cmd);
     JS_FreeCString(ctx, cmd);
 
-    // Build full command with args
+    // argv[0] is the executable; the rest are literal arguments. No shell is
+    // involved unless the caller asks for one, so an argument containing &, |,
+    // ( ) or a quote is passed through as data rather than parsed as syntax.
+    std::vector<std::string> childArgv{ command };
     if (argc >= 2 && JS_IsArray(argv[1])) {
         uint32_t len = 0;
         JSValue lenVal = JS_GetPropertyStr(ctx, argv[1], "length");
@@ -834,15 +891,7 @@ static JSValue js_spawnSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
             JSValue elem = JS_GetPropertyUint32(ctx, argv[1], i);
             const char* arg = JS_ToCString(ctx, elem);
             if (arg) {
-                command += " ";
-                // Quote args containing spaces
-                if (strchr(arg, ' ') || strchr(arg, '\t')) {
-                    command += "\"";
-                    command += arg;
-                    command += "\"";
-                } else {
-                    command += arg;
-                }
+                childArgv.emplace_back(arg);
                 JS_FreeCString(ctx, arg);
             }
             JS_FreeValue(ctx, elem);
@@ -852,8 +901,20 @@ static JSValue js_spawnSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
     int optIdx = (argc >= 2 && JS_IsArray(argv[1])) ? 2 : 1;
     auto opts = parseOptions(ctx, argc, argv, optIdx);
 
+    // options.shell opts back into a shell line for callers that really want
+    // one (builtins, redirects) out of spawnSync.
+    if (opts.shell) {
+        for (size_t i = 1; i < childArgv.size(); i++) {
+            command += " ";
+            command += childArgv[i].find_first_of(" \t") != std::string::npos
+                           ? "\"" + childArgv[i] + "\""
+                           : childArgv[i];
+        }
+    }
+
     ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
-                                opts.hasEnv ? &opts.env : nullptr);
+                                opts.hasEnv ? &opts.env : nullptr,
+                                opts.shell ? nullptr : &childArgv);
 
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "stdout", stringToOutput(ctx, res.stdoutData, opts.encoding));
@@ -906,19 +967,16 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     auto handle = std::make_unique<ChildHandle>();
 
 #ifdef _WIN32
-    // Build quoted command line
-    auto quote = [](const std::string& s) -> std::string {
-        if (s.find_first_of(" \t\"") == std::string::npos) return s;
-        std::string out = "\"";
-        for (char c : s) {
-            if (c == '"') out += "\\\"";
-            else out += c;
-        }
-        out += "\"";
-        return out;
-    };
-    std::string cmdLine = quote(file);
-    for (auto& a : args) { cmdLine += " "; cmdLine += quote(a); }
+    // Build quoted command line. With shell:true the pieces are joined into a
+    // shell line instead — the caller has asked for cmd to parse it.
+    std::string cmdLine;
+    if (opts.shell) {
+        cmdLine = "cmd /c " + file;
+        for (auto& a : args) { cmdLine += " "; cmdLine += a; }
+    } else {
+        cmdLine = quoteArg(file);
+        for (auto& a : args) { cmdLine += " "; cmdLine += quoteArg(a); }
+    }
 
     std::string envBlock;
     if (opts.hasEnv) envBlock = buildEnvBlock(opts.env);
@@ -1128,18 +1186,33 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
             dup2(fd, STDERR_FILENO);
             close(fd);
         }
+        // shell:true joins the pieces into one /bin/sh -c line; otherwise the
+        // entries are literal argv and nothing re-parses them.
+        std::string shellLine;
         std::vector<char*> argv;
-        argv.push_back(const_cast<char*>(file.c_str()));
-        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        if (opts.shell) {
+            shellLine = file;
+            for (auto& a : args) { shellLine += " "; shellLine += a; }
+            argv.push_back(const_cast<char*>("sh"));
+            argv.push_back(const_cast<char*>("-c"));
+            argv.push_back(const_cast<char*>(shellLine.c_str()));
+        } else {
+            argv.push_back(const_cast<char*>(file.c_str()));
+            for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        }
         argv.push_back(nullptr);
+        // Both vectors must outlive the execvp below: `environ` points into
+        // envp, so letting them die at the end of an if-block would leave the
+        // exec reading freed memory.
+        std::vector<std::string> envStrs;
+        std::vector<char*> envp;
         if (opts.hasEnv) {
-            auto envStrs = buildEnvStrings(opts.env);
-            std::vector<char*> envp;
+            envStrs = buildEnvStrings(opts.env);
             for (auto& s : envStrs) envp.push_back(const_cast<char*>(s.c_str()));
             envp.push_back(nullptr);
             environ = envp.data();   // pre-exec in the forked child; execvp keeps PATH search
         }
-        execvp(file.c_str(), argv.data());
+        execvp(opts.shell ? "/bin/sh" : file.c_str(), argv.data());
         int execErrno = errno;
         // Report the exec failure to the parent, then exit. Loop guards against
         // a short write; the parent only inspects the first int.

@@ -45,33 +45,30 @@ if (isWin) {
 
 // ── exec (callback style) ────────────────────────────────────────────────
 
-var cbStdout = null;
-var cbStderr = null;
-var cbErr = null;
+// exec is genuinely async: the callback runs on a later turn, so the engine
+// keeps painting while the child works. Assertions therefore live inside the
+// callback, and a synchronous check right after the call proves it hasn't
+// fired yet.
+
+var cbFiredSync = false;
 cp.exec(isWin ? 'echo callback_test' : 'echo callback_test', function(err, stdout, stderr) {
-    cbErr = err;
-    cbStdout = stdout;
-    cbStderr = stderr;
+    assertEqual(err, null, 'exec callback no error');
+    assert(stdout.trim() === 'callback_test', 'exec callback stdout');
+    assert(typeof stderr === 'string', 'exec callback stderr is string');
 });
-assertEqual(cbErr, null, 'exec callback no error');
-assert(cbStdout.trim() === 'callback_test', 'exec callback stdout');
-assert(typeof cbStderr === 'string', 'exec callback stderr is string');
+assert(!cbFiredSync, 'exec does not call back before returning');
 
 // exec callback with error
-var cbErrResult = null;
 cp.exec(isWin ? 'cmd /c exit 1' : 'exit 1', function(err, stdout, stderr) {
-    cbErrResult = err;
+    assert(err !== null, 'exec callback error on non-zero exit');
+    assert(err.code === 1, 'exec callback error code');
 });
-assert(cbErrResult !== null, 'exec callback error on non-zero exit');
-assert(cbErrResult.code === 1, 'exec callback error code');
 
 // ── exec (Promise style) ─────────────────────────────────────────────────
 
-var promiseResult = null;
 cp.exec(isWin ? 'echo promise_test' : 'echo promise_test').then(function(result) {
-    promiseResult = result;
+    assert(result.stdout.trim() === 'promise_test', 'exec promise resolves with stdout');
 });
-// Promise resolves synchronously in our implementation
 
 // ── execFileSync ──────────────────────────────────────────────────────────
 
@@ -85,17 +82,14 @@ if (isWin) {
 
 // ── execFile (callback style) ────────────────────────────────────────────
 
-var efStdout = null;
-if (isWin) {
-    cp.execFile('cmd', ['/c', 'echo', 'execfile_cb'], function(err, stdout, stderr) {
-        efStdout = stdout;
-    });
-} else {
-    cp.execFile('echo', ['execfile_cb'], function(err, stdout, stderr) {
-        efStdout = stdout;
-    });
+function execFileCb(err, stdout, stderr) {
+    assert(stdout && stdout.trim() === 'execfile_cb', 'execFile callback');
 }
-assert(efStdout && efStdout.trim() === 'execfile_cb', 'execFile callback');
+if (isWin) {
+    cp.execFile('cmd', ['/c', 'echo', 'execfile_cb'], execFileCb);
+} else {
+    cp.execFile('echo', ['execfile_cb'], execFileCb);
+}
 
 // ── spawnSync ─────────────────────────────────────────────────────────────
 

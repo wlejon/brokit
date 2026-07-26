@@ -7,57 +7,156 @@
         return globalThis.__brokit_cp_execSync(command, options || {});
     }
 
+    // ── collectRun: the shared body of exec and execFile ──────────────────────
+    //
+    // Both are "run it, buffer everything, hand me the output at the end", and
+    // both are ASYNC: they run on top of spawn(), so the engine keeps painting
+    // while the child works. (They used to call the blocking native inline and
+    // merely *look* async, which froze the frame loop for the child's whole
+    // lifetime — an ffprobe on a slow path would stall the window.)
+    //
+    // `label` is what a failure message names; `shell` picks whether the pieces
+    // are a shell line or literal argv.
+
+    function collectRun(file, args, options, callback, label, shell) {
+        options = options || {};
+
+        var encoding = options.encoding === null ? null
+                     : (options.encoding || 'utf8');
+        var maxBuffer = typeof options.maxBuffer === 'number' ? options.maxBuffer
+                                                              : 1024 * 1024;
+        var timeout = typeof options.timeout === 'number' ? options.timeout : 0;
+
+        var spawnOpts = {
+            stdio: 'pipe',
+            shell: !!shell,
+            highWaterMark: maxBuffer > 0 ? Math.max(maxBuffer, 64 * 1024) : undefined
+        };
+        if (options.cwd) spawnOpts.cwd = options.cwd;
+        if (options.env) spawnOpts.env = options.env;
+        if (encoding !== null) spawnOpts.encoding = 'utf8';
+
+        var settle;
+        var promise = null;
+        if (!callback) {
+            promise = new Promise(function (resolve, reject) {
+                settle = function (err, stdout, stderr) {
+                    if (err) reject(err);
+                    else resolve({ stdout: stdout, stderr: stderr });
+                };
+            });
+        } else {
+            settle = callback;
+        }
+
+        var child;
+        try {
+            child = spawn(file, args, spawnOpts);
+        } catch (e) {
+            // Deliver the failure asynchronously so a caller never sees the
+            // callback fire before this function has returned.
+            setTimeout(function () { settle(e, encoding === null ? new Uint8Array(0) : '', ''); }, 0);
+            return promise;
+        }
+
+        // Chunks accumulate as strings when decoding, as byte arrays when not.
+        var outChunks = [], errChunks = [];
+        var outLen = 0, errLen = 0;
+
+        function collector(chunks, isOut) {
+            return function (chunk) {
+                var len = chunk.length;
+                if (isOut) {
+                    if (maxBuffer > 0 && outLen >= maxBuffer) return;
+                    if (maxBuffer > 0 && outLen + len > maxBuffer) {
+                        chunk = chunk.slice(0, maxBuffer - outLen);
+                        len = chunk.length;
+                    }
+                    outLen += len;
+                } else {
+                    if (maxBuffer > 0 && errLen >= maxBuffer) return;
+                    if (maxBuffer > 0 && errLen + len > maxBuffer) {
+                        chunk = chunk.slice(0, maxBuffer - errLen);
+                        len = chunk.length;
+                    }
+                    errLen += len;
+                }
+                chunks.push(chunk);
+            };
+        }
+        child.stdout.on('data', collector(outChunks, true));
+        child.stderr.on('data', collector(errChunks, false));
+
+        function joined(chunks, total) {
+            if (encoding !== null) return chunks.join('');
+            var out = new Uint8Array(total);
+            var at = 0;
+            for (var i = 0; i < chunks.length; i++) { out.set(chunks[i], at); at += chunks[i].length; }
+            return out;
+        }
+
+        var timedOut = false;
+        var timer = null;
+        if (timeout > 0) {
+            timer = setTimeout(function () {
+                timedOut = true;
+                child.kill(options.killSignal || 'SIGKILL');
+            }, timeout);
+        }
+
+        child.on('close', function (code, signal) {
+            if (timer !== null) clearTimeout(timer);
+            var stdout = joined(outChunks, outLen);
+            var stderr = joined(errChunks, errLen);
+
+            if (timedOut) {
+                var terr = new Error('Command timed out: ' + label);
+                terr.code = 'ETIMEDOUT';
+                terr.killed = true;
+                terr.signal = signal || null;
+                terr.stdout = stdout;
+                terr.stderr = stderr;
+                settle(terr, stdout, stderr);
+                return;
+            }
+            if (code !== 0) {
+                var err = new Error('Command failed: ' + label);
+                err.code = code;
+                err.killed = child.killed || false;
+                err.signal = signal || null;
+                err.stdout = stdout;
+                err.stderr = stderr;
+                settle(err, stdout, stderr);
+                return;
+            }
+            settle(null, stdout, stderr);
+        });
+
+        return promise;
+    }
+
     // ── exec ──────────────────────────────────────────────────────────────────
     // exec(command[, options], callback?)
     // Callback style: callback(error, stdout, stderr)
     // Promise style: returns Promise<{ stdout, stderr }>
+    //
+    // Takes a COMMAND STRING, so a shell parses it — pipes, redirects and
+    // builtins all work, and the caller owns any quoting. Pass user-supplied
+    // values as argv through execFile instead.
 
     function exec(command, options, callback) {
         if (typeof options === 'function') {
             callback = options;
             options = {};
         }
-        options = options || {};
-
-        if (callback) {
-            try {
-                var result = globalThis.__brokit_cp_exec(command, options);
-                if (result.error || result.exitCode !== 0) {
-                    var err = new Error(result.error || 'Command failed: ' + command);
-                    err.code = result.exitCode;
-                    err.killed = result.timedOut || false;
-                    err.stdout = result.stdout;
-                    err.stderr = result.stderr;
-                    callback(err, result.stdout, result.stderr);
-                } else {
-                    callback(null, result.stdout, result.stderr);
-                }
-            } catch (e) {
-                callback(e, '', '');
-            }
-            return;
-        }
-
-        // Promise style
-        try {
-            var result = globalThis.__brokit_cp_exec(command, options);
-            if (result.error || result.exitCode !== 0) {
-                var err = new Error(result.error || 'Command failed: ' + command);
-                err.code = result.exitCode;
-                err.killed = result.timedOut || false;
-                err.stdout = result.stdout;
-                err.stderr = result.stderr;
-                return Promise.reject(err);
-            }
-            return Promise.resolve({ stdout: result.stdout, stderr: result.stderr });
-        } catch (e) {
-            return Promise.reject(e);
-        }
+        return collectRun(command, [], options, callback, command, true);
     }
 
     // ── execFileSync ──────────────────────────────────────────────────────────
     // execFileSync(file, args?, options?)
-    // Like execSync but takes file + args array
+    // Like execSync but takes file + args array — and, as in Node, NO SHELL:
+    // args are passed through as literal argv, so a path containing &, |, (, )
+    // or a quote is data rather than syntax.
 
     function execFileSync(file, args, options) {
         if (args && !Array.isArray(args)) {
@@ -67,21 +166,22 @@
         args = args || [];
         options = options || {};
 
-        var command = file;
-        for (var i = 0; i < args.length; i++) {
-            var arg = args[i];
-            if (arg.indexOf(' ') !== -1 || arg.indexOf('\t') !== -1) {
-                command += ' "' + arg + '"';
-            } else {
-                command += ' ' + arg;
-            }
+        var res = spawnSync(file, args, options);
+        if (res.error) throw res.error;
+        if (res.status !== 0) {
+            var err = new Error('Command failed: ' + file);
+            err.status = res.status;
+            err.code = 'ERR_CHILD_PROCESS';
+            err.stdout = res.stdout;
+            err.stderr = res.stderr;
+            throw err;
         }
-
-        return execSync(command, options);
+        return res.stdout;
     }
 
     // ── execFile ──────────────────────────────────────────────────────────────
     // execFile(file, args?, options?, callback?)
+    // Async, and no shell (see execFileSync).
 
     function execFile(file, args, options, callback) {
         if (typeof args === 'function') {
@@ -98,19 +198,7 @@
             }
         }
         args = Array.isArray(args) ? args : [];
-        options = options || {};
-
-        var command = file;
-        for (var i = 0; i < args.length; i++) {
-            var arg = args[i];
-            if (arg.indexOf(' ') !== -1 || arg.indexOf('\t') !== -1) {
-                command += ' "' + arg + '"';
-            } else {
-                command += ' ' + arg;
-            }
-        }
-
-        return exec(command, options, callback);
+        return collectRun(file, args, options, callback, file, false);
     }
 
     // ── spawnSync ─────────────────────────────────────────────────────────────
