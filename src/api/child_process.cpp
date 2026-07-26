@@ -9,6 +9,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <unordered_map>
 #include <atomic>
@@ -21,6 +22,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #endif
 
 namespace brokit::api {
@@ -32,16 +34,75 @@ namespace brokit::api {
 // to learn when the child exits. We keep a small registry so we can hang on to
 // OS handles (Windows HANDLE, Linux pid) without leaking them.
 // ---------------------------------------------------------------------------
+// One direction of a piped child's stdio. A reader thread appends here; JS
+// drains it via __brokit_cp_childRead. `highWater` back-pressures the reader
+// — and through the pipe's own kernel buffer, the child — so a producer that
+// outruns the JS poll (rawvideo at tens of MB/frame) blocks instead of
+// buffering without bound in the parent.
+struct PipeBuf {
+    std::mutex m;
+    std::condition_variable cv;   // reader waits here while full
+    std::vector<uint8_t> data;
+    bool eof = false;
+    size_t highWater = 8u << 20;  // 8 MB
+};
+
 struct ChildHandle {
 #ifdef _WIN32
     HANDLE process = nullptr;
     DWORD pid = 0;
+    HANDLE outRead = nullptr, errRead = nullptr, inWrite = nullptr;
 #else
     pid_t pid = 0;
+    int outRead = -1, errRead = -1, inWrite = -1;
 #endif
     std::atomic<bool> finished{false};
     int exitCode = -1;
     std::string signal;
+
+    // --- stdio: 'pipe' state (all unused when the child was spawned with the
+    // default stdio: 'ignore') ---
+    bool piped = false;
+    PipeBuf out, err;
+    std::thread outThread, errThread;
+    std::atomic<bool> closing{false};
+    std::mutex stdinMutex;         // serializes childWrite / closeStdin
+    bool exitReported = false;     // childPoll already handed the code to JS
+
+    // Readers poll with a short timeout and re-check `closing` each pass, so
+    // teardown is deterministic even when a surviving grandchild holds a write
+    // end open (the classic reason a blocking-read drain never sees EOF).
+    void stopReaders() {
+        closing.store(true, std::memory_order_release);
+        out.cv.notify_all();
+        err.cv.notify_all();
+        if (outThread.joinable()) outThread.join();
+        if (errThread.joinable()) errThread.join();
+    }
+
+    void closeStdin() {
+        std::lock_guard<std::mutex> lock(stdinMutex);
+#ifdef _WIN32
+        if (inWrite) { CloseHandle(inWrite); inWrite = nullptr; }
+#else
+        if (inWrite >= 0) { ::close(inWrite); inWrite = -1; }
+#endif
+    }
+
+    ~ChildHandle() {
+        stopReaders();
+        closeStdin();
+#ifdef _WIN32
+        if (outRead) CloseHandle(outRead);
+        if (errRead) CloseHandle(errRead);
+        // childPoll nulls this after closing on exit; a handle released while
+        // the child is still live (or killed and never polled) lands here.
+        if (process) CloseHandle(process);
+#else
+        if (outRead >= 0) ::close(outRead);
+        if (errRead >= 0) ::close(errRead);
+#endif
+    }
 };
 
 static std::mutex g_childMutex;
@@ -415,6 +476,95 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 #endif
 
 // ---------------------------------------------------------------------------
+// Pipe reader thread (stdio: 'pipe')
+//
+// Poll-then-read rather than a blocking read: teardown must not depend on the
+// child — or on a grandchild holding an inherited write end — ever closing the
+// pipe, so every pass re-checks `closing`. That is the same hazard runCommand
+// works around after a timeout kill with CancelSynchronousIo; polling sidesteps
+// it entirely. Costs one 2 ms wakeup while a piped child is alive.
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+static void pipeReader(HANDLE h, PipeBuf* buf, std::atomic<bool>* closing)
+{
+    std::vector<uint8_t> chunk;
+    for (;;) {
+        if (closing->load(std::memory_order_acquire)) break;
+
+        DWORD avail = 0;
+        // FALSE here is a broken pipe: every write end is closed == EOF.
+        if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) break;
+        if (avail == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        // Wait for room BEFORE reading, so unread bytes stay in the kernel
+        // pipe buffer and the child blocks in write() — real backpressure
+        // rather than an unbounded parent-side queue.
+        {
+            std::unique_lock<std::mutex> lock(buf->m);
+            buf->cv.wait(lock, [&] {
+                return buf->data.size() < buf->highWater ||
+                       closing->load(std::memory_order_acquire);
+            });
+            if (closing->load(std::memory_order_acquire)) break;
+        }
+
+        if (avail > 64u * 1024u) avail = 64u * 1024u;
+        chunk.resize(avail);
+        DWORD got = 0;
+        if (!ReadFile(h, chunk.data(), avail, &got, nullptr) || got == 0) break;
+
+        std::lock_guard<std::mutex> lock(buf->m);
+        buf->data.insert(buf->data.end(), chunk.begin(), chunk.begin() + got);
+    }
+    std::lock_guard<std::mutex> lock(buf->m);
+    buf->eof = true;
+}
+#else
+static void pipeReader(int fd, PipeBuf* buf, std::atomic<bool>* closing)
+{
+    uint8_t chunk[64 * 1024];
+    for (;;) {
+        if (closing->load(std::memory_order_acquire)) break;
+
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = ::poll(&pfd, 1, 2);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+
+        {
+            std::unique_lock<std::mutex> lock(buf->m);
+            buf->cv.wait(lock, [&] {
+                return buf->data.size() < buf->highWater ||
+                       closing->load(std::memory_order_acquire);
+            });
+            if (closing->load(std::memory_order_acquire)) break;
+        }
+
+        ssize_t got = ::read(fd, chunk, sizeof(chunk));
+        if (got < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            break;
+        }
+        if (got == 0) break;   // EOF: all write ends closed
+
+        std::lock_guard<std::mutex> lock(buf->m);
+        buf->data.insert(buf->data.end(), chunk, chunk + got);
+    }
+    std::lock_guard<std::mutex> lock(buf->m);
+    buf->eof = true;
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Helper: parse options object
 // ---------------------------------------------------------------------------
 struct ExecOptions {
@@ -428,6 +578,8 @@ struct ExecOptions {
     EnvList env;            // replaces the child environment when hasEnv
     std::string stdoutFile; // spawn only: redirect child stdout to this file
     std::string stderrFile; // spawn only: redirect child stderr (may equal stdoutFile)
+    bool pipeStdio = false; // spawn only: stdio:'pipe' — stream stdout/stderr, writable stdin
+    int highWaterMark = 8 * 1024 * 1024; // spawn only: per-stream backpressure threshold
 };
 
 static ExecOptions parseOptions(JSContext* ctx, int argc, JSValueConst* argv, int optIdx)
@@ -510,6 +662,23 @@ static ExecOptions parseOptions(JSContext* ctx, int argc, JSValueConst* argv, in
     if (JS_IsString(val)) {
         const char* s = JS_ToCString(ctx, val);
         if (s) { opts.stderrFile = s; JS_FreeCString(ctx, s); }
+    }
+    JS_FreeValue(ctx, val);
+
+    // stdio: 'pipe' opts spawn into streaming mode. Anything else (including
+    // the default) keeps the historical behaviour — no pipes at all — so an
+    // existing caller that never reads can't start silently buffering.
+    val = JS_GetPropertyStr(ctx, argv[optIdx], "stdio");
+    if (JS_IsString(val)) {
+        const char* s = JS_ToCString(ctx, val);
+        if (s) { opts.pipeStdio = (strcmp(s, "pipe") == 0); JS_FreeCString(ctx, s); }
+    }
+    JS_FreeValue(ctx, val);
+
+    val = JS_GetPropertyStr(ctx, argv[optIdx], "highWaterMark");
+    if (JS_IsNumber(val)) {
+        JS_ToInt32(ctx, &opts.highWaterMark, val);
+        if (opts.highWaterMark < 4096) opts.highWaterMark = 4096;
     }
     JS_FreeValue(ctx, val);
 
@@ -719,13 +888,46 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     six.StartupInfo.cb = sizeof(six);
     PROCESS_INFORMATION pi = {};
 
-    // stdoutFile / stderrFile redirect the child's output; the handles must be
-    // inheritable and passed via STARTF_USESTDHANDLES.
+    // hOut/hErr/hIn are the CHILD ends — inheritable, and closed in the parent
+    // right after CreateProcess in every path below.
     HANDLE hOut = nullptr, hErr = nullptr, hIn = nullptr;
     BOOL inheritHandles = FALSE;
     std::vector<uint8_t> attrBuf;
     bool haveAttrList = false;
-    if (!opts.stdoutFile.empty() || !opts.stderrFile.empty()) {
+    if (opts.pipeStdio) {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+        // Parent ends go straight into `handle` so its destructor closes them
+        // on any early-return below.
+        if (!CreatePipe(&handle->outRead, &hOut, &sa, 0))
+            return JS_ThrowInternalError(ctx, "spawn: cannot create stdout pipe");
+        SetHandleInformation(handle->outRead, HANDLE_FLAG_INHERIT, 0);
+        if (!CreatePipe(&handle->errRead, &hErr, &sa, 0)) {
+            CloseHandle(hOut);
+            return JS_ThrowInternalError(ctx, "spawn: cannot create stderr pipe");
+        }
+        SetHandleInformation(handle->errRead, HANDLE_FLAG_INHERIT, 0);
+        if (!CreatePipe(&hIn, &handle->inWrite, &sa, 0)) {
+            CloseHandle(hOut);
+            CloseHandle(hErr);
+            return JS_ThrowInternalError(ctx, "spawn: cannot create stdin pipe");
+        }
+        SetHandleInformation(handle->inWrite, HANDLE_FLAG_INHERIT, 0);
+
+        six.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        six.StartupInfo.hStdOutput = hOut;
+        six.StartupInfo.hStdError  = hErr;
+        six.StartupInfo.hStdInput  = hIn;
+        inheritHandles = TRUE;
+
+        // Same cross-spawn hazard as runCommand: bInheritHandles=TRUE alone
+        // leaks every inheritable handle in the process into the child, so a
+        // concurrent spawn inherits this child's write ends and its pipe never
+        // sees EOF.
+        HANDLE inheritList[3] = { hOut, hErr, hIn };
+        haveAttrList = buildHandleList(attrBuf, inheritList, 3);
+        if (haveAttrList)
+            six.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+    } else if (!opts.stdoutFile.empty() || !opts.stderrFile.empty()) {
         SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
         if (!opts.stdoutFile.empty()) {
             hOut = CreateFileA(opts.stdoutFile.c_str(), GENERIC_WRITE,
@@ -780,8 +982,11 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         cmdLine.data(),
         nullptr, nullptr,
         inheritHandles,
-        // no CREATE_NO_WINDOW — let GUI children show their window
-        haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0,
+        // No CREATE_NO_WINDOW by default — let GUI children show their window.
+        // A piped child is by definition being driven programmatically, so
+        // suppress the console window that would otherwise flash up.
+        (opts.pipeStdio ? CREATE_NO_WINDOW : 0) |
+        (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0),
         opts.hasEnv ? const_cast<char*>(envBlock.data()) : nullptr,
         opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
         &six.StartupInfo, &pi);
@@ -801,12 +1006,35 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     handle->process = pi.hProcess;
     handle->pid = pi.dwProcessId;
 #else
+    // stdio:'pipe' — create the three stdio pipes before forking. The child
+    // dups its ends over 0/1/2; the parent keeps outRead/errRead/inWrite (in
+    // `handle`, so its destructor closes them on any early return below).
+    int outPipe[2] = {-1, -1}, errPipe[2] = {-1, -1}, inPipe[2] = {-1, -1};
+    if (opts.pipeStdio) {
+        if (pipe(outPipe) != 0 || pipe(errPipe) != 0 || pipe(inPipe) != 0) {
+            for (int fd : { outPipe[0], outPipe[1], errPipe[0], errPipe[1],
+                            inPipe[0], inPipe[1] })
+                if (fd >= 0) ::close(fd);
+            return JS_ThrowInternalError(ctx, "spawn: cannot create stdio pipes");
+        }
+        handle->outRead = outPipe[0];
+        handle->errRead = errPipe[0];
+        handle->inWrite = inPipe[1];
+    }
+    auto closeChildEnds = [&]() {
+        if (!opts.pipeStdio) return;
+        if (outPipe[1] >= 0) { ::close(outPipe[1]); outPipe[1] = -1; }
+        if (errPipe[1] >= 0) { ::close(errPipe[1]); errPipe[1] = -1; }
+        if (inPipe[0]  >= 0) { ::close(inPipe[0]);  inPipe[0]  = -1; }
+    };
+
     // Self-pipe so an execvp failure in the child (e.g. a missing binary)
     // surfaces synchronously here, matching Windows' CreateProcess failure. The
     // write end is close-on-exec: a successful exec closes it (parent reads EOF);
     // a failed exec writes errno through it before _exit.
     int execPipe[2] = {-1, -1};
     if (pipe(execPipe) != 0) {
+        closeChildEnds();
         return JS_ThrowInternalError(ctx, "spawn failed: pipe");
     }
     fcntl(execPipe[1], F_SETFD, fcntl(execPipe[1], F_GETFD) | FD_CLOEXEC);
@@ -815,11 +1043,24 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     if (pid < 0) {
         close(execPipe[0]);
         close(execPipe[1]);
+        closeChildEnds();
         return JS_ThrowInternalError(ctx, "spawn failed: fork");
     }
     if (pid == 0) {
         // Child
         close(execPipe[0]);
+        if (opts.pipeStdio) {
+            // Drop the parent ends, then move our ends onto 0/1/2.
+            ::close(outPipe[0]);
+            ::close(errPipe[0]);
+            ::close(inPipe[1]);
+            dup2(outPipe[1], STDOUT_FILENO);
+            dup2(errPipe[1], STDERR_FILENO);
+            dup2(inPipe[0],  STDIN_FILENO);
+            ::close(outPipe[1]);
+            ::close(errPipe[1]);
+            ::close(inPipe[0]);
+        }
         if (!opts.cwd.empty()) {
             if (chdir(opts.cwd.c_str()) != 0) _exit(127);
         }
@@ -863,6 +1104,9 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     }
     handle->pid = pid;
 
+    // Parent: drop the child's pipe ends, or stdout/stderr never reach EOF.
+    closeChildEnds();
+
     // Parent: wait for the child to either exec (EOF) or report an errno.
     close(execPipe[1]);
     int childErrno = 0;
@@ -877,8 +1121,21 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     }
 #endif
 
+    // Start draining before the handle goes into the registry. The threads hold
+    // raw pointers into *handle, which is stable — the unique_ptr moves, the
+    // pointee does not.
+    if (opts.pipeStdio) {
+        handle->piped = true;
+        handle->out.highWater = static_cast<size_t>(opts.highWaterMark);
+        handle->err.highWater = static_cast<size_t>(opts.highWaterMark);
+        ChildHandle* hp = handle.get();
+        hp->outThread = std::thread(pipeReader, hp->outRead, &hp->out, &hp->closing);
+        hp->errThread = std::thread(pipeReader, hp->errRead, &hp->err, &hp->closing);
+    }
+
     int id = g_nextChildId.fetch_add(1);
     int pidVal = (int)handle->pid;
+    bool piped = handle->piped;
     {
         std::lock_guard<std::mutex> lock(g_childMutex);
         g_children[id] = std::move(handle);
@@ -887,6 +1144,7 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "id", JS_NewInt32(ctx, id));
     JS_SetPropertyStr(ctx, obj, "pid", JS_NewInt32(ctx, pidVal));
+    JS_SetPropertyStr(ctx, obj, "piped", JS_NewBool(ctx, piped));
     return obj;
 }
 
@@ -913,6 +1171,19 @@ static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst
         h = it->second.get();
     }
 
+    // A piped child outlives its own exit: the reader threads may still hold
+    // buffered output, so the handle stays registered and this reports the
+    // cached result until JS calls childRelease.
+    auto exitInfo = [&](int code, const std::string& sig) {
+        JSValue obj = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, obj, "exitCode", JS_NewInt32(ctx, code));
+        if (sig.empty()) JS_SetPropertyStr(ctx, obj, "signal", JS_NULL);
+        else             JS_SetPropertyStr(ctx, obj, "signal", JS_NewString(ctx, sig.c_str()));
+        return obj;
+    };
+
+    if (h->exitReported) return exitInfo(h->exitCode, h->signal);
+
 #ifdef _WIN32
     DWORD status = WaitForSingleObject(h->process, 0);
     if (status == WAIT_TIMEOUT) {
@@ -921,7 +1192,9 @@ static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst
     DWORD code = 0;
     GetExitCodeProcess(h->process, &code);
     CloseHandle(h->process);
+    h->process = nullptr;   // the destructor must not double-close
     int exitCode = (int)code;
+    std::string sig;
 #else
     int status = 0;
     pid_t r = waitpid(h->pid, &status, WNOHANG);
@@ -934,20 +1207,199 @@ static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst
     }
 #endif
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "exitCode", JS_NewInt32(ctx, exitCode));
-#ifdef _WIN32
-    JS_SetPropertyStr(ctx, obj, "signal", JS_NULL);
-#else
-    if (sig.empty()) JS_SetPropertyStr(ctx, obj, "signal", JS_NULL);
-    else JS_SetPropertyStr(ctx, obj, "signal", JS_NewString(ctx, sig.c_str()));
-#endif
+    h->exitCode = exitCode;
+    h->signal = sig;
+    h->exitReported = true;
 
-    {
+    JSValue obj = exitInfo(exitCode, sig);
+
+    if (!h->piped) {
         std::lock_guard<std::mutex> lock(g_childMutex);
         g_children.erase(id);
     }
     return obj;
+}
+
+// ---------------------------------------------------------------------------
+// __brokit_cp_childRead(id)
+//
+// Drains whatever the reader threads have buffered. Returns
+// { stdout, stderr, stdoutEof, stderrEof } where each stream is a Uint8Array
+// (binary — rawvideo and text both survive) or null when nothing was pending.
+// Draining is what releases backpressure, so a caller that stops reading
+// stalls the child rather than growing the parent's heap.
+// ---------------------------------------------------------------------------
+static JSValue js_childRead(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "childRead: id required");
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+
+    ChildHandle* h = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_childMutex);
+        auto it = g_children.find(id);
+        if (it == g_children.end())
+            return JS_ThrowRangeError(ctx, "childRead: unknown child id %d", id);
+        h = it->second.get();
+    }
+    if (!h->piped)
+        return JS_ThrowTypeError(ctx, "childRead: child %d was not spawned with stdio:'pipe'", id);
+
+    auto take = [&](PipeBuf& buf, JSValue& outVal, bool& eofOut) {
+        std::vector<uint8_t> drained;
+        {
+            std::lock_guard<std::mutex> lock(buf.m);
+            drained.swap(buf.data);
+            eofOut = buf.eof;
+        }
+        // Notify outside the lock: the reader wakes straight into its wait
+        // predicate instead of blocking on a mutex we still hold.
+        if (!drained.empty()) buf.cv.notify_all();
+        outVal = drained.empty()
+            ? JS_NULL
+            : JS_NewUint8ArrayCopy(ctx, drained.data(), drained.size());
+    };
+
+    JSValue outVal = JS_NULL, errVal = JS_NULL;
+    bool outEof = false, errEof = false;
+    take(h->out, outVal, outEof);
+    take(h->err, errVal, errEof);
+
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "stdout", outVal);
+    JS_SetPropertyStr(ctx, obj, "stderr", errVal);
+    JS_SetPropertyStr(ctx, obj, "stdoutEof", JS_NewBool(ctx, outEof));
+    JS_SetPropertyStr(ctx, obj, "stderrEof", JS_NewBool(ctx, errEof));
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// __brokit_cp_childWrite(id, data)
+//
+// Writes to the child's stdin. `data` is a string (UTF-8) or TypedArray/
+// ArrayBuffer. Returns the byte count written, or -1 if stdin is already
+// closed. Blocking: a child that never reads will stall the JS thread once
+// the pipe buffer fills, so callers streaming large input should chunk it.
+// ---------------------------------------------------------------------------
+static JSValue js_childWrite(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 2) return JS_ThrowTypeError(ctx, "childWrite: id and data required");
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+
+    ChildHandle* h = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_childMutex);
+        auto it = g_children.find(id);
+        if (it == g_children.end())
+            return JS_ThrowRangeError(ctx, "childWrite: unknown child id %d", id);
+        h = it->second.get();
+    }
+    if (!h->piped)
+        return JS_ThrowTypeError(ctx, "childWrite: child %d was not spawned with stdio:'pipe'", id);
+
+    const uint8_t* bytes = nullptr;
+    size_t len = 0;
+    std::string tmp;
+    size_t byteOffset = 0, byteLen = 0, bytesPerElem = 0;
+    JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[1], &byteOffset, &byteLen, &bytesPerElem);
+    if (!JS_IsException(ab)) {
+        size_t abLen = 0;
+        uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, ab);
+        if (abPtr) { bytes = abPtr + byteOffset; len = byteLen; }
+        JS_FreeValue(ctx, ab);
+    } else {
+        // Not a TypedArray. Clear the probe's exception before trying the next
+        // shape — both of these throw on a miss, and a leftover pending
+        // exception would surface spuriously at an unrelated call site.
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        size_t abLen = 0;
+        uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, argv[1]);
+        if (abPtr) {
+            bytes = abPtr;
+            len = abLen;
+        } else {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            const char* s = JS_ToCStringLen(ctx, &len, argv[1]);
+            if (!s) return JS_EXCEPTION;
+            tmp.assign(s, len);
+            JS_FreeCString(ctx, s);
+            bytes = reinterpret_cast<const uint8_t*>(tmp.data());
+        }
+    }
+    if (!bytes) return JS_NewInt32(ctx, 0);
+
+    std::lock_guard<std::mutex> lock(h->stdinMutex);
+    size_t written = 0;
+#ifdef _WIN32
+    if (!h->inWrite) return JS_NewInt32(ctx, -1);
+    while (written < len) {
+        DWORD n = 0;
+        if (!WriteFile(h->inWrite, bytes + written,
+                       static_cast<DWORD>(len - written), &n, nullptr) || n == 0)
+            break;
+        written += n;
+    }
+#else
+    if (h->inWrite < 0) return JS_NewInt32(ctx, -1);
+    while (written < len) {
+        ssize_t n = ::write(h->inWrite, bytes + written, len - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        written += static_cast<size_t>(n);
+    }
+#endif
+    return JS_NewInt32(ctx, static_cast<int>(written));
+}
+
+// ---------------------------------------------------------------------------
+// __brokit_cp_childCloseStdin(id)
+//
+// Sends EOF on the child's stdin. Tools that read a stream to completion
+// (ffmpeg with `-i pipe:0`) never finish without it.
+// ---------------------------------------------------------------------------
+static JSValue js_childCloseStdin(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "childCloseStdin: id required");
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+
+    std::lock_guard<std::mutex> lock(g_childMutex);
+    auto it = g_children.find(id);
+    if (it == g_children.end()) return JS_FALSE;
+    it->second->closeStdin();
+    return JS_TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// __brokit_cp_childRelease(id)
+//
+// Drops a piped child's handle: stops the reader threads and closes the pipes.
+// Non-piped children are released automatically by childPoll on exit; piped
+// ones are kept so post-exit output can still be drained, so JS must call this
+// once it has seen EOF on both streams. Idempotent.
+// ---------------------------------------------------------------------------
+static JSValue js_childRelease(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+    if (argc < 1) return JS_ThrowTypeError(ctx, "childRelease: id required");
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+
+    // Move the handle out under the lock and destroy it after releasing, so a
+    // reader thread's final buffer append can't deadlock against g_childMutex.
+    std::unique_ptr<ChildHandle> doomed;
+    {
+        std::lock_guard<std::mutex> lock(g_childMutex);
+        auto it = g_children.find(id);
+        if (it == g_children.end()) return JS_FALSE;
+        doomed = std::move(it->second);
+        g_children.erase(it);
+    }
+    return JS_TRUE;
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1453,14 @@ void installChildProcess(JSContext* ctx)
                       JS_NewCFunction(ctx, js_childPoll, "__brokit_cp_childPoll", 1));
     JS_SetPropertyStr(ctx, global, "__brokit_cp_childKill",
                       JS_NewCFunction(ctx, js_childKill, "__brokit_cp_childKill", 2));
+    JS_SetPropertyStr(ctx, global, "__brokit_cp_childRead",
+                      JS_NewCFunction(ctx, js_childRead, "__brokit_cp_childRead", 1));
+    JS_SetPropertyStr(ctx, global, "__brokit_cp_childWrite",
+                      JS_NewCFunction(ctx, js_childWrite, "__brokit_cp_childWrite", 2));
+    JS_SetPropertyStr(ctx, global, "__brokit_cp_childCloseStdin",
+                      JS_NewCFunction(ctx, js_childCloseStdin, "__brokit_cp_childCloseStdin", 1));
+    JS_SetPropertyStr(ctx, global, "__brokit_cp_childRelease",
+                      JS_NewCFunction(ctx, js_childRelease, "__brokit_cp_childRelease", 1));
 
     JS_FreeValue(ctx, global);
 

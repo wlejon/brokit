@@ -119,15 +119,20 @@ static TestResult runTestFile(const std::string& path) {
         JSValue fwTick = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_tick");
         JSValue netHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_net_has_pending");
         JSValue netTick = JS_GetPropertyStr(ctx, global2, "__brokit_net_tick");
+        // child_process has no tick of its own — ChildProcess drives itself off
+        // setTimeout — but it must keep the pump (and so the timer queue) alive
+        // while a spawned child is still running.
+        JSValue cpHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_cp_has_pending");
         JSValue timersTick = JS_GetPropertyStr(ctx, global2, "__brokit_tick_timers");
 
         bool haveFetch = JS_IsFunction(ctx, fetchHasPending) && JS_IsFunction(ctx, fetchTick);
         bool haveWs = JS_IsFunction(ctx, wsHasPending) && JS_IsFunction(ctx, wsTick);
         bool haveFw = JS_IsFunction(ctx, fwHasPending) && JS_IsFunction(ctx, fwTick);
         bool haveNet = JS_IsFunction(ctx, netHasPending) && JS_IsFunction(ctx, netTick);
+        bool haveCp = JS_IsFunction(ctx, cpHasPending);
         bool haveTimers = JS_IsFunction(ctx, timersTick);
 
-        if (haveFetch || haveWs || haveFw || haveNet) {
+        if (haveFetch || haveWs || haveFw || haveNet || haveCp) {
             for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
                 bool anyPending = false;
 
@@ -167,6 +172,12 @@ static TestResult runTestFile(const std::string& path) {
                     JS_FreeValue(ctx, tr);
                 }
 
+                if (haveCp) {
+                    JSValue p = JS_Call(ctx, cpHasPending, global2, 0, nullptr);
+                    if (JS_ToBool(ctx, p)) anyPending = true;
+                    JS_FreeValue(ctx, p);
+                }
+
                 // Fire due setTimeout/setInterval callbacks so async tests can
                 // schedule work (e.g. aborting an in-flight fetch).
                 if (haveTimers) {
@@ -192,6 +203,7 @@ static TestResult runTestFile(const std::string& path) {
         }
 
         JS_FreeValue(ctx, timersTick);
+        JS_FreeValue(ctx, cpHasPending);
         JS_FreeValue(ctx, netTick);
         JS_FreeValue(ctx, netHasPending);
         JS_FreeValue(ctx, fwTick);
