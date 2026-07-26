@@ -2,6 +2,7 @@
 #include "runtime/runtime.h"
 #include "child_process.js.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -484,6 +485,18 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 // works around after a timeout kill with CancelSynchronousIo; polling sidesteps
 // it entirely. Costs one 2 ms wakeup while a piped child is alive.
 // ---------------------------------------------------------------------------
+// Idle poll interval, and the most one read pass will take at once. The cap
+// bounds the reader's scratch buffer; it must stay well above a video frame's
+// worth of bytes or high-rate streams pay an extra wakeup per frame.
+static constexpr int      kIdleSleepMs  = 1;
+static constexpr uint32_t kMaxReadBytes = 4u * 1024u * 1024u;
+
+// Kernel buffer for the child's stdout/stderr pipes. The CreatePipe default is
+// a few KB, which forces a read pass (and, when the pipe drains, an idle sleep)
+// every few KB. A megabyte lets a burst land in one pass and keeps the child
+// from blocking in write() between our wakeups.
+static constexpr uint32_t kPipeBufferBytes = 1u * 1024u * 1024u;
+
 #ifdef _WIN32
 static void pipeReader(HANDLE h, PipeBuf* buf, std::atomic<bool>* closing)
 {
@@ -495,13 +508,18 @@ static void pipeReader(HANDLE h, PipeBuf* buf, std::atomic<bool>* closing)
         // FALSE here is a broken pipe: every write end is closed == EOF.
         if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) break;
         if (avail == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            // Only idle-wait when the pipe is genuinely empty. Sleeping after a
+            // successful read is what caps throughput: a 2 ms pause per read
+            // pass puts a hard ~30 MB/s ceiling on the stream, far below the
+            // ~237 MB/s a 1080p30 rawvideo feed needs.
+            std::this_thread::sleep_for(std::chrono::milliseconds(kIdleSleepMs));
             continue;
         }
 
         // Wait for room BEFORE reading, so unread bytes stay in the kernel
         // pipe buffer and the child blocks in write() — real backpressure
         // rather than an unbounded parent-side queue.
+        size_t room = 0;
         {
             std::unique_lock<std::mutex> lock(buf->m);
             buf->cv.wait(lock, [&] {
@@ -509,15 +527,26 @@ static void pipeReader(HANDLE h, PipeBuf* buf, std::atomic<bool>* closing)
                        closing->load(std::memory_order_acquire);
             });
             if (closing->load(std::memory_order_acquire)) break;
+            room = buf->highWater - buf->data.size();
         }
 
-        if (avail > 64u * 1024u) avail = 64u * 1024u;
+        // Take everything the pipe has, bounded by the headroom under
+        // highWaterMark (so one big read can't blow past the caller's cap) and
+        // by kMaxReadBytes (so one burst can't balloon the scratch buffer).
+        // Capping at 64 KB here throttled the stream to one small read per
+        // wakeup, which is what held rawvideo to a fraction of its needed rate.
+        if (avail > kMaxReadBytes) avail = kMaxReadBytes;
+        if (static_cast<size_t>(avail) > room) avail = static_cast<DWORD>(room);
         chunk.resize(avail);
         DWORD got = 0;
         if (!ReadFile(h, chunk.data(), avail, &got, nullptr) || got == 0) break;
 
-        std::lock_guard<std::mutex> lock(buf->m);
-        buf->data.insert(buf->data.end(), chunk.begin(), chunk.begin() + got);
+        {
+            std::lock_guard<std::mutex> lock(buf->m);
+            buf->data.insert(buf->data.end(), chunk.begin(), chunk.begin() + got);
+        }
+        // Loop straight back to Peek — no sleep — so a saturated pipe is
+        // drained at memory speed rather than one chunk per timer tick.
     }
     std::lock_guard<std::mutex> lock(buf->m);
     buf->eof = true;
@@ -525,7 +554,13 @@ static void pipeReader(HANDLE h, PipeBuf* buf, std::atomic<bool>* closing)
 #else
 static void pipeReader(int fd, PipeBuf* buf, std::atomic<bool>* closing)
 {
-    uint8_t chunk[64 * 1024];
+    // Heap, not stack: this is deliberately far larger than a page so a
+    // saturated pipe drains in few syscalls. poll() returns as soon as POLLIN
+    // is set, so unlike the Windows path there is no per-read idle cost — the
+    // timeout below only bounds how often `closing` is re-checked.
+    std::vector<uint8_t> chunkBuf(256u * 1024u);
+    uint8_t* chunk = chunkBuf.data();
+    const size_t chunkSize = chunkBuf.size();
     for (;;) {
         if (closing->load(std::memory_order_acquire)) break;
 
@@ -533,13 +568,14 @@ static void pipeReader(int fd, PipeBuf* buf, std::atomic<bool>* closing)
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        int pr = ::poll(&pfd, 1, 2);
+        int pr = ::poll(&pfd, 1, kIdleSleepMs);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
         }
         if (pr == 0) continue;
 
+        size_t room = 0;
         {
             std::unique_lock<std::mutex> lock(buf->m);
             buf->cv.wait(lock, [&] {
@@ -547,9 +583,12 @@ static void pipeReader(int fd, PipeBuf* buf, std::atomic<bool>* closing)
                        closing->load(std::memory_order_acquire);
             });
             if (closing->load(std::memory_order_acquire)) break;
+            room = buf->highWater - buf->data.size();
         }
 
-        ssize_t got = ::read(fd, chunk, sizeof(chunk));
+        // Bound the read by the headroom under highWaterMark so a single read
+        // can't overshoot the caller's cap.
+        ssize_t got = ::read(fd, chunk, std::min(chunkSize, room));
         if (got < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             break;
@@ -897,16 +936,19 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     if (opts.pipeStdio) {
         SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
         // Parent ends go straight into `handle` so its destructor closes them
-        // on any early-return below.
-        if (!CreatePipe(&handle->outRead, &hOut, &sa, 0))
+        // on any early-return below. The explicit buffer size matters: with the
+        // default the child blocks in write() after a few KB and the reader
+        // wakes constantly for tiny reads, which is what held a rawvideo feed
+        // to a fraction of the rate it needs.
+        if (!CreatePipe(&handle->outRead, &hOut, &sa, kPipeBufferBytes))
             return JS_ThrowInternalError(ctx, "spawn: cannot create stdout pipe");
         SetHandleInformation(handle->outRead, HANDLE_FLAG_INHERIT, 0);
-        if (!CreatePipe(&handle->errRead, &hErr, &sa, 0)) {
+        if (!CreatePipe(&handle->errRead, &hErr, &sa, kPipeBufferBytes)) {
             CloseHandle(hOut);
             return JS_ThrowInternalError(ctx, "spawn: cannot create stderr pipe");
         }
         SetHandleInformation(handle->errRead, HANDLE_FLAG_INHERIT, 0);
-        if (!CreatePipe(&hIn, &handle->inWrite, &sa, 0)) {
+        if (!CreatePipe(&hIn, &handle->inWrite, &sa, kPipeBufferBytes)) {
             CloseHandle(hOut);
             CloseHandle(hErr);
             return JS_ThrowInternalError(ctx, "spawn: cannot create stdin pipe");
@@ -1020,6 +1062,15 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         handle->outRead = outPipe[0];
         handle->errRead = errPipe[0];
         handle->inWrite = inPipe[1];
+#ifdef __linux__
+        // Linux pipes default to 64 KB. Widening them keeps a high-rate
+        // producer from blocking in write() between reader wakeups. Best
+        // effort: F_SETPIPE_SZ fails without privilege past
+        // /proc/sys/fs/pipe-max-size, and the default still works.
+        fcntl(outPipe[0], F_SETPIPE_SZ, static_cast<int>(kPipeBufferBytes));
+        fcntl(errPipe[0], F_SETPIPE_SZ, static_cast<int>(kPipeBufferBytes));
+        fcntl(inPipe[1],  F_SETPIPE_SZ, static_cast<int>(kPipeBufferBytes));
+#endif
     }
     auto closeChildEnds = [&]() {
         if (!opts.pipeStdio) return;

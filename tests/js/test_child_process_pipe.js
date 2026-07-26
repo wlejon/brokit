@@ -158,6 +158,25 @@ p5.on('close', function () {
     try { fs.unlinkSync(bulkPath); } catch (e) { /* best effort */ }
 });
 
+// ── large reads: no per-pass size cap ──────────────────────────────────────
+//
+// Regression guard. The reader used to cap each pass at 64 KB and then sleep,
+// which held the stream to roughly 30 MB/s — an order of magnitude under what
+// a raw video feed needs. With the default highWaterMark a 256 KB burst should
+// come back in a handful of large chunks, not dozens of small ones. Asserted
+// on chunk size rather than wall-clock rate so it can't go flaky under load.
+const p8 = cp.spawn(dump.file, dump.args, { stdio: 'pipe' });
+let p8Max = 0, p8Bytes = 0;
+p8.stdout.on('data', function (chunk) {
+    if (chunk.length > p8Max) p8Max = chunk.length;
+    p8Bytes += chunk.length;
+});
+p8.on('close', function () {
+    assert(p8Bytes >= expectedBulk, 'unbounded read delivered the whole payload');
+    assert(p8Max > 64 * 1024,
+           'a single read can exceed 64 KB (got max chunk ' + p8Max + ' B)');
+});
+
 // ── kill a long-running piped child → close still fires ────────────────────
 
 const sleeper = isWin ? sh('ping -n 30 127.0.0.1 >nul') : sh('sleep 30');
