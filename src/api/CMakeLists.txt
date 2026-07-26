@@ -2,7 +2,7 @@
 # Each .js file in js/ becomes a .h with the content as a C string literal.
 # The generated headers land in ${CMAKE_CURRENT_BINARY_DIR}/generated/.
 
-set(EMBED_SCRIPT "${CMAKE_SOURCE_DIR}/cmake/embed_js.cmake")
+set(EMBED_SCRIPT "${brokit_SOURCE_DIR}/cmake/embed_js.cmake")
 set(GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GEN_DIR}")
 
@@ -117,20 +117,20 @@ if(BROKIT_ENABLE_IMAGE)
     # broimage is already a target (added by bro/third_party/CMakeLists.txt
     # before brokit) and this block reuses it via the NOT TARGET guard.
     if(NOT TARGET broimage)
-        set(BROIMAGE_DIR "${CMAKE_SOURCE_DIR}/../broimage" CACHE PATH
+        set(BROIMAGE_DIR "${brokit_SOURCE_DIR}/../broimage" CACHE PATH
             "Path to standalone broimage repo")
         if(EXISTS "${BROIMAGE_DIR}/CMakeLists.txt")
             message(STATUS "broimage: using standalone repo at ${BROIMAGE_DIR}")
             add_subdirectory("${BROIMAGE_DIR}" "${CMAKE_BINARY_DIR}/broimage"
                              EXCLUDE_FROM_ALL)
-        elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/broimage/CMakeLists.txt")
+        elseif(EXISTS "${brokit_SOURCE_DIR}/third_party/broimage/CMakeLists.txt")
             message(STATUS "broimage: using submodule at third_party/broimage")
-            add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/broimage"
+            add_subdirectory("${brokit_SOURCE_DIR}/third_party/broimage"
                              "${CMAKE_BINARY_DIR}/broimage" EXCLUDE_FROM_ALL)
         else()
             message(FATAL_ERROR
                 "BROKIT_ENABLE_IMAGE=ON requires broimage at ${BROIMAGE_DIR} "
-                "or ${CMAKE_SOURCE_DIR}/third_party/broimage. Clone broimage "
+                "or ${brokit_SOURCE_DIR}/third_party/broimage. Clone broimage "
                 "next to brokit, or override with -DBROIMAGE_DIR=...")
         endif()
     endif()
@@ -146,7 +146,7 @@ target_link_libraries(brokit_api PUBLIC brokit_runtime)
 target_link_libraries(brokit_api PUBLIC libcurl_static)
 target_link_libraries(brokit_api PUBLIC sqlite3)
 target_link_libraries(brokit_api PRIVATE miniz)
-target_include_directories(brokit_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party/quickjs)
+target_include_directories(brokit_api PRIVATE ${brokit_SOURCE_DIR}/third_party/quickjs)
 
 if(BROKIT_ENABLE_NOISE)
     target_link_libraries(brokit_api PUBLIC FastNoise)
