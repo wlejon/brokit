@@ -126,20 +126,88 @@
         } else if (this._body instanceof Uint8Array) {
             this._bodyBytes = this._body;
         } else if (this._body instanceof Blob) {
-            // Deferred — use blob's async methods
+            // Deferred: use the blob's async methods.
             this._bodyBlob = this._body;
+            this._bodyBytes = null;
+        } else if (this._body && typeof this._body.getReader === 'function') {
+            // A ReadableStream body. This is the shape a progress-reporting
+            // loader hands back: it reads the original response's stream, wraps
+            // it in one of its own, and passes that to `new Response(stream)` —
+            // three.js's FileLoader does precisely this — so a Response that
+            // cannot take a stream body breaks every loader built on it.
+            this._bodyStream = this._body;
             this._bodyBytes = null;
         } else if (this._body === null) {
             this._bodyBytes = new Uint8Array(0);
         }
 
-        this.body = null; // ReadableStream not wired for constructed responses
+        // `body` is a ReadableStream when there is one to read. Reporting null
+        // for a response that has a body makes it look bodyless to anything
+        // that feature-detects streaming — three.js's FileLoader reads
+        // `response.body.getReader` and throws on the null — so the stream is
+        // built here even though every consumer method below answers from the
+        // bytes directly.
+        this.body = null;
+        if (this._bodyStream) {
+            this.body = this._bodyStream;
+        } else if (this._body !== null && typeof ReadableStream === 'function') {
+            var self = this;
+            var emitted = false;
+            this.body = new ReadableStream({
+                pull: function (controller) {
+                    if (emitted) { controller.close(); return; }
+                    emitted = true;
+                    if (self._bodyBytes) {
+                        controller.enqueue(new Uint8Array(self._bodyBytes));
+                        return;
+                    }
+                    // Blob body: its bytes only come back asynchronously.
+                    return self._bodyBlob.arrayBuffer().then(function (buf) {
+                        controller.enqueue(new Uint8Array(buf));
+                    });
+                }
+            });
+        }
+    }
+
+    // Read a ReadableStream body to completion. The consumer methods all need
+    // the whole thing, so the chunks are joined once and cached on the response
+    // — text() after arrayBuffer() would otherwise find the stream drained.
+    function drainStream(resp) {
+        if (resp._bodyBytes) return Promise.resolve(resp._bodyBytes);
+        var reader = resp._bodyStream.getReader();
+        var chunks = [];
+        var total = 0;
+        return (function pump() {
+            return reader.read().then(function (r) {
+                if (r.done) {
+                    var out = new Uint8Array(total);
+                    var offset = 0;
+                    for (var i = 0; i < chunks.length; i++) {
+                        out.set(chunks[i], offset);
+                        offset += chunks[i].length;
+                    }
+                    resp._bodyBytes = out;
+                    return out;
+                }
+                var chunk = r.value instanceof Uint8Array
+                    ? r.value : new Uint8Array(r.value);
+                chunks.push(chunk);
+                total += chunk.length;
+                return pump();
+            });
+        })();
     }
 
     Response.prototype.text = function() {
         if (this.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
         this.bodyUsed = true;
         if (this._bodyBlob) return this._bodyBlob.text();
+        if (this._bodyStream) {
+            return drainStream(this).then(function (bytes) {
+                return new TextDecoder().decode(bytes);
+            });
+        }
         return Promise.resolve(new TextDecoder().decode(this._bodyBytes));
     };
 
@@ -151,6 +219,12 @@
         if (this.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
         this.bodyUsed = true;
         if (this._bodyBlob) return this._bodyBlob.arrayBuffer();
+        if (this._bodyStream) {
+            return drainStream(this).then(function (bytes) {
+                return bytes.buffer.slice(bytes.byteOffset,
+                                          bytes.byteOffset + bytes.byteLength);
+            });
+        }
         return Promise.resolve(this._bodyBytes.buffer.slice(
             this._bodyBytes.byteOffset,
             this._bodyBytes.byteOffset + this._bodyBytes.byteLength));
@@ -161,6 +235,11 @@
         this.bodyUsed = true;
         var ct = this.headers.get('content-type') || '';
         if (this._bodyBlob) return Promise.resolve(this._bodyBlob);
+        if (this._bodyStream) {
+            return drainStream(this).then(function (bytes) {
+                return new Blob([bytes], { type: ct });
+            });
+        }
         return Promise.resolve(new Blob([this._bodyBytes], { type: ct }));
     };
 

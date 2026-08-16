@@ -415,6 +415,27 @@ static JSValue js_file_type(JSContext* ctx, JSValueConst this_val)
     return JS_NewString(ctx, data->blob.type.c_str());
 }
 
+// See api.h. A host-side view of a Blob's bytes, so a native consumer can
+// resolve an object URL at the moment it is created rather than a microtask
+// later, when whatever asked for it has already given up.
+bool blobBytes(JSContext* ctx, JSValueConst val, const uint8_t** data,
+               size_t* len, std::string* type)
+{
+    if (data) *data = nullptr;
+    if (len) *len = 0;
+    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(val, blobClassId));
+    if (!bdata) {
+        auto* fdata = static_cast<FileData*>(JS_GetOpaque(val, fileClassId));
+        if (fdata) bdata = &fdata->blob;
+    }
+    if (!bdata) return false;   // not a Blob; no exception, the caller asked
+    (void)ctx;
+    if (data) *data = bdata->bytes.data();
+    if (len) *len = bdata->bytes.size();
+    if (type) *type = bdata->type;
+    return true;
+}
+
 void installBlob(JSContext* ctx)
 {
     // Register Blob class

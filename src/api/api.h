@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 extern "C" {
@@ -108,5 +110,22 @@ void addFetchPrefixMount(JSContext* ctx, const std::string& prefix, const std::s
 /// boundary so their behavior matches fs.existsSync() regardless of which
 /// directory the process was actually launched from.
 std::string resolveAssetPath(JSContext* ctx, const std::string& path);
+
+/// Bytes behind a Blob or File value, without copying and without going
+/// through the async `arrayBuffer()` / `text()` methods.
+///
+/// The web only exposes a Blob's contents asynchronously, which is fine for JS
+/// and wrong for a host: `URL.createObjectURL(blob)` returns its URL
+/// synchronously, so anything that has to resolve that URL natively — an
+/// <img src>, a texture upload, a media element — needs the bytes at the same
+/// instant, not a microtask later. The data is already sitting in the Blob's
+/// C++ buffer; this hands out a view of it.
+///
+/// Returns false if `val` is not a Blob or File — distinct from a Blob that
+/// happens to be empty, which returns true with *len == 0. The pointer belongs
+/// to the Blob and stays valid until it is garbage-collected, so copy before
+/// handing it anywhere that outlives the call. Never throws.
+bool blobBytes(JSContext* ctx, JSValueConst val, const uint8_t** data,
+               size_t* len, std::string* type = nullptr);
 
 } // namespace brokit::api

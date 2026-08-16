@@ -43,6 +43,22 @@
         return obj;
     };
 
+    // A ReadableStream that hands out one already-complete ArrayBuffer and
+    // closes. `get` is called at pull time so the body can be attached to the
+    // response after the stream is built.
+    function replayStream(get) {
+        if (typeof ReadableStream !== 'function') return null;
+        var emitted = false;
+        return new ReadableStream({
+            pull: function (controller) {
+                if (emitted) { controller.close(); return; }
+                emitted = true;
+                var buf = get();
+                controller.enqueue(new Uint8Array(buf ? buf.slice(0) : 0));
+            }
+        });
+    }
+
     // Decorate a Response object that represents a missing local file (404).
     internals.applyNotFoundBody = function (resp) {
         resp.bodyUsed = false;
@@ -58,7 +74,12 @@
     // (already attached as `resp.__body`, an ArrayBuffer).
     internals.applyFileBody = function (resp) {
         resp.bodyUsed = false;
-        resp.body = null;
+        // `body` is a ReadableStream over the bytes, not null. A response that
+        // HAS a body and reports `body === null` reads as "bodyless" to any
+        // caller that feature-detects streaming — three.js's FileLoader does
+        // exactly that (`response.body.getReader === undefined`) and throws on
+        // the null instead, so every loader built on it failed on local files.
+        resp.body = replayStream(function () { return resp.__body; });
         resp.text = function () {
             resp.bodyUsed = true;
             return Promise.resolve(new TextDecoder().decode(new Uint8Array(this.__body)));
