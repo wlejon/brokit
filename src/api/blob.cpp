@@ -1,62 +1,62 @@
 #include "api/api.h"
 #include "runtime/runtime.h"
-
 #include <cstring>
 #include <string>
 #include <vector>
 
 namespace brokit::api {
 
-// Blob data is stored as an opaque pointer in the JS object.
-// Each Blob holds a contiguous byte buffer + MIME type string.
+static thread_local JSClassID blob_class_id = 0;
 
 struct BlobData {
     std::vector<uint8_t> bytes;
     std::string type;
 };
 
-// thread_local: each thread (main + each worker) has its own JSRuntime,
-// so each must allocate its own class ID from that runtime's counter.
-// Sharing across threads causes ID collisions with other classes.
-static thread_local JSClassID blobClassId = 0;
-static thread_local JSClassID fileClassId = 0;
+static void blob_finalizer(JSRuntime*, JSValue val)
+{
+    auto* w = static_cast<BlobData*>(JS_GetOpaque(val, blob_class_id));
+    delete w;
+}
 
-// File extends Blob — FileData embeds BlobData as its first member so methods
-// on Blob.prototype can retrieve the underlying bytes from a File instance.
+static JSClassDef blob_class_def = { "Blob", blob_finalizer };
+
+static thread_local JSClassID file_class_id = 0;
+
 struct FileData {
     BlobData blob;
     std::string name;
-    double lastModified;
+    double lastModified = 0;
 };
 
-static void blobFinalizer(JSRuntime*, JSValue val)
+static void file_finalizer(JSRuntime*, JSValue val)
 {
-    auto* data = static_cast<BlobData*>(JS_GetOpaque(val, blobClassId));
-    delete data;
+    auto* w = static_cast<FileData*>(JS_GetOpaque(val, file_class_id));
+    delete w;
 }
 
-static JSClassDef blobClassDef = {
-    "Blob",
-    blobFinalizer,
-    nullptr, nullptr, nullptr
-};
+static JSClassDef file_class_def = { "File", file_finalizer };
 
-// Helper: extract bytes from a Blob or File JS object. File extends Blob,
-// so methods on Blob.prototype must accept File instances too.
+static JSValue newGetter(JSContext* ctx, JSValue (*fn)(JSContext*, JSValueConst),
+                          const char* name)
+{
+    JSCFunctionType ft;
+    ft.getter = fn;
+    return JS_NewCFunction2(ctx, ft.generic, name, 0, JS_CFUNC_getter, 0);
+}
+
 static BlobData* getBlobData(JSContext* ctx, JSValueConst val)
 {
-    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(val, blobClassId));
+    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(val, blob_class_id));
     if (bdata) return bdata;
-    auto* fdata = static_cast<FileData*>(JS_GetOpaque(val, fileClassId));
+    auto* fdata = static_cast<FileData*>(JS_GetOpaque(val, file_class_id));
     if (fdata) return &fdata->blob;
     JS_ThrowTypeError(ctx, "not a Blob");
     return nullptr;
 }
 
-// Helper: flatten a single "part" (string, ArrayBuffer, TypedArray, or Blob) into bytes
 static bool flattenPart(JSContext* ctx, JSValueConst part, std::vector<uint8_t>& out)
 {
-    // String?
     if (JS_IsString(part)) {
         const char* str = JS_ToCString(ctx, part);
         if (!str) return false;
@@ -67,11 +67,9 @@ static bool flattenPart(JSContext* ctx, JSValueConst part, std::vector<uint8_t>&
         return true;
     }
 
-    // Blob?
-    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(part, blobClassId));
+    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(part, blob_class_id));
     if (!bdata) {
-        // File? (File extends Blob)
-        auto* fdata = static_cast<FileData*>(JS_GetOpaque(part, fileClassId));
+        auto* fdata = static_cast<FileData*>(JS_GetOpaque(part, file_class_id));
         if (fdata) bdata = &fdata->blob;
     }
     if (bdata) {
@@ -79,7 +77,6 @@ static bool flattenPart(JSContext* ctx, JSValueConst part, std::vector<uint8_t>&
         return true;
     }
 
-    // TypedArray?
     size_t byte_offset = 0, byte_len = 0, bpe = 0;
     JSValue buf = JS_GetTypedArrayBuffer(ctx, part, &byte_offset, &byte_len, &bpe);
     if (!JS_IsException(buf)) {
@@ -91,10 +88,8 @@ static bool flattenPart(JSContext* ctx, JSValueConst part, std::vector<uint8_t>&
         JS_FreeValue(ctx, buf);
         return true;
     }
-    // Clear the TypedArray exception
     JS_FreeValue(ctx, JS_GetException(ctx));
 
-    // ArrayBuffer?
     size_t abLen = 0;
     uint8_t* ptr = JS_GetArrayBuffer(ctx, &abLen, part);
     if (ptr) {
@@ -102,7 +97,6 @@ static bool flattenPart(JSContext* ctx, JSValueConst part, std::vector<uint8_t>&
         return true;
     }
 
-    // Unknown — convert to string
     const char* str = JS_ToCString(ctx, part);
     if (!str) return false;
     size_t len = strlen(str);
@@ -112,79 +106,118 @@ static bool flattenPart(JSContext* ctx, JSValueConst part, std::vector<uint8_t>&
     return true;
 }
 
-// new Blob(parts?, options?)
-static JSValue js_blob_constructor(JSContext* ctx, JSValueConst new_target,
+static JSValue blob_slice(JSContext* ctx, JSValueConst this_val,
                                     int argc, JSValueConst* argv)
 {
-    auto* data = new BlobData();
-
-    // Process parts array
-    if (argc >= 1 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
-        JSValue lengthVal = JS_GetPropertyStr(ctx, argv[0], "length");
-        if (JS_IsException(lengthVal)) {
-            delete data;
-            return lengthVal;
-        }
-        uint32_t len = 0;
-        JS_ToUint32(ctx, &len, lengthVal);
-        JS_FreeValue(ctx, lengthVal);
-
-        for (uint32_t i = 0; i < len; i++) {
-            JSValue item = JS_GetPropertyUint32(ctx, argv[0], i);
-            if (JS_IsException(item)) {
-                delete data;
-                return item;
-            }
-            bool ok = flattenPart(ctx, item, data->bytes);
-            JS_FreeValue(ctx, item);
-            if (!ok) {
-                delete data;
-                return JS_EXCEPTION;
-            }
+    auto* data = getBlobData(ctx, this_val);
+    if (!data) return JS_EXCEPTION;
+    
+    int64_t size = static_cast<int64_t>(data->bytes.size());
+    int64_t start = 0;
+    int64_t end = size;
+    
+    if (argc > 0 && !JS_IsUndefined(argv[0])) {
+        JS_ToInt64(ctx, &start, argv[0]);
+        if (start < 0) start = std::max<int64_t>(0, size + start);
+        else start = std::min<int64_t>(size, start);
+    }
+    if (argc > 1 && !JS_IsUndefined(argv[1])) {
+        JS_ToInt64(ctx, &end, argv[1]);
+        if (end < 0) end = std::max<int64_t>(0, size + end);
+        else end = std::min<int64_t>(size, end);
+    }
+    
+    std::string contentType;
+    if (argc > 2 && !JS_IsUndefined(argv[2])) {
+        const char* ctStr = JS_ToCString(ctx, argv[2]);
+        if (ctStr) {
+            contentType = ctStr;
+            for (auto& c : contentType) c = static_cast<char>(tolower(c));
+            JS_FreeCString(ctx, ctStr);
         }
     }
-
-    // Process options
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        JSValue typeVal = JS_GetPropertyStr(ctx, argv[1], "type");
-        if (JS_IsString(typeVal)) {
-            const char* t = JS_ToCString(ctx, typeVal);
-            if (t) {
-                data->type = t;
-                // Normalize to lowercase per spec
-                for (auto& c : data->type) c = static_cast<char>(tolower(c));
-                JS_FreeCString(ctx, t);
-            }
-        }
-        JS_FreeValue(ctx, typeVal);
+    
+    auto* newData = new BlobData();
+    newData->type = contentType;
+    if (start < end) {
+        newData->bytes.assign(data->bytes.begin() + start, data->bytes.begin() + end);
     }
-
-    // Create the JS object using the prototype from new.target
-    JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
-    if (JS_IsException(proto)) {
-        delete data;
-        return proto;
-    }
-    JSValue obj = JS_NewObjectProtoClass(ctx, proto, blobClassId);
+    
+    JSValue proto = JS_GetClassProto(ctx, blob_class_id);
+    JSValue obj = JS_NewObjectProtoClass(ctx, proto, blob_class_id);
     JS_FreeValue(ctx, proto);
     if (JS_IsException(obj)) {
-        delete data;
+        delete newData;
         return obj;
     }
-    JS_SetOpaque(obj, data);
+    JS_SetOpaque(obj, newData);
     return obj;
 }
 
-// Helper to create a getter JSValue from a 2-arg getter function
-static JSValue newGetter(JSContext* ctx, JSValue (*fn)(JSContext*, JSValueConst),
-                          const char* name)
+static JSValue blob_text(JSContext* ctx, JSValueConst this_val,
+                                    int argc, JSValueConst* argv)
 {
-    JSCFunctionType ft;
-    ft.getter = fn;
-    return JS_NewCFunction2(ctx, ft.generic, name, 0, JS_CFUNC_getter, 0);
+    auto* data = getBlobData(ctx, this_val);
+    if (!data) return JS_EXCEPTION;
+    
+    JSValue resolving_funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise)) return promise;
+    
+    JSValue str = JS_NewStringLen(ctx, reinterpret_cast<const char*>(data->bytes.data()), data->bytes.size());
+    JSValue ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &str);
+    JS_FreeValue(ctx, str);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return promise;
 }
 
-// Blob.prototype.size
+static JSValue blob_array_buffer(JSContext* ctx, JSValueConst this_val,
+                                    int argc, JSValueConst* argv)
+{
+    auto* data = getBlobData(ctx, this_val);
+    if (!data) return JS_EXCEPTION;
+    
+    JSValue resolving_funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise)) return promise;
+    
+    JSValue ab = JS_NewArrayBufferCopy(ctx, data->bytes.data(), data->bytes.size());
+    JSValue ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &ab);
+    JS_FreeValue(ctx, ab);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return promise;
+}
+
+static JSValue blob_bytes(JSContext* ctx, JSValueConst this_val,
+                                    int argc, JSValueConst* argv)
+{
+    auto* data = getBlobData(ctx, this_val);
+    if (!data) return JS_EXCEPTION;
+    
+    JSValue resolving_funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise)) return promise;
+    
+    JSValue ab = JS_NewArrayBufferCopy(ctx, data->bytes.data(), data->bytes.size());
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue u8ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
+    JSValue u8arr = JS_CallConstructor(ctx, u8ctor, 1, &ab);
+    JS_FreeValue(ctx, u8ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, ab);
+    
+    JSValue ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, &u8arr);
+    JS_FreeValue(ctx, u8arr);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return promise;
+}
+
 static JSValue js_blob_size(JSContext* ctx, JSValueConst this_val)
 {
     auto* data = getBlobData(ctx, this_val);
@@ -192,7 +225,6 @@ static JSValue js_blob_size(JSContext* ctx, JSValueConst this_val)
     return JS_NewFloat64(ctx, static_cast<double>(data->bytes.size()));
 }
 
-// Blob.prototype.type
 static JSValue js_blob_type(JSContext* ctx, JSValueConst this_val)
 {
     auto* data = getBlobData(ctx, this_val);
@@ -200,330 +232,250 @@ static JSValue js_blob_type(JSContext* ctx, JSValueConst this_val)
     return JS_NewString(ctx, data->type.c_str());
 }
 
-// Blob.prototype.slice(start?, end?, contentType?)
-static JSValue js_blob_slice(JSContext* ctx, JSValueConst this_val,
-                              int argc, JSValueConst* argv)
-{
-    auto* data = getBlobData(ctx, this_val);
-    if (!data) return JS_ThrowTypeError(ctx, "not a Blob");
-
-    int64_t size = static_cast<int64_t>(data->bytes.size());
-    int64_t start = 0, end = size;
-
-    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
-        JS_ToInt64(ctx, &start, argv[0]);
-        if (start < 0) start = std::max<int64_t>(size + start, 0);
-        else start = std::min(start, size);
-    }
-    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
-        JS_ToInt64(ctx, &end, argv[1]);
-        if (end < 0) end = std::max<int64_t>(size + end, 0);
-        else end = std::min(end, size);
-    }
-
-    std::string contentType;
-    if (argc >= 3 && JS_IsString(argv[2])) {
-        const char* ct = JS_ToCString(ctx, argv[2]);
-        if (ct) {
-            contentType = ct;
-            for (auto& c : contentType) c = static_cast<char>(tolower(c));
-            JS_FreeCString(ctx, ct);
-        }
-    }
-
-    int64_t span = std::max<int64_t>(end - start, 0);
-
-    // Create new Blob with sliced data
-    auto* sliced = new BlobData();
-    if (span > 0) {
-        sliced->bytes.assign(data->bytes.begin() + start, data->bytes.begin() + start + span);
-    }
-    sliced->type = contentType;
-
-    // Get the Blob constructor's prototype
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue blobCtor = JS_GetPropertyStr(ctx, global, "Blob");
-    JSValue proto = JS_GetPropertyStr(ctx, blobCtor, "prototype");
-    JSValue obj = JS_NewObjectProtoClass(ctx, proto, blobClassId);
-    JS_FreeValue(ctx, proto);
-    JS_FreeValue(ctx, blobCtor);
-    JS_FreeValue(ctx, global);
-
-    if (JS_IsException(obj)) {
-        delete sliced;
-        return obj;
-    }
-    JS_SetOpaque(obj, sliced);
-    return obj;
-}
-
-// Blob.prototype.arrayBuffer() — returns a Promise that resolves with an ArrayBuffer
-static JSValue js_blob_arrayBuffer(JSContext* ctx, JSValueConst this_val,
-                                    int, JSValueConst*)
-{
-    auto* data = getBlobData(ctx, this_val);
-    if (!data) return JS_ThrowTypeError(ctx, "not a Blob");
-
-    JSValue ab = JS_NewArrayBufferCopy(ctx, data->bytes.data(),
-                                        data->bytes.size());
-    if (JS_IsException(ab)) return ab;
-
-    // Wrap in resolved promise
-    JSValue resolving[2];
-    JSValue promise = JS_NewPromiseCapability(ctx, resolving);
-    if (JS_IsException(promise)) {
-        JS_FreeValue(ctx, ab);
-        return promise;
-    }
-    JSValue ret = JS_Call(ctx, resolving[0], JS_UNDEFINED, 1, &ab);
-    JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, ab);
-    JS_FreeValue(ctx, resolving[0]);
-    JS_FreeValue(ctx, resolving[1]);
-    return promise;
-}
-
-// Blob.prototype.text() — returns a Promise that resolves with a string
-static JSValue js_blob_text(JSContext* ctx, JSValueConst this_val,
-                             int, JSValueConst*)
-{
-    auto* data = getBlobData(ctx, this_val);
-    if (!data) return JS_ThrowTypeError(ctx, "not a Blob");
-
-    JSValue str = JS_NewStringLen(ctx, reinterpret_cast<const char*>(data->bytes.data()),
-                                  data->bytes.size());
-    if (JS_IsException(str)) return str;
-
-    JSValue resolving[2];
-    JSValue promise = JS_NewPromiseCapability(ctx, resolving);
-    if (JS_IsException(promise)) {
-        JS_FreeValue(ctx, str);
-        return promise;
-    }
-    JSValue ret = JS_Call(ctx, resolving[0], JS_UNDEFINED, 1, &str);
-    JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, str);
-    JS_FreeValue(ctx, resolving[0]);
-    JS_FreeValue(ctx, resolving[1]);
-    return promise;
-}
-
-// File extends Blob — FileData is declared at top of file so getBlobData() can
-// unwrap File instances. fileClassId is also declared up top.
-static void fileFinalizer(JSRuntime*, JSValue val)
-{
-    auto* data = static_cast<FileData*>(JS_GetOpaque(val, fileClassId));
-    delete data;
-}
-
-static JSClassDef fileClassDef = {
-    "File",
-    fileFinalizer,
-    nullptr, nullptr, nullptr
-};
-
-// new File(parts, name, options?)
-static JSValue js_file_constructor(JSContext* ctx, JSValueConst new_target,
+static JSValue js_blob_constructor(JSContext* ctx, JSValueConst new_target,
                                     int argc, JSValueConst* argv)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "File requires at least 2 arguments");
-
-    auto* data = new FileData();
-
-    // Process parts array (same as Blob)
-    if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
-        JSValue lengthVal = JS_GetPropertyStr(ctx, argv[0], "length");
-        if (JS_IsException(lengthVal)) { delete data; return lengthVal; }
+    auto* data = new BlobData();
+    
+    if (argc > 0 && !JS_IsUndefined(argv[0])) {
+        if (!JS_IsArray(ctx, argv[0])) {
+            delete data;
+            return JS_ThrowTypeError(ctx, "Blob parts must be an sequence/array");
+        }
+        JSValue lenVal = JS_GetPropertyStr(ctx, argv[0], "length");
         uint32_t len = 0;
-        JS_ToUint32(ctx, &len, lengthVal);
-        JS_FreeValue(ctx, lengthVal);
-
+        JS_ToUint32(ctx, &len, lenVal);
+        JS_FreeValue(ctx, lenVal);
         for (uint32_t i = 0; i < len; i++) {
-            JSValue item = JS_GetPropertyUint32(ctx, argv[0], i);
-            if (JS_IsException(item)) { delete data; return item; }
-            bool ok = flattenPart(ctx, item, data->blob.bytes);
-            JS_FreeValue(ctx, item);
-            if (!ok) { delete data; return JS_EXCEPTION; }
+            JSValue part = JS_GetPropertyUint32(ctx, argv[0], i);
+            bool ok = flattenPart(ctx, part, data->bytes);
+            JS_FreeValue(ctx, part);
+            if (!ok) {
+                delete data;
+                return JS_EXCEPTION;
+            }
         }
     }
-
-    // Name
-    const char* name = JS_ToCString(ctx, argv[1]);
-    if (!name) { delete data; return JS_EXCEPTION; }
-    data->name = name;
-    JS_FreeCString(ctx, name);
-
-    // Default lastModified to now
-    data->lastModified = 0; // Will set via JS Date.now() below if not provided
-
-    // Options
-    if (argc >= 3 && JS_IsObject(argv[2])) {
-        JSValue typeVal = JS_GetPropertyStr(ctx, argv[2], "type");
+    
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_IsObject(argv[1])) {
+        JSValue typeVal = JS_GetPropertyStr(ctx, argv[1], "type");
         if (JS_IsString(typeVal)) {
-            const char* t = JS_ToCString(ctx, typeVal);
-            if (t) {
-                data->blob.type = t;
-                for (auto& c : data->blob.type) c = static_cast<char>(tolower(c));
-                JS_FreeCString(ctx, t);
+            const char* typeStr = JS_ToCString(ctx, typeVal);
+            if (typeStr) {
+                data->type = typeStr;
+                for (auto& c : data->type) c = static_cast<char>(tolower(c));
+                JS_FreeCString(ctx, typeStr);
             }
         }
         JS_FreeValue(ctx, typeVal);
-
-        JSValue lmVal = JS_GetPropertyStr(ctx, argv[2], "lastModified");
-        if (!JS_IsUndefined(lmVal)) {
-            double lm = 0;
-            JS_ToFloat64(ctx, &lm, lmVal);
-            data->lastModified = lm;
-        }
-        JS_FreeValue(ctx, lmVal);
     }
-
+    
     JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
-    if (JS_IsException(proto)) { delete data; return proto; }
-    JSValue obj = JS_NewObjectProtoClass(ctx, proto, fileClassId);
+    if (JS_IsException(proto)) {
+        delete data;
+        return proto;
+    }
+    JSValue obj = JS_NewObjectProtoClass(ctx, proto, blob_class_id);
     JS_FreeValue(ctx, proto);
-    if (JS_IsException(obj)) { delete data; return obj; }
+    if (JS_IsException(obj)) {
+        delete data;
+        return obj;
+    }
     JS_SetOpaque(obj, data);
     return obj;
 }
 
 static JSValue js_file_name(JSContext* ctx, JSValueConst this_val)
 {
-    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, fileClassId));
+    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, file_class_id));
     if (!data) return JS_ThrowTypeError(ctx, "not a File");
     return JS_NewString(ctx, data->name.c_str());
 }
 
 static JSValue js_file_lastModified(JSContext* ctx, JSValueConst this_val)
 {
-    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, fileClassId));
+    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, file_class_id));
     if (!data) return JS_ThrowTypeError(ctx, "not a File");
     return JS_NewFloat64(ctx, data->lastModified);
 }
 
-static JSValue js_file_size(JSContext* ctx, JSValueConst this_val)
+static JSValue js_file_webkitRelativePath(JSContext* ctx, JSValueConst this_val)
 {
-    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, fileClassId));
+    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, file_class_id));
     if (!data) return JS_ThrowTypeError(ctx, "not a File");
-    return JS_NewFloat64(ctx, static_cast<double>(data->blob.bytes.size()));
+    return JS_NewString(ctx, "");
 }
 
-static JSValue js_file_type(JSContext* ctx, JSValueConst this_val)
+static JSValue js_file_path(JSContext* ctx, JSValueConst this_val)
 {
-    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, fileClassId));
+    auto* data = static_cast<FileData*>(JS_GetOpaque2(ctx, this_val, file_class_id));
     if (!data) return JS_ThrowTypeError(ctx, "not a File");
-    return JS_NewString(ctx, data->blob.type.c_str());
+    return JS_NewString(ctx, "");
 }
 
-// See api.h. A host-side view of a Blob's bytes, so a native consumer can
-// resolve an object URL at the moment it is created rather than a microtask
-// later, when whatever asked for it has already given up.
-bool blobBytes(JSContext* ctx, JSValueConst val, const uint8_t** data,
-               size_t* len, std::string* type)
+static JSValue js_file_constructor(JSContext* ctx, JSValueConst new_target,
+                                    int argc, JSValueConst* argv)
 {
-    if (data) *data = nullptr;
-    if (len) *len = 0;
-    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(val, blobClassId));
-    if (!bdata) {
-        auto* fdata = static_cast<FileData*>(JS_GetOpaque(val, fileClassId));
-        if (fdata) bdata = &fdata->blob;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "File constructor requires at least 2 arguments (bits, name)");
+    if (!JS_IsArray(ctx, argv[0])) return JS_ThrowTypeError(ctx, "File bits must be a sequence/array");
+    
+    const char* nameStr = JS_ToCString(ctx, argv[1]);
+    if (!nameStr) return JS_EXCEPTION;
+    
+    auto* data = new FileData();
+    data->name = nameStr;
+    JS_FreeCString(ctx, nameStr);
+    
+    JSValue lenVal = JS_GetPropertyStr(ctx, argv[0], "length");
+    uint32_t len = 0;
+    JS_ToUint32(ctx, &len, lenVal);
+    JS_FreeValue(ctx, lenVal);
+    for (uint32_t i = 0; i < len; i++) {
+        JSValue part = JS_GetPropertyUint32(ctx, argv[0], i);
+        bool ok = flattenPart(ctx, part, data->blob.bytes);
+        JS_FreeValue(ctx, part);
+        if (!ok) {
+            delete data;
+            return JS_EXCEPTION;
+        }
     }
-    if (!bdata) return false;   // not a Blob; no exception, the caller asked
-    (void)ctx;
-    if (data) *data = bdata->bytes.data();
-    if (len) *len = bdata->bytes.size();
-    if (type) *type = bdata->type;
-    return true;
+    
+    data->lastModified = 0;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_IsObject(argv[2])) {
+        JSValue typeVal = JS_GetPropertyStr(ctx, argv[2], "type");
+        if (JS_IsString(typeVal)) {
+            const char* typeStr = JS_ToCString(ctx, typeVal);
+            if (typeStr) {
+                data->blob.type = typeStr;
+                for (auto& c : data->blob.type) c = static_cast<char>(tolower(c));
+                JS_FreeCString(ctx, typeStr);
+            }
+        }
+        JS_FreeValue(ctx, typeVal);
+    
+        JSValue lmVal = JS_GetPropertyStr(ctx, argv[2], "lastModified");
+        if (JS_IsNumber(lmVal)) {
+            JS_ToFloat64(ctx, &data->lastModified, lmVal);
+        }
+        JS_FreeValue(ctx, lmVal);
+    }
+    
+    JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
+    if (JS_IsException(proto)) {
+        delete data;
+        return proto;
+    }
+    JSValue obj = JS_NewObjectProtoClass(ctx, proto, file_class_id);
+    JS_FreeValue(ctx, proto);
+    if (JS_IsException(obj)) {
+        delete data;
+        return obj;
+    }
+    JS_SetOpaque(obj, data);
+    return obj;
+}
+
+bool blobBytes(JSContext* ctx, JSValueConst val, const uint8_t** data, size_t* len, std::string* type)
+{
+    auto* bdata = static_cast<BlobData*>(JS_GetOpaque(val, blob_class_id));
+    if (bdata) {
+        *data = bdata->bytes.data();
+        *len = bdata->bytes.size();
+        if (type) *type = bdata->type;
+        return true;
+    }
+    auto* fdata = static_cast<FileData*>(JS_GetOpaque(val, file_class_id));
+    if (fdata) {
+        *data = fdata->blob.bytes.data();
+        *len = fdata->blob.bytes.size();
+        if (type) *type = fdata->blob.type;
+        return true;
+    }
+    return false;
 }
 
 void installBlob(JSContext* ctx)
 {
-    // Register Blob class
     JSRuntime* rt = JS_GetRuntime(ctx);
-    if (blobClassId == 0) JS_NewClassID(rt, &blobClassId);
-    JS_NewClass(rt, blobClassId, &blobClassDef);
+    JSValue global = JS_GetGlobalObject(ctx);
 
-    // Blob constructor
+    // Register Blob class
+    if (blob_class_id == 0) JS_NewClassID(rt, &blob_class_id);
+    JS_NewClass(rt, blob_class_id, &blob_class_def);
+
     JSValue blobProto = JS_NewObject(ctx);
 
-    // Getters
-    JSAtom sizeAtom = JS_NewAtom(ctx, "size");
-    JS_DefinePropertyGetSet(ctx, blobProto, sizeAtom,
+    JSAtom blob_size_atom = JS_NewAtom(ctx, "size");
+    JS_DefinePropertyGetSet(ctx, blobProto, blob_size_atom,
                             newGetter(ctx, js_blob_size, "size"),
                             JS_UNDEFINED, 0);
-    JS_FreeAtom(ctx, sizeAtom);
-
-    JSAtom typeAtom = JS_NewAtom(ctx, "type");
-    JS_DefinePropertyGetSet(ctx, blobProto, typeAtom,
+    JS_FreeAtom(ctx, blob_size_atom);
+    JSAtom blob_type_atom = JS_NewAtom(ctx, "type");
+    JS_DefinePropertyGetSet(ctx, blobProto, blob_type_atom,
                             newGetter(ctx, js_blob_type, "type"),
                             JS_UNDEFINED, 0);
-    JS_FreeAtom(ctx, typeAtom);
+    JS_FreeAtom(ctx, blob_type_atom);
 
-    // Methods
     JS_SetPropertyStr(ctx, blobProto, "slice",
-                      JS_NewCFunction(ctx, js_blob_slice, "slice", 3));
-    JS_SetPropertyStr(ctx, blobProto, "arrayBuffer",
-                      JS_NewCFunction(ctx, js_blob_arrayBuffer, "arrayBuffer", 0));
+        JS_NewCFunction(ctx, blob_slice, "slice", 3));
     JS_SetPropertyStr(ctx, blobProto, "text",
-                      JS_NewCFunction(ctx, js_blob_text, "text", 0));
+        JS_NewCFunction(ctx, blob_text, "text", 0));
+    JS_SetPropertyStr(ctx, blobProto, "arrayBuffer",
+        JS_NewCFunction(ctx, blob_array_buffer, "arrayBuffer", 0));
+    JS_SetPropertyStr(ctx, blobProto, "bytes",
+        JS_NewCFunction(ctx, blob_bytes, "bytes", 0));
 
-    JS_SetClassProto(ctx, blobClassId, blobProto);
+    JS_SetClassProto(ctx, blob_class_id, blobProto);
 
     JSValue blobCtor = JS_NewCFunction2(ctx, js_blob_constructor, "Blob", 2,
                                          JS_CFUNC_constructor, 0);
-    // Re-get proto since SetClassProto consumed our ref
-    blobProto = JS_GetClassProto(ctx, blobClassId);
+    blobProto = JS_GetClassProto(ctx, blob_class_id);
     JS_SetPropertyStr(ctx, blobCtor, "prototype", JS_DupValue(ctx, blobProto));
     JS_SetPropertyStr(ctx, blobProto, "constructor", JS_DupValue(ctx, blobCtor));
     JS_FreeValue(ctx, blobProto);
 
-    JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, global, "Blob", blobCtor);
 
     // Register File class
-    if (fileClassId == 0) JS_NewClassID(rt, &fileClassId);
-    JS_NewClass(rt, fileClassId, &fileClassDef);
+    if (file_class_id == 0) JS_NewClassID(rt, &file_class_id);
+    JS_NewClass(rt, file_class_id, &file_class_def);
 
-    // File prototype inherits from Blob prototype (File extends Blob)
-    blobProto = JS_GetClassProto(ctx, blobClassId);
-    JSValue fileProto = JS_NewObjectProto(ctx, blobProto);
-    JS_FreeValue(ctx, blobProto);
+    JSValue parentProto = JS_GetClassProto(ctx, blob_class_id);
+    JSValue fileProto = JS_NewObjectProto(ctx, parentProto);
+    JS_FreeValue(ctx, parentProto);
 
-    // File getters: name, lastModified, size, type
-    JSAtom nameAtom = JS_NewAtom(ctx, "name");
-    JS_DefinePropertyGetSet(ctx, fileProto, nameAtom,
+    JSAtom file_name_atom = JS_NewAtom(ctx, "name");
+    JS_DefinePropertyGetSet(ctx, fileProto, file_name_atom,
                             newGetter(ctx, js_file_name, "name"),
                             JS_UNDEFINED, 0);
-    JS_FreeAtom(ctx, nameAtom);
-
-    JSAtom lmAtom = JS_NewAtom(ctx, "lastModified");
-    JS_DefinePropertyGetSet(ctx, fileProto, lmAtom,
+    JS_FreeAtom(ctx, file_name_atom);
+    JSAtom file_lastModified_atom = JS_NewAtom(ctx, "lastModified");
+    JS_DefinePropertyGetSet(ctx, fileProto, file_lastModified_atom,
                             newGetter(ctx, js_file_lastModified, "lastModified"),
                             JS_UNDEFINED, 0);
-    JS_FreeAtom(ctx, lmAtom);
-
-    JSAtom fSizeAtom = JS_NewAtom(ctx, "size");
-    JS_DefinePropertyGetSet(ctx, fileProto, fSizeAtom,
-                            newGetter(ctx, js_file_size, "size"),
+    JS_FreeAtom(ctx, file_lastModified_atom);
+    JSAtom file_webkitRelativePath_atom = JS_NewAtom(ctx, "webkitRelativePath");
+    JS_DefinePropertyGetSet(ctx, fileProto, file_webkitRelativePath_atom,
+                            newGetter(ctx, js_file_webkitRelativePath, "webkitRelativePath"),
                             JS_UNDEFINED, 0);
-    JS_FreeAtom(ctx, fSizeAtom);
-
-    JSAtom fTypeAtom = JS_NewAtom(ctx, "type");
-    JS_DefinePropertyGetSet(ctx, fileProto, fTypeAtom,
-                            newGetter(ctx, js_file_type, "type"),
+    JS_FreeAtom(ctx, file_webkitRelativePath_atom);
+    JSAtom file_path_atom = JS_NewAtom(ctx, "path");
+    JS_DefinePropertyGetSet(ctx, fileProto, file_path_atom,
+                            newGetter(ctx, js_file_path, "path"),
                             JS_UNDEFINED, 0);
-    JS_FreeAtom(ctx, fTypeAtom);
+    JS_FreeAtom(ctx, file_path_atom);
 
-    JS_SetClassProto(ctx, fileClassId, fileProto);
+    JS_SetClassProto(ctx, file_class_id, fileProto);
 
     JSValue fileCtor = JS_NewCFunction2(ctx, js_file_constructor, "File", 3,
                                          JS_CFUNC_constructor, 0);
-    fileProto = JS_GetClassProto(ctx, fileClassId);
+    fileProto = JS_GetClassProto(ctx, file_class_id);
     JS_SetPropertyStr(ctx, fileCtor, "prototype", JS_DupValue(ctx, fileProto));
     JS_SetPropertyStr(ctx, fileProto, "constructor", JS_DupValue(ctx, fileCtor));
-
     JS_FreeValue(ctx, fileProto);
+
     JS_SetPropertyStr(ctx, global, "File", fileCtor);
+
     JS_FreeValue(ctx, global);
 }
 
