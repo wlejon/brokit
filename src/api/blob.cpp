@@ -238,7 +238,7 @@ static JSValue js_blob_constructor(JSContext* ctx, JSValueConst new_target,
     auto* data = new BlobData();
     
     if (argc > 0 && !JS_IsUndefined(argv[0])) {
-        if (!JS_IsArray(ctx, argv[0])) {
+        if (!JS_IsArray(argv[0])) {
             delete data;
             return JS_ThrowTypeError(ctx, "Blob parts must be an sequence/array");
         }
@@ -317,7 +317,7 @@ static JSValue js_file_constructor(JSContext* ctx, JSValueConst new_target,
                                     int argc, JSValueConst* argv)
 {
     if (argc < 2) return JS_ThrowTypeError(ctx, "File constructor requires at least 2 arguments (bits, name)");
-    if (!JS_IsArray(ctx, argv[0])) return JS_ThrowTypeError(ctx, "File bits must be a sequence/array");
+    if (!JS_IsArray(argv[0])) return JS_ThrowTypeError(ctx, "File bits must be a sequence/array");
     
     const char* nameStr = JS_ToCString(ctx, argv[1]);
     if (!nameStr) return JS_EXCEPTION;

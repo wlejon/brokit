@@ -144,6 +144,8 @@ static JSValue fast_noise_types(JSContext* ctx, JSValueConst this_val,
 static JSValue fast_noise_set(JSContext* ctx, JSValueConst this_val,
                                     int argc, JSValueConst* argv)
 {
+    auto* w = static_cast<NoiseWrapper*>(JS_GetOpaque2(ctx, this_val, noise_class_id));
+    if (!w) return JS_EXCEPTION;
     if (argc < 2 || !JS_IsString(argv[0])) return JS_ThrowTypeError(ctx, "set(name, value)");
     const char* name = JS_ToCString(ctx, argv[0]); if (!name) return JS_EXCEPTION;
     const auto& meta = w->node->GetMetadata(); JSValueConst val = argv[1];
@@ -189,6 +191,8 @@ static JSValue fast_noise_set(JSContext* ctx, JSValueConst this_val,
 static JSValue fast_noise_get_members(JSContext* ctx, JSValueConst this_val,
                                     int argc, JSValueConst* argv)
 {
+    auto* w = static_cast<NoiseWrapper*>(JS_GetOpaque2(ctx, this_val, noise_class_id));
+    if (!w) return JS_EXCEPTION;
     const auto& meta = w->node->GetMetadata(); JSValue result = JS_NewObject(ctx); JS_SetPropertyStr(ctx, result, "type", JS_NewString(ctx, meta.name));
     JSValue vars = JS_NewArray(ctx);
     for (size_t i = 0; i < meta.memberVariables.size(); i++) {
