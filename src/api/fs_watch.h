@@ -25,10 +25,6 @@
 #include <thread>
 #include <vector>
 
-extern "C" {
-#include "quickjs.h"
-}
-
 namespace brokit::api {
 
 class FsWatcher {
@@ -93,6 +89,6 @@ private:
 };
 
 // JS bindings: install __brokit_fs_watch_* globals.
-void installFSWatch(JSContext* ctx);
+void installFSWatch();
 
 } // namespace brokit::api

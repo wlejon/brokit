@@ -25,8 +25,7 @@ openReq.onsuccess = function (e) {
 };
 
 // ── Native binding error paths ───────────────────────────────────────────
-// Bad arg counts: should NOT throw QuickJS (they return JS_FALSE / JS_NULL / etc.)
-// but exercise the arg-validation branches.
+// Bad arg counts: exercise the arg-validation branches.
 var idbPut = globalThis.__brokit_idb_put;
 var idbGet = globalThis.__brokit_idb_get;
 var idbDelete = globalThis.__brokit_idb_delete;

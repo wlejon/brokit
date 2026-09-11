@@ -14,16 +14,25 @@ if(MSVC)
     endif()
 endif()
 
-# QuickJS — consumer can provide it, otherwise build from bundled submodule
-if(NOT TARGET qjs)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs/CMakeLists.txt")
-        set(QJS_BUILD_CLI OFF CACHE BOOL "" FORCE)
-        set(QJS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-        set(BUILD_QJS_LIBC ON CACHE BOOL "" FORCE)
-        add_subdirectory(third_party/quickjs EXCLUDE_FROM_ALL)
-    else()
-        message(FATAL_ERROR "QuickJS not found. Either provide the qjs target or place QuickJS in third_party/quickjs/")
+# bronze AOT JavaScript compiler & runtime (standalone ../bronze or third_party/bronze submodule)
+if(NOT TARGET bronze_runtime_shared)
+    set(BRONZE_BUILD_SHARED_RUNTIME ON CACHE BOOL "" FORCE)
+    set(BRONZE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BRONZE_WITH_LLVM ON CACHE BOOL "Build bronze's LLVM codegen backend")
+    if(DEFINED BRONZE_DIR AND EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        # Explicit BRONZE_DIR supplied
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bronze" CACHE PATH "bronze AOT compiler source tree")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze/CMakeLists.txt")
+        set(BRONZE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/bronze" CACHE PATH "bronze AOT compiler source tree")
     endif()
+
+    if(NOT BRONZE_DIR OR NOT EXISTS "${BRONZE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "bronze not found. Either provide ../bronze, third_party/bronze, or pass -DBRONZE_DIR=<path>.")
+    endif()
+
+    add_subdirectory("${BRONZE_DIR}" "${CMAKE_BINARY_DIR}/bronze-build" EXCLUDE_FROM_ALL)
 endif()
 
 # libcurl — built as static library, no extras

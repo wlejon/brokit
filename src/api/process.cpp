@@ -1,9 +1,16 @@
 #include "api/api.h"
+#include "api/object_builder.h"
+#include "api/arg_reader.h"
+#include "api/host_proxy.h"
 #include "runtime/runtime.h"
-#include "process.js.h"
+#include "embed/embed.h"
 
+extern "C" void bronze_process_main();
+
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -14,225 +21,197 @@ extern "C" char** environ;
 
 namespace brokit::api {
 
-// process.env.KEY — read an environment variable
-static JSValue js_env_get(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-{
-    if (argc < 1) return JS_UNDEFINED;
-    const char* key = JS_ToCString(ctx, argv[0]);
-    if (!key) return JS_EXCEPTION;
+namespace {
 
-    const char* val = getenv(key);
-    JS_FreeCString(ctx, key);
-
-    if (!val) return JS_UNDEFINED;
-    return JS_NewString(ctx, val);
-}
-
-// process.env.KEY = value — set an environment variable
-static JSValue js_env_set(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-{
-    if (argc < 2) return JS_UNDEFINED;
-    const char* key = JS_ToCString(ctx, argv[0]);
-    if (!key) return JS_EXCEPTION;
-    const char* val = JS_ToCString(ctx, argv[1]);
-    if (!val) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
-
-#ifdef _WIN32
-    SetEnvironmentVariableA(key, val);
-    // Also update CRT environ
-    _putenv_s(key, val);
-#else
-    setenv(key, val, 1);
-#endif
-
-    JS_FreeCString(ctx, key);
-    JS_FreeCString(ctx, val);
-    return JS_UNDEFINED;
-}
-
-// process.env enumeration — all variable names, for the Proxy's ownKeys trap
-// (Object.keys / spread / Object.assign on process.env need this)
-static JSValue js_env_keys(JSContext* ctx, JSValueConst, int, JSValueConst*)
-{
-    JSValue arr = JS_NewArray(ctx);
-    uint32_t n = 0;
-#ifdef _WIN32
-    char* block = GetEnvironmentStringsA();
-    if (block) {
-        for (char* p = block; *p; p += strlen(p) + 1) {
-            if (p[0] == '=') continue;   // cmd's hidden per-drive cwd entries
-            const char* eq = strchr(p, '=');
-            if (!eq) continue;
-            JS_SetPropertyUint32(ctx, arr, n++,
-                                 JS_NewStringLen(ctx, p, static_cast<size_t>(eq - p)));
-        }
-        FreeEnvironmentStringsA(block);
-    }
-#else
-    for (char** e = environ; e && *e; e++) {
-        const char* eq = strchr(*e, '=');
-        if (!eq) continue;
-        JS_SetPropertyUint32(ctx, arr, n++,
-                             JS_NewStringLen(ctx, *e, static_cast<size_t>(eq - *e)));
-    }
-#endif
-    return arr;
-}
-
-// process.env.KEY delete — unset an environment variable
-static JSValue js_env_delete(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-{
-    if (argc < 1) return JS_UNDEFINED;
-    const char* key = JS_ToCString(ctx, argv[0]);
-    if (!key) return JS_EXCEPTION;
-
-#ifdef _WIN32
-    SetEnvironmentVariableA(key, nullptr);
-    _putenv_s(key, "");
-#else
-    unsetenv(key);
-#endif
-
-    JS_FreeCString(ctx, key);
-    return JS_UNDEFINED;
-}
-
-// process.cwd()
-static JSValue js_process_cwd(JSContext* ctx, JSValueConst, int, JSValueConst*)
-{
+Value js_process_cwd(Value, std::span<const Value>) {
 #ifdef _WIN32
     char buf[MAX_PATH];
     DWORD len = GetCurrentDirectoryA(MAX_PATH, buf);
-    if (len == 0) return JS_ThrowInternalError(ctx, "process.cwd: failed");
-    return JS_NewStringLen(ctx, buf, len);
+    if (len == 0) return ev::throwError("process.cwd: failed");
+    return ev::fromUtf8(buf);
 #else
     char buf[4096];
-    if (!getcwd(buf, sizeof(buf))) return JS_ThrowInternalError(ctx, "process.cwd: failed");
-    return JS_NewString(ctx, buf);
+    if (!getcwd(buf, sizeof(buf))) return ev::throwError("process.cwd: failed");
+    return ev::fromUtf8(buf);
 #endif
 }
 
-// process.exit(code?)
-static JSValue js_process_exit(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-{
+Value js_process_exit(Value, std::span<const Value> a) {
     int code = 0;
-    if (argc > 0) JS_ToInt32(ctx, &code, argv[0]);
+    if (!a.empty()) code = i32At(a, 0);
     exit(code);
-    return JS_UNDEFINED; // unreachable
+    return ev::undefined();
 }
 
-void installProcess(JSContext* ctx)
-{
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue process = JS_NewObject(ctx);
-
-    // Native helpers for the env Proxy
-    JS_SetPropertyStr(ctx, global, "__brokit_env_get",
-                      JS_NewCFunction(ctx, js_env_get, "__brokit_env_get", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_env_set",
-                      JS_NewCFunction(ctx, js_env_set, "__brokit_env_set", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_env_delete",
-                      JS_NewCFunction(ctx, js_env_delete, "__brokit_env_delete", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_env_keys",
-                      JS_NewCFunction(ctx, js_env_keys, "__brokit_env_keys", 0));
-
-    // process.cwd, process.exit
-    JS_SetPropertyStr(ctx, process, "cwd",
-                      JS_NewCFunction(ctx, js_process_cwd, "cwd", 0));
-    JS_SetPropertyStr(ctx, process, "exit",
-                      JS_NewCFunction(ctx, js_process_exit, "exit", 1));
-
-    // process.platform
-#ifdef _WIN32
-    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "win32"));
-#elif defined(__linux__)
-    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "linux"));
-#elif defined(__APPLE__)
-    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "darwin"));
-#else
-    JS_SetPropertyStr(ctx, process, "platform", JS_NewString(ctx, "unknown"));
-#endif
-
-    // process.arch
-#if defined(_M_X64) || defined(__x86_64__)
-    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "x64"));
-#elif defined(_M_ARM64) || defined(__aarch64__)
-    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "arm64"));
-#elif defined(_M_IX86) || defined(__i386__)
-    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "ia32"));
-#elif defined(_M_ARM) || defined(__arm__)
-    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "arm"));
-#else
-    JS_SetPropertyStr(ctx, process, "arch", JS_NewString(ctx, "x64"));
-#endif
-
-    // process.argv — argv[0] is the "node" executable stand-in, argv[1] the "script"
-    JSValue argv = JS_NewArray(ctx);
-    JS_SetPropertyUint32(ctx, argv, 0, JS_NewString(ctx, "bro"));
-    JS_SetPropertyUint32(ctx, argv, 1, JS_NewString(ctx, ""));
-    JS_SetPropertyStr(ctx, process, "argv", argv);
-
-    // process.version / process.versions
-    JS_SetPropertyStr(ctx, process, "version", JS_NewString(ctx, "v20.0.0"));
-    JSValue versions = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, versions, "node", JS_NewString(ctx, "20.0.0"));
-    JS_SetPropertyStr(ctx, versions, "v8", JS_NewString(ctx, "0.0.0"));
-    JS_SetPropertyStr(ctx, versions, "brokit", JS_NewString(ctx, "1.0.0"));
-    JS_SetPropertyStr(ctx, process, "versions", versions);
-
-    // process.pid
-    JS_SetPropertyStr(ctx, process, "pid", JS_NewInt32(ctx, 1));
-
-    // process.execPath
-    JS_SetPropertyStr(ctx, process, "execPath", JS_NewString(ctx, "bro"));
-
-    JS_SetPropertyStr(ctx, global, "process", process);
-    JS_FreeValue(ctx, global);
-
-    // Install process.env as a Proxy for dynamic property access
-    const char* envProxy = R"JS(
-(function() {
-    var handler = {
-        get: function(target, prop) {
-            if (typeof prop !== 'string') return undefined;
-            return globalThis.__brokit_env_get(prop);
-        },
-        set: function(target, prop, value) {
-            globalThis.__brokit_env_set(prop, String(value));
-            return true;
-        },
-        deleteProperty: function(target, prop) {
-            globalThis.__brokit_env_delete(prop);
-            return true;
-        },
-        has: function(target, prop) {
-            return globalThis.__brokit_env_get(prop) !== undefined;
-        },
-        ownKeys: function(target) {
-            return globalThis.__brokit_env_keys();
-        },
-        getOwnPropertyDescriptor: function(target, prop) {
-            var v = globalThis.__brokit_env_get(prop);
-            if (v === undefined) return undefined;
-            return { value: v, writable: true, enumerable: true, configurable: true };
-        }
+Value makeEnvProxy() {
+    HostProxyTraps traps;
+    traps.get = [](const std::string& key, Value& out) -> bool {
+        const char* val = getenv(key.c_str());
+        if (!val) return false;
+        out = ev::fromUtf8(val);
+        return true;
     };
-    process.env = new Proxy({}, handler);
-})();
-)JS";
+    traps.set = [](const std::string& key, Value v) {
+        std::string val = ev::toUtf8(v);
+#ifdef _WIN32
+        SetEnvironmentVariableA(key.c_str(), val.c_str());
+        _putenv_s(key.c_str(), val.c_str());
+#else
+        setenv(key.c_str(), val.c_str(), 1);
+#endif
+    };
+    traps.remove = [](const std::string& key) {
+#ifdef _WIN32
+        SetEnvironmentVariableA(key.c_str(), nullptr);
+        _putenv_s(key.c_str(), "");
+#else
+        unsetenv(key.c_str());
+#endif
+    };
+    traps.has = [](const std::string& key) -> bool {
+        return getenv(key.c_str()) != nullptr;
+    };
+    traps.ownKeys = []() -> std::vector<std::string> {
+        std::vector<std::string> keys;
+#ifdef _WIN32
+        char* block = GetEnvironmentStringsA();
+        if (block) {
+            for (char* p = block; *p; p += strlen(p) + 1) {
+                if (p[0] == '=') continue;
+                const char* eq = strchr(p, '=');
+                if (!eq) continue;
+                keys.emplace_back(p, static_cast<size_t>(eq - p));
+            }
+            FreeEnvironmentStringsA(block);
+        }
+#else
+        for (char** e = environ; e && *e; e++) {
+            const char* eq = strchr(*e, '=');
+            if (!eq) continue;
+            keys.emplace_back(*e, static_cast<size_t>(eq - *e));
+        }
+#endif
+        return keys;
+    };
+    return makeHostProxy(std::move(traps));
+}
 
-    JSValue r = JS_Eval(ctx, envProxy, strlen(envProxy), "<process>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+} // namespace
 
-    // JS-layer augmentation: process.nextTick, process.hrtime, process.stdout/stderr, etc.
-    JSValue r2 = JS_Eval(ctx, js_process, strlen(js_process), "<process>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r2)) {
-        Runtime::checkException(ctx, r2);
+void installProcess() {
+    ObjectBuilder process;
+
+    process.set("env", makeEnvProxy());
+    process.def("cwd", 0, js_process_cwd);
+    process.def("exit", 1, js_process_exit);
+
+#ifdef _WIN32
+    process.set("platform", ev::fromUtf8("win32"));
+#elif defined(__linux__)
+    process.set("platform", ev::fromUtf8("linux"));
+#elif defined(__APPLE__)
+    process.set("platform", ev::fromUtf8("darwin"));
+#else
+    process.set("platform", ev::fromUtf8("unknown"));
+#endif
+
+#if defined(_M_X64) || defined(__x86_64__)
+    process.set("arch", ev::fromUtf8("x64"));
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    process.set("arch", ev::fromUtf8("arm64"));
+#elif defined(_M_IX86) || defined(__i386__)
+    process.set("arch", ev::fromUtf8("ia32"));
+#elif defined(_M_ARM) || defined(__arm__)
+    process.set("arch", ev::fromUtf8("arm"));
+#else
+    process.set("arch", ev::fromUtf8("x64"));
+#endif
+
+    process.set("argv", hostArrayOf(2, [](size_t i) {
+        return i == 0 ? ev::fromUtf8("bro") : ev::fromUtf8("");
+    }));
+
+    process.set("version", ev::fromUtf8("v20.0.0"));
+    {
+        ObjectBuilder versions;
+        versions.set("node", ev::fromUtf8("20.0.0"));
+        versions.set("v8", ev::fromUtf8("0.0.0"));
+        versions.set("brokit", ev::fromUtf8("1.0.0"));
+        process.set("versions", versions.get());
     }
-    JS_FreeValue(ctx, r2);
+
+    process.set("pid", ev::fromDouble(1.0));
+    process.set("execPath", ev::fromUtf8("bro"));
+
+    process.def("nextTick", 1, [](Value, std::span<const Value> a) {
+        if (a.empty() || !ev::isFunction(a[0])) return ev::undefined();
+        Value fn = a[0];
+        Value p = ev::createPromise();
+        ev::resolvePromise(p, ev::undefined());
+        Value thenFn = ev::getProperty(p, "then");
+        if (ev::isFunction(thenFn)) {
+            ev::call(thenFn, p, std::span<const Value>(&fn, 1));
+        }
+        return ev::undefined();
+    });
+
+    process.def("hrtime", 0, [](Value, std::span<const Value> a) {
+        static auto start = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        auto totalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+        if (a.size() > 0 && ev::isObject(a[0])) {
+            double prevSec = ev::toDouble(ev::getElement(a[0], 0));
+            double prevNs = ev::toDouble(ev::getElement(a[0], 1));
+            int64_t prevTotal = static_cast<int64_t>(prevSec) * 1000000000LL + static_cast<int64_t>(prevNs);
+            int64_t diff = totalNs - prevTotal;
+            return hostArrayOf(2, [diff](size_t i) {
+                if (i == 0) return ev::fromDouble(static_cast<double>(diff / 1000000000LL));
+                return ev::fromDouble(static_cast<double>(diff % 1000000000LL));
+            });
+        }
+        return hostArrayOf(2, [totalNs](size_t i) {
+            if (i == 0) return ev::fromDouble(static_cast<double>(totalNs / 1000000000LL));
+            return ev::fromDouble(static_cast<double>(totalNs % 1000000000LL));
+        });
+    });
+
+    {
+        ObjectBuilder stdoutObj;
+        stdoutObj.def("write", 1, [](Value, std::span<const Value> a) {
+            if (!a.empty()) {
+                std::string s = ev::toUtf8(a[0]);
+                std::fwrite(s.data(), 1, s.size(), stdout);
+                std::fflush(stdout);
+            }
+            return ev::fromBool(true);
+        });
+        process.set("stdout", stdoutObj.get());
+    }
+
+    {
+        ObjectBuilder stderrObj;
+        stderrObj.def("write", 1, [](Value, std::span<const Value> a) {
+            if (!a.empty()) {
+                std::string s = ev::toUtf8(a[0]);
+                std::fwrite(s.data(), 1, s.size(), stderr);
+                std::fflush(stderr);
+            }
+            return ev::fromBool(true);
+        });
+        process.set("stderr", stderrObj.get());
+    }
+
+    process.def("on", 2, [](Value thisValue, std::span<const Value>) { return thisValue; });
+    process.def("addListener", 2, [](Value thisValue, std::span<const Value>) { return thisValue; });
+    process.def("removeListener", 2, [](Value thisValue, std::span<const Value>) { return thisValue; });
+    process.def("emit", 1, [](Value, std::span<const Value>) { return ev::fromBool(true); });
+
+    ev::registerGlobal("process", process.get());
+    auto g = ev::globalValue("globalThis");
+    if (g.found && ev::isObject(g.value)) {
+        ev::setProperty(g.value, "process", process.get());
+    }
+    bronze::embed::runEntry(bronze_process_main);
 }
 
 } // namespace brokit::api

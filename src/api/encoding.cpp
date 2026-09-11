@@ -1,98 +1,56 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "encoding.js.h"
+#include "api/arg_reader.h"
+#include "embed/embed.h"
 
-#include <cstring>
 #include <string>
-#include <vector>
+#include <string_view>
+
+extern "C" void bronze_encoding_main();
 
 namespace brokit::api {
 
-// Native C++ TextEncoder.encode() for correctness + performance.
-static JSValue js_textencoder_encode(JSContext* ctx, JSValueConst,
-                                      int argc, JSValueConst* argv)
-{
-    const char* str = "";
-    if (argc > 0) {
-        str = JS_ToCString(ctx, argv[0]);
-        if (!str) return JS_EXCEPTION;
+namespace {
+
+Value encoderEncode(Value, std::span<const Value> a) {
+    std::string s = hasArg(a, 0) ? strAt(a, 0) : "";
+    Value arr = ev::createTypedArray(ev::elements::Uint8, static_cast<uint32_t>(s.size()));
+    if (!s.empty()) {
+        ev::fillTypedArray(arr, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
     }
-
-    size_t len = strlen(str);
-    // UTF-8 string is already UTF-8 in QuickJS, so we can just copy the bytes
-    JSValue buf = JS_NewArrayBufferCopy(ctx, reinterpret_cast<const uint8_t*>(str), len);
-    if (argc > 0) JS_FreeCString(ctx, str);
-
-    if (JS_IsException(buf)) return buf;
-
-    // Wrap in Uint8Array
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue uint8Ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
-    JSValue args[] = { buf };
-    JSValue result = JS_CallConstructor(ctx, uint8Ctor, 1, args);
-    JS_FreeValue(ctx, buf);
-    JS_FreeValue(ctx, uint8Ctor);
-    JS_FreeValue(ctx, global);
-    return result;
+    return arr;
 }
 
-// Native C++ TextDecoder.decode() for correctness.
-static JSValue js_textdecoder_decode(JSContext* ctx, JSValueConst,
-                                      int argc, JSValueConst* argv)
-{
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
-        return JS_NewString(ctx, "");
+Value decoderDecode(Value, std::span<const Value> a) {
+    if (a.empty() || ev::isUndefined(a[0]) || ev::isNull(a[0])) {
+        return ev::fromUtf8("");
     }
-
-    size_t byte_len = 0;
-    size_t byte_offset = 0;
-    size_t bytes_per_element = 0;
-
-    // Try TypedArray first
-    JSValue buf = JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_len, &bytes_per_element);
-    uint8_t* ptr = nullptr;
+    const uint8_t* data = nullptr;
     size_t len = 0;
-
-    if (!JS_IsException(buf)) {
-        size_t abLen = 0;
-        ptr = JS_GetArrayBuffer(ctx, &abLen, buf);
-        if (ptr) {
-            ptr += byte_offset;
-            len = byte_len;
-        }
-        JS_FreeValue(ctx, buf);
-    } else {
-        // Clear exception and try ArrayBuffer directly
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        size_t abLen = 0;
-        ptr = JS_GetArrayBuffer(ctx, &abLen, argv[0]);
-        len = abLen;
+    if (!bufferBytes(a[0], &data, &len)) {
+        return ev::throwTypeError("TextDecoder.decode: expected ArrayBuffer or TypedArray");
     }
-
-    if (!ptr) {
-        return JS_ThrowTypeError(ctx, "TextDecoder.decode: expected ArrayBuffer or TypedArray");
+    if (len == 0 || !data) {
+        return ev::fromUtf8("");
     }
-
-    // QuickJS strings are UTF-8 internally, and we assume UTF-8 input
-    return JS_NewStringLen(ctx, reinterpret_cast<const char*>(ptr), len);
+    return ev::fromUtf8(std::string_view(reinterpret_cast<const char*>(data), len));
 }
 
-void installEncoding(JSContext* ctx)
-{
-    JSValue global = JS_GetGlobalObject(ctx);
+} // namespace
 
-    JS_SetPropertyStr(ctx, global, "__brokit_textencoder_encode",
-                      JS_NewCFunction(ctx, js_textencoder_encode, "__brokit_textencoder_encode", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_textdecoder_decode",
-                      JS_NewCFunction(ctx, js_textdecoder_decode, "__brokit_textdecoder_decode", 1));
+void installEncoding() {
+    Value encFn = ev::makeFunction(encoderEncode, 1, "__brokit_textencoder_encode");
+    Value decFn = ev::makeFunction(decoderDecode, 1, "__brokit_textdecoder_decode");
 
-    JS_FreeValue(ctx, global);
+    ev::registerGlobal("__brokit_textencoder_encode", encFn);
+    ev::registerGlobal("__brokit_textdecoder_decode", decFn);
 
-    JSValue r = JS_Eval(ctx, js_encoding, strlen(js_encoding), "<encoding>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
+    auto g = ev::globalValue("globalThis");
+    if (g.found && ev::isObject(g.value)) {
+        ev::setProperty(g.value, "__brokit_textencoder_encode", encFn);
+        ev::setProperty(g.value, "__brokit_textdecoder_decode", decFn);
     }
-    JS_FreeValue(ctx, r);
+
+    bronze::embed::runEntry(bronze_encoding_main);
 }
 
 } // namespace brokit::api

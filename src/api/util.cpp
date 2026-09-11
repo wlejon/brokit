@@ -1,18 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "util.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_util_main();
 
 namespace brokit::api {
 
-void installUtil(JSContext* ctx)
+void installUtil()
 {
-    JSValue r = JS_Eval(ctx, js_util, strlen(js_util), "<util>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_util_main);
 }
 
 } // namespace brokit::api

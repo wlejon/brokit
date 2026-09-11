@@ -16,10 +16,6 @@
 #include <unistd.h>
 #endif
 
-extern "C" {
-#include "quickjs.h"
-}
-
 namespace fs = std::filesystem;
 
 struct TestResult {
@@ -29,27 +25,14 @@ struct TestResult {
     std::vector<std::string> failures;
 };
 
-static std::string readFile(const std::string& path) {
-    std::ifstream f(path, std::ios::in | std::ios::binary);
-    if (!f) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
 static TestResult runTestFile(const std::string& path) {
     TestResult result;
     result.name = fs::path(path).filename().string();
 
     brokit::Runtime rt;
-    if (!rt.context()) {
-        result.failed = 1;
-        result.failures.push_back("Failed to create runtime");
-        return result;
-    }
 
     // Install all APIs
-    brokit::api::installAll(rt.context());
+    brokit::api::installAll();
 
     // Install test helpers: assert, test registration
     const char* testHarness = R"JS(
@@ -94,139 +77,115 @@ static TestResult runTestFile(const std::string& path) {
 })();
 )JS";
 
-    rt.eval(testHarness, "<test-harness>");
-
-    // Run the test file
-    std::string code = readFile(path);
-    if (code.empty()) {
+    if (!rt.eval(testHarness, "<test-harness>")) {
         result.failed = 1;
-        result.failures.push_back("Could not read test file: " + path);
+        result.failures.push_back("Failed to evaluate test harness");
         return result;
     }
 
-    rt.eval(code, path);
+    // Run the test file
+    if (!rt.loadFile(path)) {
+        result.failed = 1;
+        result.failures.push_back("Could not load/execute test file: " + path);
+        return result;
+    }
+
     rt.executePendingJobs();
 
     // Pump async subsystems: tick curl_multi (fetch + websocket) until idle.
-    JSContext* ctx = rt.context();
-    {
-        JSValue global2 = JS_GetGlobalObject(ctx);
-        JSValue fetchHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_fetch_has_pending");
-        JSValue fetchTick = JS_GetPropertyStr(ctx, global2, "__brokit_fetch_tick");
-        JSValue wsHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_ws_has_pending");
-        JSValue wsTick = JS_GetPropertyStr(ctx, global2, "__brokit_ws_tick");
-        JSValue fwHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_has_pending");
-        JSValue fwTick = JS_GetPropertyStr(ctx, global2, "__brokit_fs_watch_tick");
-        JSValue netHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_net_has_pending");
-        JSValue netTick = JS_GetPropertyStr(ctx, global2, "__brokit_net_tick");
-        // child_process has no tick of its own — ChildProcess drives itself off
-        // setTimeout — but it must keep the pump (and so the timer queue) alive
-        // while a spawned child is still running.
-        JSValue cpHasPending = JS_GetPropertyStr(ctx, global2, "__brokit_cp_has_pending");
-        JSValue timersTick = JS_GetPropertyStr(ctx, global2, "__brokit_tick_timers");
+    namespace ev = bronze::embed;
 
-        bool haveFetch = JS_IsFunction(ctx, fetchHasPending) && JS_IsFunction(ctx, fetchTick);
-        bool haveWs = JS_IsFunction(ctx, wsHasPending) && JS_IsFunction(ctx, wsTick);
-        bool haveFw = JS_IsFunction(ctx, fwHasPending) && JS_IsFunction(ctx, fwTick);
-        bool haveNet = JS_IsFunction(ctx, netHasPending) && JS_IsFunction(ctx, netTick);
-        bool haveCp = JS_IsFunction(ctx, cpHasPending);
-        bool haveTimers = JS_IsFunction(ctx, timersTick);
+    auto fetchHasPending = ev::globalValue("__brokit_fetch_has_pending");
+    auto fetchTick = ev::globalValue("__brokit_fetch_tick");
+    auto wsHasPending = ev::globalValue("__brokit_ws_has_pending");
+    auto wsTick = ev::globalValue("__brokit_ws_tick");
+    auto fwHasPending = ev::globalValue("__brokit_fs_watch_has_pending");
+    auto fwTick = ev::globalValue("__brokit_fs_watch_tick");
+    auto netHasPending = ev::globalValue("__brokit_net_has_pending");
+    auto netTick = ev::globalValue("__brokit_net_tick");
+    auto cpHasPending = ev::globalValue("__brokit_cp_has_pending");
+    auto timersTick = ev::globalValue("__brokit_tick_timers");
 
-        if (haveFetch || haveWs || haveFw || haveNet || haveCp) {
-            for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
-                bool anyPending = false;
+    bool haveFetch = fetchHasPending.found && ev::isFunction(fetchHasPending.value) &&
+                     fetchTick.found && ev::isFunction(fetchTick.value);
+    bool haveWs = wsHasPending.found && ev::isFunction(wsHasPending.value) &&
+                  wsTick.found && ev::isFunction(wsTick.value);
+    bool haveFw = fwHasPending.found && ev::isFunction(fwHasPending.value) &&
+                  fwTick.found && ev::isFunction(fwTick.value);
+    bool haveNet = netHasPending.found && ev::isFunction(netHasPending.value) &&
+                   netTick.found && ev::isFunction(netTick.value);
+    bool haveCp = cpHasPending.found && ev::isFunction(cpHasPending.value);
+    bool haveTimers = timersTick.found && ev::isFunction(timersTick.value);
 
-                if (haveFetch) {
-                    JSValue p = JS_Call(ctx, fetchHasPending, global2, 0, nullptr);
-                    if (JS_ToBool(ctx, p)) anyPending = true;
-                    JS_FreeValue(ctx, p);
+    ev::Persistent pFetchHasPending{haveFetch ? fetchHasPending.value : ev::undefined()};
+    ev::Persistent pFetchTick{haveFetch ? fetchTick.value : ev::undefined()};
+    ev::Persistent pWsHasPending{haveWs ? wsHasPending.value : ev::undefined()};
+    ev::Persistent pWsTick{haveWs ? wsTick.value : ev::undefined()};
+    ev::Persistent pFwHasPending{haveFw ? fwHasPending.value : ev::undefined()};
+    ev::Persistent pFwTick{haveFw ? fwTick.value : ev::undefined()};
+    ev::Persistent pNetHasPending{haveNet ? netHasPending.value : ev::undefined()};
+    ev::Persistent pNetTick{haveNet ? netTick.value : ev::undefined()};
+    ev::Persistent pCpHasPending{haveCp ? cpHasPending.value : ev::undefined()};
+    ev::Persistent pTimersTick{haveTimers ? timersTick.value : ev::undefined()};
 
-                    JSValue tr = JS_Call(ctx, fetchTick, global2, 0, nullptr);
-                    JS_FreeValue(ctx, tr);
-                }
+    if (haveFetch || haveWs || haveFw || haveNet || haveCp) {
+        for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
+            bool anyPending = false;
 
-                if (haveWs) {
-                    JSValue p = JS_Call(ctx, wsHasPending, global2, 0, nullptr);
-                    if (JS_ToBool(ctx, p)) anyPending = true;
-                    JS_FreeValue(ctx, p);
+            if (haveFetch) {
+                auto p = ev::call(pFetchHasPending.get(), ev::undefined(), {});
+                if (!p.thrown && ev::toBool(p.value)) anyPending = true;
+                ev::call(pFetchTick.get(), ev::undefined(), {});
+            }
 
-                    JSValue tr = JS_Call(ctx, wsTick, global2, 0, nullptr);
-                    JS_FreeValue(ctx, tr);
-                }
+            if (haveWs) {
+                auto p = ev::call(pWsHasPending.get(), ev::undefined(), {});
+                if (!p.thrown && ev::toBool(p.value)) anyPending = true;
+                ev::call(pWsTick.get(), ev::undefined(), {});
+            }
 
-                if (haveFw) {
-                    JSValue p = JS_Call(ctx, fwHasPending, global2, 0, nullptr);
-                    if (JS_ToBool(ctx, p)) anyPending = true;
-                    JS_FreeValue(ctx, p);
+            if (haveFw) {
+                auto p = ev::call(pFwHasPending.get(), ev::undefined(), {});
+                if (!p.thrown && ev::toBool(p.value)) anyPending = true;
+                ev::call(pFwTick.get(), ev::undefined(), {});
+            }
 
-                    JSValue tr = JS_Call(ctx, fwTick, global2, 0, nullptr);
-                    JS_FreeValue(ctx, tr);
-                }
+            if (haveNet) {
+                auto p = ev::call(pNetHasPending.get(), ev::undefined(), {});
+                if (!p.thrown && ev::toBool(p.value)) anyPending = true;
+                ev::call(pNetTick.get(), ev::undefined(), {});
+            }
 
-                if (haveNet) {
-                    JSValue p = JS_Call(ctx, netHasPending, global2, 0, nullptr);
-                    if (JS_ToBool(ctx, p)) anyPending = true;
-                    JS_FreeValue(ctx, p);
+            if (haveCp) {
+                auto p = ev::call(pCpHasPending.get(), ev::undefined(), {});
+                if (!p.thrown && ev::toBool(p.value)) anyPending = true;
+            }
 
-                    JSValue tr = JS_Call(ctx, netTick, global2, 0, nullptr);
-                    JS_FreeValue(ctx, tr);
-                }
+            if (haveTimers) {
+                double nowMs = static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+                ev::Value nowVal = ev::fromDouble(nowMs);
+                ev::call(pTimersTick.get(), ev::undefined(), std::span<const ev::Value>(&nowVal, 1));
+            }
 
-                if (haveCp) {
-                    JSValue p = JS_Call(ctx, cpHasPending, global2, 0, nullptr);
-                    if (JS_ToBool(ctx, p)) anyPending = true;
-                    JS_FreeValue(ctx, p);
-                }
-
-                // Fire due setTimeout/setInterval callbacks so async tests can
-                // schedule work (e.g. aborting an in-flight fetch).
-                if (haveTimers) {
-                    JSValue nowV = JS_NewFloat64(
-                        ctx, static_cast<double>(
-                                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count()));
-                    JSValue tr = JS_Call(ctx, timersTick, global2, 1, &nowV);
-                    JS_FreeValue(ctx, tr);
-                    JS_FreeValue(ctx, nowV);
-                }
-
-                rt.executePendingJobs();
-                if (!anyPending) break;
+            rt.executePendingJobs();
+            if (!anyPending) break;
 
 #ifdef _WIN32
-                Sleep(10);
+            Sleep(10);
 #else
-                usleep(10000);
+            usleep(10000);
 #endif
-            }
         }
-
-        JS_FreeValue(ctx, timersTick);
-        JS_FreeValue(ctx, cpHasPending);
-        JS_FreeValue(ctx, netTick);
-        JS_FreeValue(ctx, netHasPending);
-        JS_FreeValue(ctx, fwTick);
-        JS_FreeValue(ctx, fwHasPending);
-        JS_FreeValue(ctx, wsTick);
-        JS_FreeValue(ctx, wsHasPending);
-        JS_FreeValue(ctx, fetchTick);
-        JS_FreeValue(ctx, fetchHasPending);
-        JS_FreeValue(ctx, global2);
     }
 
     // Collect results
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue fn = JS_GetPropertyStr(ctx, global, "__test_results");
-    JSValue res = JS_Call(ctx, fn, global, 0, nullptr);
-
-    if (!JS_IsException(res)) {
-        const char* json = JS_ToCString(ctx, res);
-        if (json) {
-            // Simple JSON parsing for { passed, failed, failures }
-            std::string s(json);
-            JS_FreeCString(ctx, json);
-
+    auto resultsFn = ev::globalValue("__test_results");
+    if (resultsFn.found && ev::isFunction(resultsFn.value)) {
+        auto res = ev::call(resultsFn.value, ev::undefined(), {});
+        if (!res.thrown && ev::isString(res.value)) {
+            std::string s = ev::toUtf8(res.value);
             // Extract passed count
             auto passedPos = s.find("\"passed\":");
             if (passedPos != std::string::npos) {
@@ -265,10 +224,6 @@ static TestResult runTestFile(const std::string& path) {
             }
         }
     }
-
-    JS_FreeValue(ctx, res);
-    JS_FreeValue(ctx, fn);
-    JS_FreeValue(ctx, global);
 
     return result;
 }

@@ -1,19 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "fetch_classes.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_fetch_classes_main();
 
 namespace brokit::api {
 
-void installFetchClasses(JSContext* ctx)
+void installFetchClasses()
 {
-    JSValue r = JS_Eval(ctx, js_fetch_classes, strlen(js_fetch_classes),
-                        "<fetch-classes>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_fetch_classes_main);
 }
 
 } // namespace brokit::api

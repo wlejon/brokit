@@ -201,7 +201,7 @@
                     break;
                 case 'id':
                     // Per spec, ignore id fields containing null
-                    if (value.indexOf('\0') === -1) {
+                    if (value.indexOf(String.fromCharCode(0)) === -1) {
                         this._lastEventId = value;
                     }
                     break;

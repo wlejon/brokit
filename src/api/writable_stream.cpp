@@ -1,19 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "writable_stream.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_writable_stream_main();
 
 namespace brokit::api {
 
-void installWritableStream(JSContext* ctx)
+void installWritableStream()
 {
-    JSValue r = JS_Eval(ctx, js_writable_stream, strlen(js_writable_stream),
-                        "<writable_stream>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_writable_stream_main);
 }
 
 } // namespace brokit::api

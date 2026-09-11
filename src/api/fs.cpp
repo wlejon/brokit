@@ -1,6 +1,6 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "fs.js.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
 
 #include <cstring>
 #include <map>
@@ -11,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <chrono>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -23,171 +24,135 @@
 
 namespace fs = std::filesystem;
 
+extern "C" void bronze_fs_main();
+
 namespace brokit::api {
 
-// Key for the base-paths array stored on globalThis
-static const char* kFsBasePathsKey = "__brokit_fs_base_paths";
+static thread_local std::map<std::string, std::string> g_pathMounts;
 
-// Key for the prefix-mounts object stored on globalThis. Shared by fs and
-// fetch — both consult this map to rewrite paths beginning with /<prefix>/.
-static const char* kPathMountsKey = "__brokit_path_mounts";
-
-/// Look up a path against globalThis.__brokit_path_mounts. If `path` begins
-/// with `<prefix>/...` (or equals `<prefix>`) for any registered mount,
-/// return the rewritten absolute disk path. Otherwise return empty string.
-/// Exposed (extern "C"-internally) so fetch.cpp can call it too.
-std::string resolveBrokitPrefixMount(JSContext* ctx, const std::string& path)
+std::string resolveBrokitPrefixMount(const std::string& path)
 {
     if (path.empty() || path[0] != '/') return {};
 
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue obj = JS_GetPropertyStr(ctx, global, kPathMountsKey);
-    if (!JS_IsObject(obj)) {
-        JS_FreeValue(ctx, obj);
-        JS_FreeValue(ctx, global);
-        return {};
-    }
-
-    JSPropertyEnum* tab = nullptr;
-    uint32_t len = 0;
     std::string best, bestRewrite;
-    if (JS_GetOwnPropertyNames(ctx, &tab, &len, obj,
-                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0)
-    {
-        for (uint32_t i = 0; i < len; i++) {
-            const char* keyC = JS_AtomToCString(ctx, tab[i].atom);
-            if (!keyC) continue;
-            std::string prefix(keyC);
-            JS_FreeCString(ctx, keyC);
 
-            if (path.size() >= prefix.size() &&
-                path.compare(0, prefix.size(), prefix) == 0 &&
-                (path.size() == prefix.size() || path[prefix.size()] == '/'))
-            {
-                if (prefix.size() > best.size()) {
-                    JSValue v = JS_GetProperty(ctx, obj, tab[i].atom);
-                    const char* targetC = JS_ToCString(ctx, v);
-                    JS_FreeValue(ctx, v);
-                    if (targetC) {
-                        best = prefix;
-                        bestRewrite = std::string(targetC) + path.substr(prefix.size());
-                        JS_FreeCString(ctx, targetC);
+    auto g = ev::globalValue("globalThis");
+    if (g.found && ev::isObject(g.value)) {
+        auto mountsVal = ev::getProperty(g.value, "__brokit_path_mounts");
+        if (ev::isObject(mountsVal)) {
+            auto objCtor = ev::globalValue("Object");
+            if (objCtor.found) {
+                auto keysFn = ev::getProperty(objCtor.value, "keys");
+                if (ev::isFunction(keysFn)) {
+                    auto res = ev::call(keysFn, objCtor.value, std::span(&mountsVal, 1));
+                    if (!res.thrown && ev::isObject(res.value)) {
+                        auto lenVal = ev::getProperty(res.value, "length");
+                        uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+                        for (uint32_t i = 0; i < len; ++i) {
+                            auto k = ev::getElement(res.value, i);
+                            std::string prefix = ev::toUtf8(k);
+                            auto targetVal = ev::getProperty(mountsVal, prefix);
+                            if (ev::isString(targetVal)) {
+                                std::string target = ev::toUtf8(targetVal);
+                                if (path.size() >= prefix.size() &&
+                                    path.compare(0, prefix.size(), prefix) == 0 &&
+                                    (path.size() == prefix.size() || path[prefix.size()] == '/'))
+                                {
+                                    if (prefix.size() > best.size()) {
+                                        best = prefix;
+                                        bestRewrite = target + path.substr(prefix.size());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        for (uint32_t i = 0; i < len; i++) JS_FreeAtom(ctx, tab[i].atom);
-        js_free(ctx, tab);
     }
 
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, global);
-    return bestRewrite;
-}
-
-// Resolve a path against engine prefix mounts and registered base paths.
-// Read mode (forCreate=false): returns the first existing candidate, or the
-// raw path when nothing exists (which then resolves against process CWD —
-// fine, the call will fail naturally with ENOENT).
-// Create mode (forCreate=true): used by writeFileSync / mkdirSync / etc.
-// where the target path may not exist yet. If no existing candidate is
-// found, fall back to the most-recently-added basePath instead of CWD so
-// app-relative writes land in the app's directory, not wherever the binary
-// was launched from.
-static std::string resolveFsPath(JSContext* ctx, const char* path,
-                                 bool forCreate = false)
-{
-    // Engine-supplied prefix mounts (e.g. /lib, /system) win over both
-    // basePath resolution and filesystem-absolute interpretation.
-    std::string mounted = resolveBrokitPrefixMount(ctx, std::string(path));
-    if (!mounted.empty()) return mounted;
-
-    // Absolute paths are returned as-is
-    fs::path p(path);
-    if (p.is_absolute()) return path;
-
-    // Check base paths (last added = checked first, like fetch)
-    std::string topBase;
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue arr = JS_GetPropertyStr(ctx, global, kFsBasePathsKey);
-    if (JS_IsArray(arr)) {
-        JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
-        int32_t len = 0;
-        JS_ToInt32(ctx, &len, lenVal);
-        JS_FreeValue(ctx, lenVal);
-
-        for (int32_t i = len - 1; i >= 0; --i) {
-            JSValue elem = JS_GetPropertyUint32(ctx, arr, i);
-            const char* base = JS_ToCString(ctx, elem);
-            JS_FreeValue(ctx, elem);
-            if (!base) continue;
-
-            fs::path candidate = fs::path(base) / path;
-            if (topBase.empty()) topBase = base;
-            JS_FreeCString(ctx, base);
-
-            std::error_code ec;
-            if (fs::exists(candidate, ec)) {
-                JS_FreeValue(ctx, arr);
-                JS_FreeValue(ctx, global);
-                return candidate.string();
+    for (const auto& [prefix, target] : g_pathMounts) {
+        if (path.size() >= prefix.size() &&
+            path.compare(0, prefix.size(), prefix) == 0 &&
+            (path.size() == prefix.size() || path[prefix.size()] == '/'))
+        {
+            if (prefix.size() > best.size()) {
+                best = prefix;
+                bestRewrite = target + path.substr(prefix.size());
             }
         }
     }
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, global);
+    return bestRewrite;
+}
 
-    // Create mode: nothing existed; anchor the new path under the most-
-    // recently-registered basePath (the app dir) instead of process CWD.
+namespace {
+
+thread_local std::vector<std::string> g_fsBasePaths;
+
+std::string resolveFsPath(const char* path, bool forCreate = false)
+{
+    std::string mounted = resolveBrokitPrefixMount(std::string(path));
+    if (!mounted.empty()) return mounted;
+
+    fs::path p(path);
+    if (p.is_absolute()) return path;
+
+    std::string topBase;
+
+    auto g = ev::globalValue("globalThis");
+    if (g.found && ev::isObject(g.value)) {
+        auto arr = ev::getProperty(g.value, "__brokit_fs_base_paths");
+        if (ev::isObject(arr)) {
+            auto lenVal = ev::getProperty(arr, "length");
+            int32_t len = static_cast<int32_t>(ev::toDouble(lenVal));
+            for (int32_t i = len - 1; i >= 0; --i) {
+                auto elem = ev::getElement(arr, static_cast<uint32_t>(i));
+                if (ev::isString(elem)) {
+                    std::string base = ev::toUtf8(elem);
+                    fs::path candidate = fs::path(base) / path;
+                    if (topBase.empty()) topBase = base;
+
+                    std::error_code ec;
+                    if (fs::exists(candidate, ec)) {
+                        return candidate.string();
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = static_cast<int>(g_fsBasePaths.size()) - 1; i >= 0; --i) {
+        const auto& base = g_fsBasePaths[i];
+        fs::path candidate = fs::path(base) / path;
+        if (topBase.empty()) topBase = base;
+
+        std::error_code ec;
+        if (fs::exists(candidate, ec)) {
+            return candidate.string();
+        }
+    }
+
     if (forCreate && !topBase.empty()) {
         return (fs::path(topBase) / path).string();
     }
 
-    // No match — return original (will fail naturally)
     return path;
 }
 
-std::string resolveAssetPath(JSContext* ctx, const std::string& path)
+std::string getEncoding(std::span<const bronze::Value> a, size_t idx)
 {
-    return resolveFsPath(ctx, path.c_str(), false);
-}
-
-// Helper: read encoding arg (default nullptr = buffer mode)
-static const char* getEncoding(JSContext* ctx, int argc, JSValueConst* argv, int idx)
-{
-    if (idx >= argc) return nullptr;
-    // Could be string or options object with 'encoding' field
-    if (JS_IsString(argv[idx])) {
-        return JS_ToCString(ctx, argv[idx]);
+    if (idx >= a.size()) return "";
+    bronze::Value v = a[idx];
+    if (ev::isString(v)) return ev::toUtf8(v);
+    if (ev::isObject(v)) {
+        bronze::Value enc = ev::getProperty(v, "encoding");
+        if (ev::isString(enc)) return ev::toUtf8(enc);
     }
-    if (JS_IsObject(argv[idx])) {
-        JSValue enc = JS_GetPropertyStr(ctx, argv[idx], "encoding");
-        if (JS_IsString(enc)) {
-            const char* s = JS_ToCString(ctx, enc);
-            JS_FreeValue(ctx, enc);
-            return s;
-        }
-        JS_FreeValue(ctx, enc);
-    }
-    return nullptr;
+    return "";
 }
 
-// Helper: throw a Node.js-style error with code and syscall
-static JSValue throwErrno(JSContext* ctx, const char* syscall, const char* path,
-                          const char* code, const char* message)
+bronze::Value throwFsError(const char* syscall, const char* path, const std::error_code& ec)
 {
-    JSValue err = JS_NewError(ctx);
-    JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, message));
-    JS_SetPropertyStr(ctx, err, "code", JS_NewString(ctx, code));
-    JS_SetPropertyStr(ctx, err, "syscall", JS_NewString(ctx, syscall));
-    if (path) JS_SetPropertyStr(ctx, err, "path", JS_NewString(ctx, path));
-    return JS_Throw(ctx, err);
-}
-
-static JSValue throwFsError(JSContext* ctx, const char* syscall, const char* path,
-                            const std::error_code& ec)
-{
-    // Map common error codes to Node.js codes
     const char* code = "ERR_FS";
     if (ec == std::errc::no_such_file_or_directory) code = "ENOENT";
     else if (ec == std::errc::file_exists) code = "EEXIST";
@@ -201,65 +166,31 @@ static JSValue throwFsError(JSContext* ctx, const char* syscall, const char* pat
 
     std::string msg = std::string(code) + ": " + ec.message() + ", " + syscall;
     if (path) msg += " '" + std::string(path) + "'";
-    return throwErrno(ctx, syscall, path, code, msg.c_str());
+
+    ObjectBuilder err;
+    err.set("message", ev::fromUtf8(msg));
+    err.set("code", ev::fromUtf8(code));
+    if (syscall) err.set("syscall", ev::fromUtf8(syscall));
+    if (path) err.set("path", ev::fromUtf8(path));
+    return ev::throwValue(err.get());
 }
 
-// ---------------------------------------------------------------------------
-// readFileSync(path[, encoding])
-// ---------------------------------------------------------------------------
-static JSValue js_readFileSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+bronze::Value throwErrno(const char* syscall, const char* path, const char* code, const char* message)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "readFileSync: path required");
-
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
-
-    const char* encoding = getEncoding(ctx, argc, argv, 1);
-
-    std::ifstream f(resolved, std::ios::in | std::ios::binary);
-    if (!f) {
-        if (encoding) JS_FreeCString(ctx, encoding);
-        return throwErrno(ctx, "open", resolved.c_str(), "ENOENT",
-                          ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
-    }
-
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    std::string data = ss.str();
-    f.close();
-
-    JSValue result;
-    if (encoding && (strcmp(encoding, "utf8") == 0 || strcmp(encoding, "utf-8") == 0)) {
-        result = JS_NewStringLen(ctx, data.data(), data.size());
-    } else if (encoding) {
-        // For any other encoding, return as string too (best effort)
-        result = JS_NewStringLen(ctx, data.data(), data.size());
-    } else {
-        // No encoding: return Uint8Array (Buffer-like)
-        result = JS_NewUint8ArrayCopy(ctx, reinterpret_cast<const uint8_t*>(data.data()), data.size());
-    }
-
-    if (encoding) JS_FreeCString(ctx, encoding);
-    return result;
+    ObjectBuilder err;
+    err.set("message", ev::fromUtf8(message));
+    if (code) err.set("code", ev::fromUtf8(code));
+    if (syscall) err.set("syscall", ev::fromUtf8(syscall));
+    if (path) err.set("path", ev::fromUtf8(path));
+    return ev::throwValue(err.get());
 }
 
-// ---------------------------------------------------------------------------
-// File descriptors: openSync / readSync / writeSync / fstatSync / closeSync
-//
-// readFileSync is the only way to get bytes out of a file without these, and it
-// reads the whole file. That is a hard ceiling rather than an inefficiency: a
-// script that wants eight columns out of a multi-gigabyte HDF5 or a frame out
-// of a video container has no way to ask for a range, and no amount of JS can
-// work around a missing syscall.
-//
-// The descriptor table is process-wide and mutex-guarded because workers each
-// get their own JSContext but share the address space; a per-context table
-// would hand two workers the same small integer for different files.
-// ---------------------------------------------------------------------------
-namespace {
+bronze::Value makeU8(std::span<const uint8_t> bytes)
+{
+    bronze::Value v = ev::createTypedArray(elements::Uint8, static_cast<uint32_t>(bytes.size()));
+    ev::fillTypedArray(v, bytes);
+    return v;
+}
 
 struct OpenFile {
     std::fstream stream;
@@ -269,7 +200,7 @@ struct OpenFile {
 
 std::mutex g_fdMutex;
 std::map<int, std::unique_ptr<OpenFile>> g_fds;
-int g_nextFd = 3;                    // 0/1/2 are conventionally the std streams
+int g_nextFd = 3;
 
 OpenFile* lookupFd(int fd)
 {
@@ -279,20 +210,66 @@ OpenFile* lookupFd(int fd)
 
 } // namespace
 
-// openSync(path[, flags]) -> fd
-static JSValue js_openSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+std::string resolveAssetPath(const std::string& path)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "openSync: path required");
+    return resolveFsPath(path.c_str(), false);
+}
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
+void addFsBasePath(const std::string& path)
+{
+    g_fsBasePaths.push_back(path);
+}
+
+void addFsPrefixMount(const std::string& prefix, const std::string& absPath)
+{
+    if (!prefix.empty() && prefix[0] == '/') {
+        g_pathMounts[prefix] = absPath;
+    }
+}
+
+void addFetchPrefixMount(const std::string& prefix, const std::string& absPath)
+{
+    addFsPrefixMount(prefix, absPath);
+}
+
+// readFileSync(path[, encoding])
+static bronze::Value js_readFileSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.empty()) return ev::throwTypeError("readFileSync: path required");
+
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
+    std::string encoding = getEncoding(a, 1);
+
+    std::ifstream f(resolved, std::ios::in | std::ios::binary);
+    if (!f) {
+        return throwErrno("open", resolved.c_str(), "ENOENT",
+                          ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
+    }
+
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string data = ss.str();
+    f.close();
+
+    if (!encoding.empty()) {
+        return ev::fromUtf8(data);
+    }
+
+    return makeU8(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+}
+
+// openSync(path[, flags]) -> fd
+static bronze::Value js_openSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.empty()) return ev::throwTypeError("openSync: path required");
+
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
 
     std::string flags = "r";
-    if (argc >= 2 && JS_IsString(argv[1])) {
-        const char* f = JS_ToCString(ctx, argv[1]);
-        if (f) { flags = f; JS_FreeCString(ctx, f); }
+    if (a.size() >= 2 && ev::isString(a[1])) {
+        flags = ev::toUtf8(a[1]);
     }
 
     std::ios::openmode mode = std::ios::binary;
@@ -313,19 +290,18 @@ static JSValue js_openSync(JSContext* ctx, JSValueConst, int argc, JSValueConst*
         if (flags == "a+") mode |= std::ios::in;
         writable = true;
     } else {
-        return JS_ThrowTypeError(ctx, "openSync: unsupported flags '%s'", flags.c_str());
+        return ev::throwTypeError(("openSync: unsupported flags '" + flags + "'").c_str());
     }
 
-    // std::fstream will not create a file for "r+"; open it first if needed.
     if (flags == "r+" && !fs::exists(resolved)) {
-        return throwErrno(ctx, "open", resolved.c_str(), "ENOENT",
+        return throwErrno("open", resolved.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
     }
 
     auto file = std::make_unique<OpenFile>();
     file->stream.open(resolved, mode);
     if (!file->stream.is_open()) {
-        return throwErrno(ctx, "open", resolved.c_str(), "ENOENT",
+        return throwErrno("open", resolved.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
     }
     file->path = resolved;
@@ -334,289 +310,226 @@ static JSValue js_openSync(JSContext* ctx, JSValueConst, int argc, JSValueConst*
     std::lock_guard<std::mutex> lock(g_fdMutex);
     int fd = g_nextFd++;
     g_fds[fd] = std::move(file);
-    return JS_NewInt32(ctx, fd);
+    return ev::fromDouble(fd);
 }
 
 // readSync(fd, buffer, offset, length[, position]) -> bytes read
-//
-// `position` is where in the FILE to read from; null or omitted means "carry on
-// from wherever the last read stopped". Node's contract, and the reason this
-// function exists at all.
-static JSValue js_readSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_readSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "readSync: fd and buffer required");
+    if (a.size() < 2) return ev::throwTypeError("readSync: fd and buffer required");
 
-    int32_t fd = 0;
-    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+    int32_t fd = i32At(a, 0);
+    auto info = ev::typedArrayInfo(a[1]);
+    if (!info) return ev::throwTypeError("readSync: buffer must be a typed array");
 
-    size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
-    JSValue arrayBuffer = JS_GetTypedArrayBuffer(ctx, argv[1], &byteOffset, &byteLength,
-                                                 &bytesPerElement);
-    if (JS_IsException(arrayBuffer)) return JS_EXCEPTION;
-    size_t bufSize = 0;
-    uint8_t* base = JS_GetArrayBuffer(ctx, &bufSize, arrayBuffer);
-    JS_FreeValue(ctx, arrayBuffer);
-    if (!base) return JS_ThrowTypeError(ctx, "readSync: buffer must be a typed array");
+    uint8_t* base = info.data;
+    size_t byteLength = info.byteLength;
 
     int64_t offset = 0, length = static_cast<int64_t>(byteLength);
-    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
-        if (JS_ToInt64(ctx, &offset, argv[2])) return JS_EXCEPTION;
+    if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
+        offset = static_cast<int64_t>(ev::toDouble(a[2]));
     }
-    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
-        if (JS_ToInt64(ctx, &length, argv[3])) return JS_EXCEPTION;
+    if (a.size() >= 4 && !ev::isUndefined(a[3]) && !ev::isNull(a[3])) {
+        length = static_cast<int64_t>(ev::toDouble(a[3]));
     }
     if (offset < 0 || length < 0 || offset + length > static_cast<int64_t>(byteLength)) {
-        return JS_ThrowRangeError(ctx, "readSync: offset/length out of buffer bounds");
+        return ev::throwRangeError("readSync: offset/length out of buffer bounds");
     }
 
     bool seek = false;
     int64_t position = 0;
-    if (argc >= 5 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
-        if (JS_ToInt64(ctx, &position, argv[4])) return JS_EXCEPTION;
+    if (a.size() >= 5 && !ev::isUndefined(a[4]) && !ev::isNull(a[4])) {
+        position = static_cast<int64_t>(ev::toDouble(a[4]));
         if (position >= 0) seek = true;
     }
 
     std::lock_guard<std::mutex> lock(g_fdMutex);
     OpenFile* file = lookupFd(fd);
-    if (!file) return throwErrno(ctx, "read", nullptr, "EBADF", "EBADF: bad file descriptor, read");
+    if (!file) return throwErrno("read", nullptr, "EBADF", "EBADF: bad file descriptor, read");
 
-    // A stream that hit EOF on a previous read refuses to seek until cleared,
-    // which would turn one short read into a permanently dead descriptor.
     file->stream.clear();
     if (seek) file->stream.seekg(static_cast<std::streamoff>(position), std::ios::beg);
     if (!file->stream) {
-        return throwErrno(ctx, "read", file->path.c_str(), "EINVAL",
-                          "EINVAL: invalid position, read");
+        return throwErrno("read", file->path.c_str(), "EINVAL", "EINVAL: invalid position, read");
     }
 
-    file->stream.read(reinterpret_cast<char*>(base + byteOffset + offset),
+    file->stream.read(reinterpret_cast<char*>(base + offset),
                       static_cast<std::streamsize>(length));
     std::streamsize got = file->stream.gcount();
     file->stream.clear();
-    return JS_NewInt64(ctx, static_cast<int64_t>(got));
+    return ev::fromDouble(static_cast<double>(got));
 }
 
 // writeSync(fd, buffer, offset, length[, position]) -> bytes written
-static JSValue js_writeSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_writeSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "writeSync: fd and buffer required");
+    if (a.size() < 2) return ev::throwTypeError("writeSync: fd and buffer required");
 
-    int32_t fd = 0;
-    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+    int32_t fd = i32At(a, 0);
+    auto info = ev::typedArrayInfo(a[1]);
+    if (!info) return ev::throwTypeError("writeSync: buffer must be a typed array");
 
-    size_t byteOffset = 0, byteLength = 0, bytesPerElement = 0;
-    JSValue arrayBuffer = JS_GetTypedArrayBuffer(ctx, argv[1], &byteOffset, &byteLength,
-                                                 &bytesPerElement);
-    if (JS_IsException(arrayBuffer)) return JS_EXCEPTION;
-    size_t bufSize = 0;
-    uint8_t* base = JS_GetArrayBuffer(ctx, &bufSize, arrayBuffer);
-    JS_FreeValue(ctx, arrayBuffer);
-    if (!base) return JS_ThrowTypeError(ctx, "writeSync: buffer must be a typed array");
+    uint8_t* base = info.data;
+    size_t byteLength = info.byteLength;
 
     int64_t offset = 0, length = static_cast<int64_t>(byteLength);
-    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
-        if (JS_ToInt64(ctx, &offset, argv[2])) return JS_EXCEPTION;
+    if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
+        offset = static_cast<int64_t>(ev::toDouble(a[2]));
     }
-    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
-        if (JS_ToInt64(ctx, &length, argv[3])) return JS_EXCEPTION;
+    if (a.size() >= 4 && !ev::isUndefined(a[3]) && !ev::isNull(a[3])) {
+        length = static_cast<int64_t>(ev::toDouble(a[3]));
     }
     if (offset < 0 || length < 0 || offset + length > static_cast<int64_t>(byteLength)) {
-        return JS_ThrowRangeError(ctx, "writeSync: offset/length out of buffer bounds");
+        return ev::throwRangeError("writeSync: offset/length out of buffer bounds");
     }
 
     bool seek = false;
     int64_t position = 0;
-    if (argc >= 5 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
-        if (JS_ToInt64(ctx, &position, argv[4])) return JS_EXCEPTION;
+    if (a.size() >= 5 && !ev::isUndefined(a[4]) && !ev::isNull(a[4])) {
+        position = static_cast<int64_t>(ev::toDouble(a[4]));
         if (position >= 0) seek = true;
     }
 
     std::lock_guard<std::mutex> lock(g_fdMutex);
     OpenFile* file = lookupFd(fd);
-    if (!file) return throwErrno(ctx, "write", nullptr, "EBADF", "EBADF: bad file descriptor, write");
+    if (!file) return throwErrno("write", nullptr, "EBADF", "EBADF: bad file descriptor, write");
     if (!file->writable) {
-        return throwErrno(ctx, "write", file->path.c_str(), "EBADF",
+        return throwErrno("write", file->path.c_str(), "EBADF",
                           "EBADF: file descriptor is not open for writing, write");
     }
 
     file->stream.clear();
     if (seek) file->stream.seekp(static_cast<std::streamoff>(position), std::ios::beg);
-    file->stream.write(reinterpret_cast<const char*>(base + byteOffset + offset),
+    file->stream.write(reinterpret_cast<const char*>(base + offset),
                        static_cast<std::streamsize>(length));
     if (!file->stream) {
-        return throwErrno(ctx, "write", file->path.c_str(), "EIO", "EIO: write failed");
+        return throwErrno("write", file->path.c_str(), "EIO", "EIO: write failed");
     }
-    return JS_NewInt64(ctx, length);
+    return ev::fromDouble(static_cast<double>(length));
 }
 
-// fstatSync(fd) -> { size, ... }, in the same shape statSync returns
-static JSValue js_fstatSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// fstatSync(fd) -> { size, ... }
+static bronze::Value js_fstatSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "fstatSync: fd required");
-    int32_t fd = 0;
-    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+    if (a.empty()) return ev::throwTypeError("fstatSync: fd required");
+    int32_t fd = i32At(a, 0);
 
     std::string path;
     {
         std::lock_guard<std::mutex> lock(g_fdMutex);
         OpenFile* file = lookupFd(fd);
-        if (!file) return throwErrno(ctx, "fstat", nullptr, "EBADF", "EBADF: bad file descriptor, fstat");
+        if (!file) return throwErrno("fstat", nullptr, "EBADF", "EBADF: bad file descriptor, fstat");
         path = file->path;
     }
 
     std::error_code ec;
     auto size = fs::file_size(path, ec);
-    if (ec) return throwFsError(ctx, "fstat", path.c_str(), ec);
+    if (ec) return throwFsError("fstat", path.c_str(), ec);
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "size", JS_NewInt64(ctx, static_cast<int64_t>(size)));
-    JS_SetPropertyStr(ctx, obj, "_isFile", JS_NewBool(ctx, true));
-    JS_SetPropertyStr(ctx, obj, "_isDirectory", JS_NewBool(ctx, false));
-    JS_SetPropertyStr(ctx, obj, "_isSymbolicLink", JS_NewBool(ctx, false));
-    return obj;
+    ObjectBuilder obj;
+    obj.set("size", ev::fromDouble(static_cast<double>(size)));
+    obj.set("_isFile", ev::fromBool(true));
+    obj.set("_isDirectory", ev::fromBool(false));
+    obj.set("_isSymbolicLink", ev::fromBool(false));
+    return obj.get();
 }
 
 // closeSync(fd)
-static JSValue js_closeSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_closeSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "closeSync: fd required");
-    int32_t fd = 0;
-    if (JS_ToInt32(ctx, &fd, argv[0])) return JS_EXCEPTION;
+    if (a.empty()) return ev::undefined();
+    int32_t fd = i32At(a, 0);
 
     std::lock_guard<std::mutex> lock(g_fdMutex);
     auto it = g_fds.find(fd);
     if (it == g_fds.end()) {
-        return throwErrno(ctx, "close", nullptr, "EBADF", "EBADF: bad file descriptor, close");
+        return throwErrno("close", nullptr, "EBADF", "EBADF: bad file descriptor, close");
     }
     it->second->stream.close();
     g_fds.erase(it);
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // writeFileSync(path, data[, encoding])
-// ---------------------------------------------------------------------------
-static JSValue js_writeFileSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_writeFileSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "writeFileSync: path and data required");
+    if (a.size() < 2) return ev::throwTypeError("writeFileSync: path and data required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string pathStr = resolveFsPath(rawPath.c_str(), /*forCreate=*/true);
 
-    std::string pathStr = resolveFsPath(ctx, rawPath, /*forCreate=*/true);
-    JS_FreeCString(ctx, rawPath);
-
-    // Get data as bytes
     std::string data;
-    if (JS_IsString(argv[1])) {
-        const char* str = JS_ToCString(ctx, argv[1]);
-        if (!str) return JS_EXCEPTION;
-        data = str;
-        JS_FreeCString(ctx, str);
+    if (ev::isString(a[1])) {
+        data = ev::toUtf8(a[1]);
+    } else if (auto info = ev::typedArrayInfo(a[1])) {
+        data.assign(reinterpret_cast<const char*>(info.data), info.byteLength);
+    } else if (auto infoAb = ev::arrayBufferInfo(a[1])) {
+        data.assign(reinterpret_cast<const char*>(infoAb.data), infoAb.byteLength);
     } else {
-        // TypedArray or ArrayBuffer
-        size_t len = 0;
-        uint8_t* buf = JS_GetUint8Array(ctx, &len, argv[1]);
-        if (buf) {
-            data.assign(reinterpret_cast<char*>(buf), len);
-        } else {
-            // Try ArrayBuffer
-            size_t abLen = 0;
-            uint8_t* abBuf = JS_GetArrayBuffer(ctx, &abLen, argv[1]);
-            if (abBuf) {
-                data.assign(reinterpret_cast<char*>(abBuf), abLen);
-            } else {
-                // Convert to string as fallback
-                const char* str = JS_ToCString(ctx, argv[1]);
-                if (!str) return JS_EXCEPTION;
-                data = str;
-                JS_FreeCString(ctx, str);
-            }
-        }
+        data = ev::toUtf8(a[1]);
     }
 
     std::ofstream f(pathStr, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!f) {
-        return throwErrno(ctx, "open", pathStr.c_str(), "ENOENT",
+        return throwErrno("open", pathStr.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + pathStr + "'").c_str());
     }
     f.write(data.data(), static_cast<std::streamsize>(data.size()));
     if (!f) {
-        return throwErrno(ctx, "write", pathStr.c_str(), "ERR_FS",
+        return throwErrno("write", pathStr.c_str(), "ERR_FS",
                           ("ERR_FS: write failed '" + pathStr + "'").c_str());
     }
     f.close();
 
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // appendFileSync(path, data[, encoding])
-// ---------------------------------------------------------------------------
-static JSValue js_appendFileSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_appendFileSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "appendFileSync: path and data required");
+    if (a.size() < 2) return ev::throwTypeError("appendFileSync: path and data required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string pathStr = resolveFsPath(ctx, rawPath, /*forCreate=*/true);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string pathStr = resolveFsPath(rawPath.c_str(), /*forCreate=*/true);
 
     std::string data;
-    if (JS_IsString(argv[1])) {
-        const char* str = JS_ToCString(ctx, argv[1]);
-        if (!str) return JS_EXCEPTION;
-        data = str;
-        JS_FreeCString(ctx, str);
+    if (ev::isString(a[1])) {
+        data = ev::toUtf8(a[1]);
+    } else if (auto info = ev::typedArrayInfo(a[1])) {
+        data.assign(reinterpret_cast<const char*>(info.data), info.byteLength);
     } else {
-        size_t len = 0;
-        uint8_t* buf = JS_GetUint8Array(ctx, &len, argv[1]);
-        if (buf) {
-            data.assign(reinterpret_cast<char*>(buf), len);
-        } else {
-            const char* str = JS_ToCString(ctx, argv[1]);
-            if (!str) return JS_EXCEPTION;
-            data = str;
-            JS_FreeCString(ctx, str);
-        }
+        data = ev::toUtf8(a[1]);
     }
 
     std::ofstream f(pathStr, std::ios::out | std::ios::binary | std::ios::app);
     if (!f) {
-        return throwErrno(ctx, "open", pathStr.c_str(), "ENOENT",
+        return throwErrno("open", pathStr.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + pathStr + "'").c_str());
     }
     f.write(data.data(), static_cast<std::streamsize>(data.size()));
     f.close();
 
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
-// statSync(path) — returns {size, isFile(), isDirectory(), isSymbolicLink(), mtimeMs, atimeMs, ctimeMs, birthtimeMs, mode}
-// ---------------------------------------------------------------------------
-static JSValue js_statSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// statSync(path)
+static bronze::Value js_statSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "statSync: path required");
+    if (a.empty()) return ev::throwTypeError("statSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
 
     std::error_code ec;
     auto status = fs::status(resolved, ec);
     if (ec) {
-        return throwFsError(ctx, "stat", resolved.c_str(), ec);
+        return throwFsError("stat", resolved.c_str(), ec);
     }
 
     auto fileSize = fs::file_size(resolved, ec);
-    if (ec) fileSize = 0; // directories etc.
+    if (ec) fileSize = 0;
 
     auto mtime = fs::last_write_time(resolved, ec);
-    // Convert to ms since epoch
     double mtimeMs = 0;
     if (!ec) {
         auto sctp = std::chrono::time_point_cast<std::chrono::milliseconds>(
@@ -632,51 +545,44 @@ static JSValue js_statSync(JSContext* ctx, JSValueConst, int argc, JSValueConst*
         if (!ec) isSymlink = fs::is_symlink(lstatus);
     }
 
-#ifdef _WIN32
-    // Get file attributes for mode approximation
-    DWORD attrs = GetFileAttributesA(resolved.c_str());
     int mode = 0;
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesA(resolved.c_str());
     if (attrs != INVALID_FILE_ATTRIBUTES) {
-        mode = 0444; // readable
-        if (!(attrs & FILE_ATTRIBUTE_READONLY)) mode |= 0222; // writable
-        if (isDir) mode |= 0111; // executable for dirs
+        mode = 0444;
+        if (!(attrs & FILE_ATTRIBUTE_READONLY)) mode |= 0222;
+        if (isDir) mode |= 0111;
     }
 #else
     struct stat st;
-    int mode = 0;
     if (::stat(resolved.c_str(), &st) == 0) {
         mode = st.st_mode & 07777;
     }
 #endif
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "size", JS_NewFloat64(ctx, static_cast<double>(fileSize)));
-    JS_SetPropertyStr(ctx, obj, "mtimeMs", JS_NewFloat64(ctx, mtimeMs));
-    JS_SetPropertyStr(ctx, obj, "mode", JS_NewInt32(ctx, mode));
-    JS_SetPropertyStr(ctx, obj, "_isFile", JS_NewBool(ctx, isFile));
-    JS_SetPropertyStr(ctx, obj, "_isDirectory", JS_NewBool(ctx, isDir));
-    JS_SetPropertyStr(ctx, obj, "_isSymbolicLink", JS_NewBool(ctx, isSymlink));
+    ObjectBuilder obj;
+    obj.set("size", ev::fromDouble(static_cast<double>(fileSize)));
+    obj.set("mtimeMs", ev::fromDouble(mtimeMs));
+    obj.set("mode", ev::fromDouble(mode));
+    obj.set("_isFile", ev::fromBool(isFile));
+    obj.set("_isDirectory", ev::fromBool(isDir));
+    obj.set("_isSymbolicLink", ev::fromBool(isSymlink));
 
-    return obj;
+    return obj.get();
 }
 
-// ---------------------------------------------------------------------------
-// lstatSync(path) — like statSync but doesn't follow symlinks
-// ---------------------------------------------------------------------------
-static JSValue js_lstatSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// lstatSync(path)
+static bronze::Value js_lstatSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "lstatSync: path required");
+    if (a.empty()) return ev::throwTypeError("lstatSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
 
     std::error_code ec;
     auto status = fs::symlink_status(resolved, ec);
     if (ec) {
-        return throwFsError(ctx, "lstat", resolved.c_str(), ec);
+        return throwFsError("lstat", resolved.c_str(), ec);
     }
 
     auto fileSize = fs::file_size(resolved, ec);
@@ -686,101 +592,76 @@ static JSValue js_lstatSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
     bool isDir = fs::is_directory(status);
     bool isSymlink = fs::is_symlink(status);
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "size", JS_NewFloat64(ctx, static_cast<double>(fileSize)));
-    JS_SetPropertyStr(ctx, obj, "mode", JS_NewInt32(ctx, 0));
-    JS_SetPropertyStr(ctx, obj, "_isFile", JS_NewBool(ctx, isFile));
-    JS_SetPropertyStr(ctx, obj, "_isDirectory", JS_NewBool(ctx, isDir));
-    JS_SetPropertyStr(ctx, obj, "_isSymbolicLink", JS_NewBool(ctx, isSymlink));
+    ObjectBuilder obj;
+    obj.set("size", ev::fromDouble(static_cast<double>(fileSize)));
+    obj.set("mode", ev::fromDouble(0));
+    obj.set("_isFile", ev::fromBool(isFile));
+    obj.set("_isDirectory", ev::fromBool(isDir));
+    obj.set("_isSymbolicLink", ev::fromBool(isSymlink));
 
-    return obj;
+    return obj.get();
 }
 
-// ---------------------------------------------------------------------------
 // readdirSync(path[, options])
-// ---------------------------------------------------------------------------
-static JSValue js_readdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_readdirSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "readdirSync: path required");
+    if (a.empty()) return ev::throwTypeError("readdirSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
 
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
-
-    // Check for withFileTypes option
     bool withFileTypes = false;
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        JSValue wft = JS_GetPropertyStr(ctx, argv[1], "withFileTypes");
-        withFileTypes = JS_ToBool(ctx, wft);
-        JS_FreeValue(ctx, wft);
+    if (a.size() >= 2 && ev::isObject(a[1])) {
+        bronze::Value wft = ev::getProperty(a[1], "withFileTypes");
+        withFileTypes = ev::isBool(wft) && ev::toBool(wft);
     }
 
     std::error_code ec;
     auto iter = fs::directory_iterator(resolved, ec);
     if (ec) {
-        return throwFsError(ctx, "scandir", resolved.c_str(), ec);
+        return throwFsError("scandir", resolved.c_str(), ec);
     }
 
-    JSValue arr = JS_NewArray(ctx);
-    uint32_t i = 0;
-
+    std::vector<bronze::Value> items;
     for (auto& entry : iter) {
+        std::string name = entry.path().filename().string();
         if (withFileTypes) {
-            JSValue dirent = JS_NewObject(ctx);
-            std::string name = entry.path().filename().string();
-            JS_SetPropertyStr(ctx, dirent, "name", JS_NewString(ctx, name.c_str()));
-            JS_SetPropertyStr(ctx, dirent, "_isFile", JS_NewBool(ctx, entry.is_regular_file()));
-            JS_SetPropertyStr(ctx, dirent, "_isDirectory", JS_NewBool(ctx, entry.is_directory()));
-            JS_SetPropertyStr(ctx, dirent, "_isSymbolicLink", JS_NewBool(ctx, entry.is_symlink()));
-            JS_SetPropertyUint32(ctx, arr, i++, dirent);
+            ObjectBuilder dirent;
+            dirent.set("name", ev::fromUtf8(name));
+            dirent.set("_isFile", ev::fromBool(entry.is_regular_file()));
+            dirent.set("_isDirectory", ev::fromBool(entry.is_directory()));
+            dirent.set("_isSymbolicLink", ev::fromBool(entry.is_symlink()));
+            items.push_back(dirent.get());
         } else {
-            std::string name = entry.path().filename().string();
-            JS_SetPropertyUint32(ctx, arr, i++, JS_NewString(ctx, name.c_str()));
+            items.push_back(ev::fromUtf8(name));
         }
     }
 
-    return arr;
+    return hostArrayOf(items);
 }
 
-// ---------------------------------------------------------------------------
 // existsSync(path)
-// ---------------------------------------------------------------------------
-static JSValue js_existsSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_existsSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_NewBool(ctx, false);
-
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_NewBool(ctx, false);
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
-
+    if (a.empty()) return ev::fromBool(false);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
     std::error_code ec;
-    bool exists = fs::exists(resolved, ec);
-
-    return JS_NewBool(ctx, exists);
+    return ev::fromBool(fs::exists(resolved, ec));
 }
 
-// ---------------------------------------------------------------------------
 // mkdirSync(path[, options])
-// ---------------------------------------------------------------------------
-static JSValue js_mkdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_mkdirSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "mkdirSync: path required");
+    if (a.empty()) return ev::throwTypeError("mkdirSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath, /*forCreate=*/true);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str(), /*forCreate=*/true);
 
     bool recursive = false;
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        JSValue rec = JS_GetPropertyStr(ctx, argv[1], "recursive");
-        recursive = JS_ToBool(ctx, rec);
-        JS_FreeValue(ctx, rec);
+    if (a.size() >= 2 && ev::isObject(a[1])) {
+        bronze::Value rec = ev::getProperty(a[1], "recursive");
+        recursive = ev::isBool(rec) && ev::toBool(rec);
     }
 
     std::error_code ec;
@@ -791,63 +672,48 @@ static JSValue js_mkdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
     }
 
     if (ec) {
-        return throwFsError(ctx, "mkdir", resolved.c_str(), ec);
+        return throwFsError("mkdir", resolved.c_str(), ec);
     }
 
-    // Node returns the first directory created when recursive, or undefined
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // rmdirSync(path)
-// ---------------------------------------------------------------------------
-static JSValue js_rmdirSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_rmdirSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "rmdirSync: path required");
+    if (a.empty()) return ev::throwTypeError("rmdirSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
 
     std::error_code ec;
     fs::remove(resolved, ec);
     if (ec) {
-        return throwFsError(ctx, "rmdir", resolved.c_str(), ec);
+        return throwFsError("rmdir", resolved.c_str(), ec);
     }
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
-// rmSync(path[, options]) — supports {recursive, force}
-// ---------------------------------------------------------------------------
-static JSValue js_rmSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// rmSync(path[, options])
+static bronze::Value js_rmSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "rmSync: path required");
+    if (a.empty()) return ev::throwTypeError("rmSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
 
     bool recursive = false;
     bool force = false;
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        JSValue rec = JS_GetPropertyStr(ctx, argv[1], "recursive");
-        recursive = JS_ToBool(ctx, rec);
-        JS_FreeValue(ctx, rec);
-        JSValue f = JS_GetPropertyStr(ctx, argv[1], "force");
-        force = JS_ToBool(ctx, f);
-        JS_FreeValue(ctx, f);
+    if (a.size() >= 2 && ev::isObject(a[1])) {
+        bronze::Value rec = ev::getProperty(a[1], "recursive");
+        recursive = ev::isBool(rec) && ev::toBool(rec);
+        bronze::Value f = ev::getProperty(a[1], "force");
+        force = ev::isBool(f) && ev::toBool(f);
     }
 
     std::error_code ec;
-
-    // Check if path exists first for force mode
     if (!fs::exists(resolved, ec) && force) {
-        return JS_UNDEFINED;
+        return ev::undefined();
     }
 
     if (recursive) {
@@ -857,246 +723,122 @@ static JSValue js_rmSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* a
     }
 
     if (ec && !force) {
-        return throwFsError(ctx, "rm", resolved.c_str(), ec);
+        return throwFsError("rm", resolved.c_str(), ec);
     }
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // unlinkSync(path)
-// ---------------------------------------------------------------------------
-static JSValue js_unlinkSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_unlinkSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "unlinkSync: path required");
+    if (a.empty()) return ev::throwTypeError("unlinkSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveFsPath(rawPath.c_str());
 
     std::error_code ec;
     fs::remove(resolved, ec);
     if (ec) {
-        return throwFsError(ctx, "unlink", resolved.c_str(), ec);
+        return throwFsError("unlink", resolved.c_str(), ec);
     }
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // renameSync(oldPath, newPath)
-// ---------------------------------------------------------------------------
-static JSValue js_renameSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_renameSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "renameSync: oldPath and newPath required");
+    if (a.size() < 2) return ev::throwTypeError("renameSync: oldPath and newPath required");
 
-    const char* rawOld = JS_ToCString(ctx, argv[0]);
-    if (!rawOld) return JS_EXCEPTION;
-    const char* rawNew = JS_ToCString(ctx, argv[1]);
-    if (!rawNew) { JS_FreeCString(ctx, rawOld); return JS_EXCEPTION; }
-
-    std::string resolvedOld = resolveFsPath(ctx, rawOld);
-    std::string resolvedNew = resolveFsPath(ctx, rawNew, /*forCreate=*/true);
-    JS_FreeCString(ctx, rawOld);
-    JS_FreeCString(ctx, rawNew);
+    std::string oldResolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
+    std::string newResolved = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
 
     std::error_code ec;
-    fs::rename(resolvedOld, resolvedNew, ec);
-
+    fs::rename(oldResolved, newResolved, ec);
     if (ec) {
-        return throwFsError(ctx, "rename", resolvedOld.c_str(), ec);
+        return throwFsError("rename", oldResolved.c_str(), ec);
     }
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // copyFileSync(src, dest)
-// ---------------------------------------------------------------------------
-static JSValue js_copyFileSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_copyFileSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "copyFileSync: src and dest required");
+    if (a.size() < 2) return ev::throwTypeError("copyFileSync: src and dest required");
 
-    const char* rawSrc = JS_ToCString(ctx, argv[0]);
-    if (!rawSrc) return JS_EXCEPTION;
-    const char* rawDest = JS_ToCString(ctx, argv[1]);
-    if (!rawDest) { JS_FreeCString(ctx, rawSrc); return JS_EXCEPTION; }
-
-    std::string resolvedSrc = resolveFsPath(ctx, rawSrc);
-    std::string resolvedDest = resolveFsPath(ctx, rawDest, /*forCreate=*/true);
-    JS_FreeCString(ctx, rawSrc);
-    JS_FreeCString(ctx, rawDest);
+    std::string srcResolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
+    std::string destResolved = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
 
     std::error_code ec;
-    fs::copy_file(resolvedSrc, resolvedDest, fs::copy_options::overwrite_existing, ec);
-
+    fs::copy_file(srcResolved, destResolved, fs::copy_options::overwrite_existing, ec);
     if (ec) {
-        return throwFsError(ctx, "copyfile", resolvedSrc.c_str(), ec);
+        return throwFsError("copyfile", srcResolved.c_str(), ec);
     }
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // chmodSync(path, mode)
-// ---------------------------------------------------------------------------
-static JSValue js_chmodSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_chmodSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "chmodSync: path and mode required");
+    if (a.size() < 2) return ev::throwTypeError("chmodSync: path and mode required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string resolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
-
-    int mode = 0;
-    JS_ToInt32(ctx, &mode, argv[1]);
+    std::string resolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
+    int mode = i32At(a, 1);
 
 #ifdef _WIN32
-    // Windows: approximate with _chmod (only supports _S_IREAD / _S_IWRITE)
     int wmode = 0;
-    if (mode & 0444) wmode |= 0x100; // _S_IREAD
-    if (mode & 0222) wmode |= 0x080; // _S_IWRITE
+    if (mode & 0444) wmode |= 0x100;
+    if (mode & 0222) wmode |= 0x080;
     int result = _chmod(resolved.c_str(), wmode);
 #else
     int result = chmod(resolved.c_str(), static_cast<mode_t>(mode));
 #endif
 
     if (result != 0) {
-        return throwErrno(ctx, "chmod", resolved.c_str(), "ENOENT",
+        return throwErrno("chmod", resolved.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, chmod '" + resolved + "'").c_str());
     }
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// ---------------------------------------------------------------------------
 // realpathSync(path)
-// ---------------------------------------------------------------------------
-static JSValue js_realpathSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_realpathSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "realpathSync: path required");
+    if (a.empty()) return ev::throwTypeError("realpathSync: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-
-    std::string fsResolved = resolveFsPath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
-
+    std::string resolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
     std::error_code ec;
-    auto canonical = fs::canonical(fsResolved, ec);
+    auto canonical = fs::canonical(resolved, ec);
     if (ec) {
-        return throwFsError(ctx, "realpath", fsResolved.c_str(), ec);
+        return throwFsError("realpath", resolved.c_str(), ec);
     }
 
-    std::string result = canonical.string();
-    return JS_NewString(ctx, result.c_str());
+    return ev::fromUtf8(canonical.string());
 }
 
-// ---------------------------------------------------------------------------
-// Install
-// ---------------------------------------------------------------------------
-void installFS(JSContext* ctx)
+void installFS()
 {
-    JSValue global = JS_GetGlobalObject(ctx);
+    ev::setGlobalFunction("__brokit_fs_readFileSync", 2, js_readFileSync);
+    ev::setGlobalFunction("__brokit_fs_writeFileSync", 3, js_writeFileSync);
+    ev::setGlobalFunction("__brokit_fs_appendFileSync", 3, js_appendFileSync);
+    ev::setGlobalFunction("__brokit_fs_statSync", 2, js_statSync);
+    ev::setGlobalFunction("__brokit_fs_lstatSync", 2, js_lstatSync);
+    ev::setGlobalFunction("__brokit_fs_readdirSync", 2, js_readdirSync);
+    ev::setGlobalFunction("__brokit_fs_existsSync", 1, js_existsSync);
+    ev::setGlobalFunction("__brokit_fs_mkdirSync", 2, js_mkdirSync);
+    ev::setGlobalFunction("__brokit_fs_rmdirSync", 1, js_rmdirSync);
+    ev::setGlobalFunction("__brokit_fs_rmSync", 2, js_rmSync);
+    ev::setGlobalFunction("__brokit_fs_unlinkSync", 1, js_unlinkSync);
+    ev::setGlobalFunction("__brokit_fs_renameSync", 2, js_renameSync);
+    ev::setGlobalFunction("__brokit_fs_copyFileSync", 2, js_copyFileSync);
+    ev::setGlobalFunction("__brokit_fs_chmodSync", 2, js_chmodSync);
+    ev::setGlobalFunction("__brokit_fs_realpathSync", 1, js_realpathSync);
+    ev::setGlobalFunction("__brokit_fs_openSync", 2, js_openSync);
+    ev::setGlobalFunction("__brokit_fs_readSync", 5, js_readSync);
+    ev::setGlobalFunction("__brokit_fs_writeSync", 5, js_writeSync);
+    ev::setGlobalFunction("__brokit_fs_fstatSync", 1, js_fstatSync);
+    ev::setGlobalFunction("__brokit_fs_closeSync", 1, js_closeSync);
 
-    // Initialize base-paths array for relative path resolution
-    JS_SetPropertyStr(ctx, global, kFsBasePathsKey, JS_NewArray(ctx));
-
-    // Native sync functions as __brokit_fs_* globals
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_readFileSync",
-                      JS_NewCFunction(ctx, js_readFileSync, "readFileSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_writeFileSync",
-                      JS_NewCFunction(ctx, js_writeFileSync, "writeFileSync", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_appendFileSync",
-                      JS_NewCFunction(ctx, js_appendFileSync, "appendFileSync", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_statSync",
-                      JS_NewCFunction(ctx, js_statSync, "statSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_lstatSync",
-                      JS_NewCFunction(ctx, js_lstatSync, "lstatSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_readdirSync",
-                      JS_NewCFunction(ctx, js_readdirSync, "readdirSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_existsSync",
-                      JS_NewCFunction(ctx, js_existsSync, "existsSync", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_mkdirSync",
-                      JS_NewCFunction(ctx, js_mkdirSync, "mkdirSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_rmdirSync",
-                      JS_NewCFunction(ctx, js_rmdirSync, "rmdirSync", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_rmSync",
-                      JS_NewCFunction(ctx, js_rmSync, "rmSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_unlinkSync",
-                      JS_NewCFunction(ctx, js_unlinkSync, "unlinkSync", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_renameSync",
-                      JS_NewCFunction(ctx, js_renameSync, "renameSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_copyFileSync",
-                      JS_NewCFunction(ctx, js_copyFileSync, "copyFileSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_chmodSync",
-                      JS_NewCFunction(ctx, js_chmodSync, "chmodSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_realpathSync",
-                      JS_NewCFunction(ctx, js_realpathSync, "realpathSync", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_openSync",
-                      JS_NewCFunction(ctx, js_openSync, "openSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_readSync",
-                      JS_NewCFunction(ctx, js_readSync, "readSync", 5));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_writeSync",
-                      JS_NewCFunction(ctx, js_writeSync, "writeSync", 5));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_fstatSync",
-                      JS_NewCFunction(ctx, js_fstatSync, "fstatSync", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_closeSync",
-                      JS_NewCFunction(ctx, js_closeSync, "closeSync", 1));
-
-    JS_FreeValue(ctx, global);
-
-    // Install JS polyfill (async wrappers + fs object)
-    JSValue r = JS_Eval(ctx, js_fs, strlen(js_fs), "<fs>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
-}
-
-void addFsBasePath(JSContext* ctx, const std::string& path)
-{
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue arr = JS_GetPropertyStr(ctx, global, kFsBasePathsKey);
-    if (!JS_IsArray(arr)) {
-        JS_FreeValue(ctx, arr);
-        arr = JS_NewArray(ctx);
-        JS_SetPropertyStr(ctx, global, kFsBasePathsKey, JS_DupValue(ctx, arr));
-    }
-    JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
-    int32_t len = 0;
-    JS_ToInt32(ctx, &len, lenVal);
-    JS_FreeValue(ctx, lenVal);
-    JS_SetPropertyUint32(ctx, arr, len, JS_NewString(ctx, path.c_str()));
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, global);
-}
-
-// Internal: shared mount registration used by both fs and fetch entry points.
-static void addPrefixMountInternal(JSContext* ctx, const std::string& prefix,
-                                   const std::string& absPath)
-{
-    if (prefix.empty() || prefix[0] != '/') return;
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue obj = JS_GetPropertyStr(ctx, global, kPathMountsKey);
-    if (!JS_IsObject(obj)) {
-        JS_FreeValue(ctx, obj);
-        obj = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, global, kPathMountsKey, JS_DupValue(ctx, obj));
-    }
-    JS_SetPropertyStr(ctx, obj, prefix.c_str(),
-                      JS_NewString(ctx, absPath.c_str()));
-    JS_FreeValue(ctx, obj);
-    JS_FreeValue(ctx, global);
-}
-
-void addFsPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath)
-{
-    addPrefixMountInternal(ctx, prefix, absPath);
-}
-
-void addFetchPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath)
-{
-    addPrefixMountInternal(ctx, prefix, absPath);
+    bronze::embed::runEntry(bronze_fs_main);
 }
 
 } // namespace brokit::api

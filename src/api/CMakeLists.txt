@@ -1,64 +1,66 @@
-## ── Embed JS polyfills as C++ headers at build time ──────────────────────────
-# Each .js file in js/ becomes a .h with the content as a C string literal.
-# The generated headers land in ${CMAKE_CURRENT_BINARY_DIR}/generated/.
+## ── Compile JS polyfills with bronze AOT at build time ───────────────────
+# Each .js file in js/ is compiled directly to an object file (.o) with its
+# unique entry symbol and linked into brokit_api.
 
-set(EMBED_SCRIPT "${brokit_SOURCE_DIR}/cmake/embed_js.cmake")
 set(GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GEN_DIR}")
 
-function(embed_js JS_FILE VAR_NAME)
-    set(INPUT  "${CMAKE_CURRENT_SOURCE_DIR}/js/${JS_FILE}")
-    set(OUTPUT "${GEN_DIR}/${JS_FILE}.h")
+set(BROKIT_GLOBALS "${CMAKE_CURRENT_SOURCE_DIR}/brokit.globals")
+set(BROKIT_COMPILED_JS_OBJECTS "")
+
+function(bronze_compile_js JS_FILE ENTRY_SYMBOL)
+    set(INPUT  "${CMAKE_CURRENT_SOURCE_DIR}/js/${JS_FILE}.js")
+    set(OUTPUT "${GEN_DIR}/${JS_FILE}.o")
     add_custom_command(
         OUTPUT  "${OUTPUT}"
-        COMMAND ${CMAKE_COMMAND}
-                -DINPUT="${INPUT}"
-                -DOUTPUT="${OUTPUT}"
-                -DVAR_NAME="${VAR_NAME}"
-                -P "${EMBED_SCRIPT}"
-        DEPENDS "${INPUT}" "${EMBED_SCRIPT}"
-        COMMENT "Embedding js/${JS_FILE} -> ${JS_FILE}.h"
+        COMMAND $<TARGET_FILE:bronze> build "${INPUT}" --emit-obj --host-globals "${BROKIT_GLOBALS}" --entry-symbol=${ENTRY_SYMBOL} -o "${OUTPUT}"
+        DEPENDS bronze "${INPUT}" "${BROKIT_GLOBALS}"
+        COMMENT "bronze compile js/${JS_FILE}.js -> ${JS_FILE}.o (${ENTRY_SYMBOL})"
+        VERBATIM
     )
-    list(APPEND GENERATED_HEADERS "${OUTPUT}")
-    set(GENERATED_HEADERS "${GENERATED_HEADERS}" PARENT_SCOPE)
+    set_source_files_properties("${OUTPUT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+    list(APPEND BROKIT_COMPILED_JS_OBJECTS "${OUTPUT}")
+    set(BROKIT_COMPILED_JS_OBJECTS "${BROKIT_COMPILED_JS_OBJECTS}" PARENT_SCOPE)
 endfunction()
 
-embed_js(abort.js           js_abort)
-embed_js(structuredclone.js js_structuredclone)
-embed_js(timers.js          js_timers)
-embed_js(console_time.js    js_console_time)
-embed_js(url.js             js_url)
-embed_js(encoding.js        js_encoding)
-embed_js(treewalker.js      js_treewalker)
-embed_js(url_object.js      js_url_object)
-embed_js(path.js            js_path)
-embed_js(readable_stream.js js_readable_stream)
-embed_js(fs.js              js_fs)
-embed_js(child_process.js   js_child_process)
-embed_js(indexeddb.js       js_indexeddb)
-embed_js(writable_stream.js js_writable_stream)
-embed_js(websocket.js       js_websocket)
-embed_js(eventsource.js     js_eventsource)
-embed_js(formdata.js        js_formdata)
-embed_js(fetch_classes.js   js_fetch_classes)
-embed_js(base64.js          js_base64)
-embed_js(navigator.js       js_navigator)
-embed_js(event_target.js    js_event_target)
-embed_js(message_channel.js js_message_channel)
-embed_js(fs_watch.js        js_fs_watch)
-embed_js(fetch_helpers.js   js_fetch_helpers)
-embed_js(process.js         js_process)
-embed_js(buffer.js          js_buffer)
-embed_js(events.js          js_events)
-embed_js(util.js            js_util)
-embed_js(compression.js     js_compression)
-embed_js(net.js             js_net)
-embed_js(dgram.js           js_dgram)
-embed_js(websocket_server.js js_websocket_server)
+bronze_compile_js(abort              bronze_abort_main)
+bronze_compile_js(structuredclone    bronze_structuredclone_main)
+bronze_compile_js(timers             bronze_timers_main)
+bronze_compile_js(console_time       bronze_console_time_main)
+bronze_compile_js(url                bronze_url_main)
+bronze_compile_js(encoding           bronze_encoding_main)
+bronze_compile_js(treewalker         bronze_treewalker_main)
+bronze_compile_js(url_object         bronze_url_object_main)
+bronze_compile_js(path               bronze_path_main)
+bronze_compile_js(readable_stream    bronze_readable_stream_main)
+bronze_compile_js(fs                 bronze_fs_main)
+bronze_compile_js(child_process      bronze_child_process_main)
+bronze_compile_js(indexeddb          bronze_indexeddb_main)
+bronze_compile_js(writable_stream    bronze_writable_stream_main)
+bronze_compile_js(websocket          bronze_websocket_main)
+bronze_compile_js(eventsource        bronze_eventsource_main)
+bronze_compile_js(formdata           bronze_formdata_main)
+bronze_compile_js(fetch_classes      bronze_fetch_classes_main)
+bronze_compile_js(base64             bronze_base64_main)
+bronze_compile_js(navigator          bronze_navigator_main)
+bronze_compile_js(event_target       bronze_event_target_main)
+bronze_compile_js(message_channel    bronze_message_channel_main)
+bronze_compile_js(fs_watch           bronze_fs_watch_main)
+bronze_compile_js(fetch_helpers      bronze_fetch_helpers_main)
+bronze_compile_js(process            bronze_process_main)
+bronze_compile_js(buffer             bronze_buffer_main)
+bronze_compile_js(events             bronze_events_main)
+bronze_compile_js(util               bronze_util_main)
+bronze_compile_js(compression        bronze_compression_main)
+bronze_compile_js(net                bronze_net_main)
+bronze_compile_js(dgram              bronze_dgram_main)
+bronze_compile_js(websocket_server   bronze_websocket_server_main)
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
 set(BROKIT_API_SOURCES
+    host_class.cpp
+    host_proxy.cpp
     api.cpp
     console.cpp
     timers.cpp
@@ -111,11 +113,6 @@ endif()
 option(BROKIT_ENABLE_IMAGE "Build bro.image typed-array kernels" ON)
 if(BROKIT_ENABLE_IMAGE)
     list(APPEND BROKIT_API_SOURCES image.cpp)
-    # broimage provides the kernel implementations; image.cpp is the JS glue
-    # that delegates to it. Standalone repo at ../broimage preferred, with a
-    # third_party/broimage submodule fallback. When brokit builds inside bro,
-    # broimage is already a target (added by bro/third_party/CMakeLists.txt
-    # before brokit) and this block reuses it via the NOT TARGET guard.
     if(NOT TARGET broimage)
         set(BROIMAGE_DIR "${brokit_SOURCE_DIR}/../broimage" CACHE PATH
             "Path to standalone broimage repo")
@@ -138,15 +135,14 @@ endif()
 
 add_library(brokit_api STATIC
     ${BROKIT_API_SOURCES}
-    ${GENERATED_HEADERS}
+    ${BROKIT_COMPILED_JS_OBJECTS}
 )
 target_include_directories(brokit_api PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-target_include_directories(brokit_api PRIVATE ${GEN_DIR})
 target_link_libraries(brokit_api PUBLIC brokit_runtime)
 target_link_libraries(brokit_api PUBLIC libcurl_static)
 target_link_libraries(brokit_api PUBLIC sqlite3)
 target_link_libraries(brokit_api PRIVATE miniz)
-target_include_directories(brokit_api PRIVATE ${brokit_SOURCE_DIR}/third_party/quickjs)
+target_link_libraries(brokit_api PUBLIC bronze::runtime_shared)
 
 if(BROKIT_ENABLE_NOISE)
     target_link_libraries(brokit_api PUBLIC FastNoise)
@@ -159,8 +155,6 @@ if(BROKIT_ENABLE_IMAGE)
 endif()
 
 # fs.watch — native filesystem watcher uses one OS thread per watcher.
-# Threads is required on Linux for std::thread; macOS needs the CoreServices
-# framework for FSEvents.
 find_package(Threads REQUIRED)
 target_link_libraries(brokit_api PUBLIC Threads::Threads)
 # net.cpp — raw TCP/UDP sockets need Winsock on Windows.

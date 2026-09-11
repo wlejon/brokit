@@ -1,18 +1,12 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "path.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_path_main();
 
 namespace brokit::api {
 
-void installPath(JSContext* ctx)
-{
-    JSValue r = JS_Eval(ctx, js_path, strlen(js_path), "<path>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+void installPath() {
+    bronze::embed::runEntry(bronze_path_main);
 }
 
 } // namespace brokit::api

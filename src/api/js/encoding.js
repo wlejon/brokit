@@ -3,7 +3,7 @@
         this.encoding = 'utf-8';
     };
     TextEncoder.prototype.encode = function(str) {
-        return globalThis.__brokit_textencoder_encode(str || '');
+        return (typeof __brokit_textencoder_encode === 'function' ? __brokit_textencoder_encode : globalThis.__brokit_textencoder_encode)(str || '');
     };
     TextEncoder.prototype.encodeInto = function(str, dest) {
         var encoded = this.encode(str);
@@ -19,6 +19,7 @@
     };
     TextDecoder.prototype.decode = function(input) {
         if (!input) return '';
-        return globalThis.__brokit_textdecoder_decode(input);
+        var raw = (input && input._u8) ? input._u8 : input;
+        return (typeof __brokit_textdecoder_decode === 'function' ? __brokit_textdecoder_decode : globalThis.__brokit_textdecoder_decode)(raw);
     };
 })();

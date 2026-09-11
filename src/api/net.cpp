@@ -16,7 +16,8 @@
 // with "0.0.0.0" / "::" / a concrete interface address.
 
 #include "api/api.h"
-#include "runtime/runtime.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
 
 #include <cstdint>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <span>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -180,24 +182,15 @@ struct NetHandle {
 
     bool ipv6 = false; // UDP family
 
-    // Ticks a fully-closed handle has survived without JS draining its Close
-    // event. Handles wrapped by the JS layer are drained the tick they close;
-    // anything still counting up was opened through the raw bindings and gets
-    // reaped so it stops holding __brokit_net_has_pending() true forever.
-    // (Same orphan policy as websocket.cpp.)
     int closedSweeps = 0;
 };
 
-// thread_local: bro pumps __brokit_net_tick from the main thread AND from each
-// Worker's own thread (worker.cpp). Per-thread tables mean each JS thread owns
-// and pumps only its own sockets — no cross-thread iteration, no locks.
+// thread_local: each JS thread owns and pumps only its own sockets
 thread_local std::unordered_map<int, NetHandle*> g_handles;
 thread_local int g_nextId = 1;
 
-NetHandle* findHandle(JSContext* ctx, JSValueConst idVal)
+NetHandle* findHandle(int id)
 {
-    int id = 0;
-    JS_ToInt32(ctx, &id, idVal);
     auto it = g_handles.find(id);
     return it == g_handles.end() ? nullptr : it->second;
 }
@@ -248,57 +241,32 @@ void failHandle(NetHandle* h, const std::string& msg)
 }
 
 // data: string | ArrayBuffer | any TypedArray/DataView → bytes.
-// Strings are encoded as UTF-8 (matching how brokit's fs and WebSocket treat
-// string payloads).
-bool valueToBytes(JSContext* ctx, JSValueConst v, std::vector<uint8_t>& out)
+bool valueToBytes(bronze::Value v, std::vector<uint8_t>& out)
 {
-    if (JS_IsString(v)) {
-        size_t len = 0;
-        const char* s = JS_ToCStringLen(ctx, &len, v);
-        if (!s) return false;
-        out.assign(s, s + len);
-        JS_FreeCString(ctx, s);
+    if (ev::isString(v)) {
+        std::string s = ev::toUtf8(v);
+        out.assign(s.begin(), s.end());
         return true;
     }
-    size_t len = 0;
-    if (uint8_t* p = JS_GetUint8Array(ctx, &len, v)) {
-        out.assign(p, p + len);
+    if (auto info = ev::typedArrayInfo(v)) {
+        out.assign(info.data, info.data + info.byteLength);
         return true;
     }
-    JS_FreeValue(ctx, JS_GetException(ctx)); // clear the type-mismatch throw
-    if (uint8_t* p = JS_GetArrayBuffer(ctx, &len, v)) {
-        out.assign(p, p + len);
+    if (auto info = ev::arrayBufferInfo(v)) {
+        out.assign(info.data, info.data + info.byteLength);
         return true;
     }
-    JS_FreeValue(ctx, JS_GetException(ctx));
-    // Other TypedArray / DataView: go through .buffer + byteOffset/byteLength.
-    JSValue bufv = JS_GetPropertyStr(ctx, v, "buffer");
-    if (!JS_IsObject(bufv)) {
-        JS_FreeValue(ctx, bufv);
-        return false;
+    if (ev::isObject(v)) {
+        auto u8 = ev::getProperty(v, "_u8");
+        if (auto info = ev::typedArrayInfo(u8)) {
+            out.assign(info.data, info.data + info.byteLength);
+            return true;
+        }
     }
-    size_t total = 0;
-    uint8_t* base = JS_GetArrayBuffer(ctx, &total, bufv);
-    JS_FreeValue(ctx, bufv);
-    if (!base) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        return false;
-    }
-    int64_t off = 0, blen = 0;
-    JSValue offv = JS_GetPropertyStr(ctx, v, "byteOffset");
-    JSValue lenv = JS_GetPropertyStr(ctx, v, "byteLength");
-    JS_ToInt64(ctx, &off, offv);
-    JS_ToInt64(ctx, &blen, lenv);
-    JS_FreeValue(ctx, offv);
-    JS_FreeValue(ctx, lenv);
-    if (off < 0 || blen < 0 || static_cast<size_t>(off + blen) > total) return false;
-    out.assign(base + off, base + off + blen);
-    return true;
+    return false;
 }
 
 // Resolve host:port. family: AF_UNSPEC / AF_INET / AF_INET6.
-// Synchronous getaddrinfo — instant for numeric addresses and localhost; a
-// remote DNS name blocks the JS thread for the lookup (documented v1 tradeoff).
 addrinfo* resolve(const std::string& host, int port, int family, int socktype,
                   bool passive, std::string& err)
 {
@@ -348,35 +316,28 @@ void flushOutBuf(NetHandle* h)
 } // namespace
 
 // ---------------------------------------------------------------------------
-// __brokit_net_tcp_listen(port, host) → id   (throws on failure)
+// __brokit_net_tcp_listen(port, host) → id (throws on failure)
 // ---------------------------------------------------------------------------
-static JSValue js_net_tcp_listen(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_tcp_listen(bronze::Value, std::span<const bronze::Value> args)
 {
     ensureSocketsInit();
-    if (argc < 1) return JS_ThrowTypeError(ctx, "tcp_listen: port required");
+    if (args.empty()) return ev::throwTypeError("tcp_listen: port required");
 
-    int port = 0;
-    JS_ToInt32(ctx, &port, argv[0]);
-    std::string host = "127.0.0.1"; // safe default: loopback unless told otherwise
-    if (argc >= 2 && JS_IsString(argv[1])) {
-        const char* s = JS_ToCString(ctx, argv[1]);
-        if (s) { host = s; JS_FreeCString(ctx, s); }
-    }
+    ArgReader reader(args);
+    int port = reader.getInt(0, 0);
+    std::string host = reader.getString(1, "127.0.0.1");
 
     std::string err;
     addrinfo* res = resolve(host, port, AF_UNSPEC, SOCK_STREAM, true, err);
-    if (!res) return JS_ThrowInternalError(ctx, "listen: %s", err.c_str());
+    if (!res) return ev::throwError("listen: " + err);
 
     socket_t fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd == BROKIT_INVALID_SOCKET) {
         std::string msg = sockErrorString(lastSockError());
         freeaddrinfo(res);
-        return JS_ThrowInternalError(ctx, "listen: socket: %s", msg.c_str());
+        return ev::throwError("listen: socket: " + msg);
     }
 #ifndef _WIN32
-    // POSIX: allow fast rebinding after a listener restarts (TIME_WAIT).
-    // Deliberately NOT set on Windows, where SO_REUSEADDR allows hijacking a
-    // port another process is actively listening on.
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one),
                sizeof(one));
@@ -386,8 +347,7 @@ static JSValue js_net_tcp_listen(JSContext* ctx, JSValueConst, int argc, JSValue
         std::string msg = sockErrorString(lastSockError());
         freeaddrinfo(res);
         brokit_closesocket(fd);
-        return JS_ThrowInternalError(ctx, "listen %s:%d: %s", host.c_str(), port,
-                                     msg.c_str());
+        return ev::throwError("listen " + host + ":" + std::to_string(port) + ": " + msg);
     }
     freeaddrinfo(res);
     setNonBlocking(fd);
@@ -398,34 +358,30 @@ static JSValue js_net_tcp_listen(JSContext* ctx, JSValueConst, int argc, JSValue
     h->fd = fd;
     cacheLocalInfo(h);
     g_handles[h->id] = h;
-    return JS_NewInt32(ctx, h->id);
+    return ev::fromDouble(h->id);
 }
 
 // ---------------------------------------------------------------------------
-// __brokit_net_tcp_connect(host, port) → id   (throws on immediate failure)
+// __brokit_net_tcp_connect(host, port) → id (throws on immediate failure)
 // ---------------------------------------------------------------------------
-static JSValue js_net_tcp_connect(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_tcp_connect(bronze::Value, std::span<const bronze::Value> args)
 {
     ensureSocketsInit();
-    if (argc < 2) return JS_ThrowTypeError(ctx, "tcp_connect: host and port required");
+    if (args.size() < 2) return ev::throwTypeError("tcp_connect: host and port required");
 
-    const char* hostC = JS_ToCString(ctx, argv[0]);
-    if (!hostC) return JS_EXCEPTION;
-    std::string host(hostC);
-    JS_FreeCString(ctx, hostC);
-    int port = 0;
-    JS_ToInt32(ctx, &port, argv[1]);
+    ArgReader reader(args);
+    std::string host = reader.getString(0, "");
+    int port = reader.getInt(1, 0);
 
     std::string err;
     addrinfo* res = resolve(host, port, AF_UNSPEC, SOCK_STREAM, false, err);
-    if (!res) return JS_ThrowInternalError(ctx, "connect %s:%d: %s", host.c_str(),
-                                           port, err.c_str());
+    if (!res) return ev::throwError("connect " + host + ":" + std::to_string(port) + ": " + err);
 
     socket_t fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd == BROKIT_INVALID_SOCKET) {
         std::string msg = sockErrorString(lastSockError());
         freeaddrinfo(res);
-        return JS_ThrowInternalError(ctx, "connect: socket: %s", msg.c_str());
+        return ev::throwError("connect: socket: " + msg);
     }
     setNonBlocking(fd);
 
@@ -437,54 +393,53 @@ static JSValue js_net_tcp_connect(JSContext* ctx, JSValueConst, int argc, JSValu
     int rc = ::connect(fd, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
     freeaddrinfo(res);
     if (rc == 0) {
-        // Connected synchronously (loopback often does).
         cacheLocalInfo(h);
         cacheRemoteInfo(h);
-        NetEvent ev;
-        ev.type = NetEvent::Type::Connect;
-        h->events.push_back(std::move(ev));
+        NetEvent evNet;
+        evNet.type = NetEvent::Type::Connect;
+        h->events.push_back(std::move(evNet));
     } else {
         int e = lastSockError();
         if (!errInProgress(e)) {
-            // Immediate failure — still return a handle; error surfaces as
-            // events so the JS Socket's error path is uniform.
             failHandle(h, "connect failed: " + sockErrorString(e));
         } else {
             h->connecting = true;
         }
     }
     g_handles[h->id] = h;
-    return JS_NewInt32(ctx, h->id);
+    return ev::fromDouble(h->id);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_write(id, data) → bool
 // ---------------------------------------------------------------------------
-static JSValue js_net_write(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_write(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_FALSE;
-    NetHandle* h = findHandle(ctx, argv[0]);
+    if (args.size() < 2) return ev::fromBool(false);
+    ArgReader reader(args);
+    NetHandle* h = findHandle(reader.getInt(0, 0));
     if (!h || h->kind != NetHandle::Kind::TcpConn || h->closed ||
         h->endRequested || h->wroteShutdown)
-        return JS_FALSE;
+        return ev::fromBool(false);
 
     std::vector<uint8_t> bytes;
-    if (!valueToBytes(ctx, argv[1], bytes))
-        return JS_ThrowTypeError(ctx, "write: data must be a string, ArrayBuffer or TypedArray");
+    if (!valueToBytes(reader.get(1), bytes))
+        return ev::throwTypeError("write: data must be a string, ArrayBuffer or TypedArray");
 
     h->outBuf.insert(h->outBuf.end(), bytes.begin(), bytes.end());
     if (!h->connecting) flushOutBuf(h);
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_end(id) — graceful: FIN after pending writes drain
 // ---------------------------------------------------------------------------
-static JSValue js_net_end(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_end(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_FALSE;
-    NetHandle* h = findHandle(ctx, argv[0]);
-    if (!h || h->kind != NetHandle::Kind::TcpConn || h->closed) return JS_FALSE;
+    if (args.empty()) return ev::fromBool(false);
+    ArgReader reader(args);
+    NetHandle* h = findHandle(reader.getInt(0, 0));
+    if (!h || h->kind != NetHandle::Kind::TcpConn || h->closed) return ev::fromBool(false);
     h->endRequested = true;
     if (!h->connecting) {
         flushOutBuf(h);
@@ -493,34 +448,35 @@ static JSValue js_net_end(JSContext* ctx, JSValueConst, int argc, JSValueConst* 
             queueClose(h, false);
         }
     }
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // ---------------------------------------------------------------------------
-// __brokit_net_close(id) — immediate teardown (destroy / server.close / udp close)
+// __brokit_net_close(id) — immediate teardown
 // ---------------------------------------------------------------------------
-static JSValue js_net_close(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_close(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_FALSE;
-    NetHandle* h = findHandle(ctx, argv[0]);
-    if (!h || h->closed) return JS_FALSE;
+    if (args.empty()) return ev::fromBool(false);
+    ArgReader reader(args);
+    NetHandle* h = findHandle(reader.getInt(0, 0));
+    if (!h || h->closed) return ev::fromBool(false);
     hardClose(h);
     queueClose(h, false);
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_udp_open(ipv6?) → id
 // ---------------------------------------------------------------------------
-static JSValue js_net_udp_open(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_udp_open(bronze::Value, std::span<const bronze::Value> args)
 {
     ensureSocketsInit();
-    bool ipv6 = argc >= 1 && JS_ToBool(ctx, argv[0]);
+    ArgReader reader(args);
+    bool ipv6 = reader.getBool(0, false);
 
     socket_t fd = ::socket(ipv6 ? AF_INET6 : AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd == BROKIT_INVALID_SOCKET)
-        return JS_ThrowInternalError(ctx, "udp_open: %s",
-                                     sockErrorString(lastSockError()).c_str());
+        return ev::throwError("udp_open: " + sockErrorString(lastSockError()));
     setNonBlocking(fd);
 
     auto* h = new NetHandle();
@@ -529,68 +485,60 @@ static JSValue js_net_udp_open(JSContext* ctx, JSValueConst, int argc, JSValueCo
     h->fd = fd;
     h->ipv6 = ipv6;
     g_handles[h->id] = h;
-    return JS_NewInt32(ctx, h->id);
+    return ev::fromDouble(h->id);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_udp_bind(id, port, host) → bool (throws on bind failure)
 // ---------------------------------------------------------------------------
-static JSValue js_net_udp_bind(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_udp_bind(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "udp_bind: id and port required");
-    NetHandle* h = findHandle(ctx, argv[0]);
-    if (!h || h->kind != NetHandle::Kind::Udp || h->closed) return JS_FALSE;
+    if (args.size() < 2) return ev::throwTypeError("udp_bind: id and port required");
+    ArgReader reader(args);
+    NetHandle* h = findHandle(reader.getInt(0, 0));
+    if (!h || h->kind != NetHandle::Kind::Udp || h->closed) return ev::fromBool(false);
 
-    int port = 0;
-    JS_ToInt32(ctx, &port, argv[1]);
-    std::string host = h->ipv6 ? "::1" : "127.0.0.1"; // safe default: loopback
-    if (argc >= 3 && JS_IsString(argv[2])) {
-        const char* s = JS_ToCString(ctx, argv[2]);
-        if (s) { host = s; JS_FreeCString(ctx, s); }
-    }
+    int port = reader.getInt(1, 0);
+    std::string defaultHost = h->ipv6 ? "::1" : "127.0.0.1";
+    std::string host = reader.getString(2, defaultHost);
 
     std::string err;
     addrinfo* res = resolve(host, port, h->ipv6 ? AF_INET6 : AF_INET,
                             SOCK_DGRAM, true, err);
-    if (!res) return JS_ThrowInternalError(ctx, "udp bind: %s", err.c_str());
+    if (!res) return ev::throwError("udp bind: " + err);
 
     int rc = ::bind(h->fd, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
     freeaddrinfo(res);
     if (rc != 0)
-        return JS_ThrowInternalError(ctx, "udp bind %s:%d: %s", host.c_str(), port,
-                                     sockErrorString(lastSockError()).c_str());
+        return ev::throwError("udp bind " + host + ":" + std::to_string(port) + ": " +
+                              sockErrorString(lastSockError()));
     cacheLocalInfo(h);
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_udp_send(id, data, port, host) → bool
-// Datagram semantics: sent immediately (no userspace queue); a full kernel
-// buffer drops the datagram, which is faithful UDP behavior.
 // ---------------------------------------------------------------------------
-static JSValue js_net_udp_send(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_udp_send(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 4) return JS_FALSE;
-    NetHandle* h = findHandle(ctx, argv[0]);
-    if (!h || h->kind != NetHandle::Kind::Udp || h->closed) return JS_FALSE;
+    if (args.size() < 4) return ev::fromBool(false);
+    ArgReader reader(args);
+    NetHandle* h = findHandle(reader.getInt(0, 0));
+    if (!h || h->kind != NetHandle::Kind::Udp || h->closed) return ev::fromBool(false);
 
     std::vector<uint8_t> bytes;
-    if (!valueToBytes(ctx, argv[1], bytes))
-        return JS_ThrowTypeError(ctx, "send: data must be a string, ArrayBuffer or TypedArray");
+    if (!valueToBytes(reader.get(1), bytes))
+        return ev::throwTypeError("send: data must be a string, ArrayBuffer or TypedArray");
 
-    int port = 0;
-    JS_ToInt32(ctx, &port, argv[2]);
-    const char* hostC = JS_ToCString(ctx, argv[3]);
-    if (!hostC) return JS_EXCEPTION;
-    std::string host(hostC);
-    JS_FreeCString(ctx, hostC);
+    int port = reader.getInt(2, 0);
+    std::string host = reader.getString(3, "");
 
     std::string err;
     addrinfo* res = resolve(host, port, h->ipv6 ? AF_INET6 : AF_INET,
                             SOCK_DGRAM, false, err);
     if (!res) {
         failHandle(h, "udp send resolve: " + err);
-        return JS_FALSE;
+        return ev::fromBool(false);
     }
     int n = ::sendto(h->fd, reinterpret_cast<const char*>(bytes.data()),
                      static_cast<int>(bytes.size()), 0, res->ai_addr,
@@ -598,110 +546,114 @@ static JSValue js_net_udp_send(JSContext* ctx, JSValueConst, int argc, JSValueCo
     freeaddrinfo(res);
     if (n < 0) {
         int e = lastSockError();
-        if (errWouldBlock(e)) return JS_FALSE; // kernel buffer full → dropped
+        if (errWouldBlock(e)) return ev::fromBool(false);
         failHandle(h, "udp send: " + sockErrorString(e));
-        return JS_FALSE;
+        return ev::fromBool(false);
     }
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_set_broadcast(id, on) → bool
 // ---------------------------------------------------------------------------
-static JSValue js_net_set_broadcast(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_set_broadcast(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_FALSE;
-    NetHandle* h = findHandle(ctx, argv[0]);
-    if (!h || h->kind != NetHandle::Kind::Udp || h->closed) return JS_FALSE;
-    int on = JS_ToBool(ctx, argv[1]) ? 1 : 0;
+    if (args.size() < 2) return ev::fromBool(false);
+    ArgReader reader(args);
+    NetHandle* h = findHandle(reader.getInt(0, 0));
+    if (!h || h->kind != NetHandle::Kind::Udp || h->closed) return ev::fromBool(false);
+    int on = reader.getBool(1, false) ? 1 : 0;
     int rc = setsockopt(h->fd, SOL_SOCKET, SO_BROADCAST,
                         reinterpret_cast<const char*>(&on), sizeof(on));
-    return JS_NewBool(ctx, rc == 0);
+    return ev::fromBool(rc == 0);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_info(id) → { localAddress, localPort, remoteAddress, remotePort }
 // ---------------------------------------------------------------------------
-static JSValue js_net_info(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_info(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_NULL;
-    NetHandle* h = findHandle(ctx, argv[0]);
-    if (!h) return JS_NULL;
+    if (args.empty()) return ev::null();
+    ArgReader reader(args);
+    NetHandle* h = findHandle(reader.getInt(0, 0));
+    if (!h) return ev::null();
     if (!h->closed && h->localAddress.empty()) cacheLocalInfo(h);
 
-    JSValue o = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, o, "localAddress", JS_NewString(ctx, h->localAddress.c_str()));
-    JS_SetPropertyStr(ctx, o, "localPort", JS_NewInt32(ctx, h->localPort));
-    JS_SetPropertyStr(ctx, o, "remoteAddress", JS_NewString(ctx, h->remoteAddress.c_str()));
-    JS_SetPropertyStr(ctx, o, "remotePort", JS_NewInt32(ctx, h->remotePort));
-    return o;
+    ObjectBuilder obj;
+    obj.set("localAddress", h->localAddress);
+    obj.set("localPort", static_cast<double>(h->localPort));
+    obj.set("remoteAddress", h->remoteAddress);
+    obj.set("remotePort", static_cast<double>(h->remotePort));
+    return obj.build();
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_poll(id) → event object | null
-// Delivering a Close event erases the handle (mirrors __brokit_ws_recv).
 // ---------------------------------------------------------------------------
-static JSValue js_net_poll(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_net_poll(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_NULL;
-    int id = 0;
-    JS_ToInt32(ctx, &id, argv[0]);
+    if (args.empty()) return ev::null();
+    ArgReader reader(args);
+    int id = reader.getInt(0, 0);
     auto it = g_handles.find(id);
-    if (it == g_handles.end()) return JS_NULL;
+    if (it == g_handles.end()) return ev::null();
     NetHandle* h = it->second;
-    if (h->events.empty()) return JS_NULL;
+    if (h->events.empty()) return ev::null();
 
-    NetEvent ev = std::move(h->events.front());
+    NetEvent evNet = std::move(h->events.front());
     h->events.pop_front();
 
-    JSValue o = JS_NewObject(ctx);
-    switch (ev.type) {
+    ObjectBuilder obj;
+    switch (evNet.type) {
     case NetEvent::Type::Accept:
-        JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx, "accept"));
-        JS_SetPropertyStr(ctx, o, "connId", JS_NewInt32(ctx, ev.connId));
-        JS_SetPropertyStr(ctx, o, "address", JS_NewString(ctx, ev.address.c_str()));
-        JS_SetPropertyStr(ctx, o, "port", JS_NewInt32(ctx, ev.port));
+        obj.set("type", "accept");
+        obj.set("connId", static_cast<double>(evNet.connId));
+        obj.set("address", evNet.address);
+        obj.set("port", static_cast<double>(evNet.port));
         break;
     case NetEvent::Type::Connect:
-        JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx, "connect"));
+        obj.set("type", "connect");
         break;
-    case NetEvent::Type::Data:
-        JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx, "data"));
-        JS_SetPropertyStr(ctx, o, "data",
-            JS_NewUint8ArrayCopy(ctx, ev.data.data(), ev.data.size()));
+    case NetEvent::Type::Data: {
+        obj.set("type", "data");
+        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(evNet.data.data(), evNet.data.size()));
+        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(evNet.data.size()));
+        obj.set("data", u8);
         break;
+    }
     case NetEvent::Type::End:
-        JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx, "end"));
+        obj.set("type", "end");
         break;
-    case NetEvent::Type::Message:
-        JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx, "message"));
-        JS_SetPropertyStr(ctx, o, "data",
-            JS_NewUint8ArrayCopy(ctx, ev.data.data(), ev.data.size()));
-        JS_SetPropertyStr(ctx, o, "address", JS_NewString(ctx, ev.address.c_str()));
-        JS_SetPropertyStr(ctx, o, "port", JS_NewInt32(ctx, ev.port));
-        JS_SetPropertyStr(ctx, o, "family", JS_NewString(ctx, ev.family.c_str()));
+    case NetEvent::Type::Message: {
+        obj.set("type", "message");
+        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(evNet.data.data(), evNet.data.size()));
+        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(evNet.data.size()));
+        obj.set("data", u8);
+        obj.set("address", evNet.address);
+        obj.set("port", static_cast<double>(evNet.port));
+        obj.set("family", evNet.family);
         break;
+    }
     case NetEvent::Type::Error:
-        JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx, "error"));
-        JS_SetPropertyStr(ctx, o, "message", JS_NewString(ctx, ev.message.c_str()));
+        obj.set("type", "error");
+        obj.set("message", evNet.message);
         break;
     case NetEvent::Type::Close:
-        JS_SetPropertyStr(ctx, o, "type", JS_NewString(ctx, "close"));
-        JS_SetPropertyStr(ctx, o, "hadError", JS_NewBool(ctx, ev.hadError));
-        // Close is always the final event; retire the handle.
+        obj.set("type", "close");
+        obj.set("hadError", evNet.hadError);
         g_handles.erase(it);
         delete h;
         break;
     }
-    return o;
+    return obj.build();
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_tick() — pump every socket, then let JS drain
 // ---------------------------------------------------------------------------
-static JSValue js_net_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static bronze::Value js_net_tick(bronze::Value, std::span<const bronze::Value>)
 {
-    if (g_handles.empty()) return JS_NewInt32(ctx, 0);
+    if (g_handles.empty()) return ev::fromDouble(0);
 
     // Snapshot ids — accepts insert into g_handles during iteration.
     std::vector<int> ids;
@@ -732,19 +684,17 @@ static JSValue js_net_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
                 cacheLocalInfo(c);
                 g_handles[c->id] = c;
 
-                NetEvent ev;
-                ev.type = NetEvent::Type::Accept;
-                ev.connId = c->id;
-                ev.address = c->remoteAddress;
-                ev.port = c->remotePort;
-                h->events.push_back(std::move(ev));
+                NetEvent evNet;
+                evNet.type = NetEvent::Type::Accept;
+                evNet.connId = c->id;
+                evNet.address = c->remoteAddress;
+                evNet.port = c->remotePort;
+                h->events.push_back(std::move(evNet));
             }
             break;
         }
         case NetHandle::Kind::TcpConn: {
             if (h->connecting) {
-                // Nonblocking connect progress: writable ⇒ done, then SO_ERROR
-                // says whether it succeeded.
                 fd_set wfds, efds;
                 FD_ZERO(&wfds);
                 FD_ZERO(&efds);
@@ -762,10 +712,10 @@ static JSValue js_net_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
                         h->connecting = false;
                         cacheLocalInfo(h);
                         cacheRemoteInfo(h);
-                        NetEvent ev;
-                        ev.type = NetEvent::Type::Connect;
-                        h->events.push_back(std::move(ev));
-                        flushOutBuf(h); // writes queued while connecting
+                        NetEvent evNet;
+                        evNet.type = NetEvent::Type::Connect;
+                        h->events.push_back(std::move(evNet));
+                        flushOutBuf(h);
                     } else {
                         failHandle(h, "connect failed: " +
                                           sockErrorString(soerr ? soerr :
@@ -785,20 +735,18 @@ static JSValue js_net_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
             for (int i = 0; i < 8 && !h->closed; i++) {
                 int n = ::recv(h->fd, buf, sizeof(buf), 0);
                 if (n > 0) {
-                    NetEvent ev;
-                    ev.type = NetEvent::Type::Data;
-                    ev.data.assign(buf, buf + n);
-                    h->events.push_back(std::move(ev));
+                    NetEvent evNet;
+                    evNet.type = NetEvent::Type::Data;
+                    evNet.data.assign(buf, buf + n);
+                    h->events.push_back(std::move(evNet));
                     continue;
                 }
                 if (n == 0) {
                     if (!h->peerEof) {
                         h->peerEof = true;
-                        NetEvent ev;
-                        ev.type = NetEvent::Type::End;
-                        h->events.push_back(std::move(ev));
-                        // Node allowHalfOpen:false semantics — answer FIN with
-                        // our own once pending writes drain.
+                        NetEvent evNet;
+                        evNet.type = NetEvent::Type::End;
+                        h->events.push_back(std::move(evNet));
                         h->endRequested = true;
                     }
                     break;
@@ -837,41 +785,33 @@ static JSValue js_net_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
                 if (n < 0) {
                     int e = lastSockError();
 #ifdef _WIN32
-                    // A previous send to a dead port surfaces here as
-                    // WSAECONNRESET (ICMP port unreachable). Not fatal for UDP.
                     if (e == WSAECONNRESET) continue;
 #endif
                     if (!errWouldBlock(e))
                         failHandle(h, "recvfrom failed: " + sockErrorString(e));
                     break;
                 }
-                NetEvent ev;
-                ev.type = NetEvent::Type::Message;
-                ev.data.assign(buf, buf + n);
-                describeAddr(reinterpret_cast<sockaddr*>(&ss), slen, ev.address, ev.port);
-                ev.family = (ss.ss_family == AF_INET6) ? "IPv6" : "IPv4";
-                h->events.push_back(std::move(ev));
+                NetEvent evNet;
+                evNet.type = NetEvent::Type::Message;
+                evNet.data.assign(buf, buf + n);
+                describeAddr(reinterpret_cast<sockaddr*>(&ss), slen, evNet.address, evNet.port);
+                evNet.family = (ss.ss_family == AF_INET6) ? "IPv6" : "IPv4";
+                h->events.push_back(std::move(evNet));
             }
             break;
         }
         }
     }
 
-    // Deliver queued events to the JS wrappers (net.js registers this hook).
+    // Deliver queued events to the JS wrappers
     {
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue drainFn = JS_GetPropertyStr(ctx, global, "__brokit_net_drain_all");
-        if (JS_IsFunction(ctx, drainFn)) {
-            JSValue ret = JS_Call(ctx, drainFn, JS_UNDEFINED, 0, nullptr);
-            if (JS_IsException(ret)) Runtime::checkException(ctx, ret);
-            JS_FreeValue(ctx, ret);
+        bronze::Value drainFn = ev::getGlobal("__brokit_net_drain_all");
+        if (ev::isFunction(drainFn)) {
+            ev::call(drainFn, ev::undefined(), {});
         }
-        JS_FreeValue(ctx, drainFn);
-        JS_FreeValue(ctx, global);
     }
 
-    // Reap orphans: fully-closed handles whose events nobody drained (raw
-    // binding users). One tick of grace, same policy as websocket.cpp.
+    // Reap orphans
     for (auto it = g_handles.begin(); it != g_handles.end();) {
         NetHandle* h = it->second;
         if (h->closed && ++h->closedSweeps > 1) {
@@ -882,60 +822,39 @@ static JSValue js_net_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
         }
     }
 
-    return JS_NewInt32(ctx, 0);
+    return ev::fromDouble(0);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_net_has_pending() → bool
-// True while any socket is live (a listener, bound UDP socket, or open TCP
-// connection can produce events with no other wakeup signal — same reasoning
-// as __brokit_ws_has_pending, and the same consequence: close your sockets or
-// the host keeps polling).
 // ---------------------------------------------------------------------------
-static JSValue js_net_has_pending(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static bronze::Value js_net_has_pending(bronze::Value, std::span<const bronze::Value>)
 {
     for (auto& [id, h] : g_handles) {
-        if (!h->closed) return JS_TRUE;
-        if (!h->events.empty()) return JS_TRUE;
+        if (!h->closed) return ev::fromBool(true);
+        if (!h->events.empty()) return ev::fromBool(true);
     }
-    return JS_FALSE;
+    return ev::fromBool(false);
 }
 
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
-void installNet(JSContext* ctx)
+void installNet()
 {
-    JSValue global = JS_GetGlobalObject(ctx);
-
-    JS_SetPropertyStr(ctx, global, "__brokit_net_tcp_listen",
-        JS_NewCFunction(ctx, js_net_tcp_listen, "__brokit_net_tcp_listen", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_tcp_connect",
-        JS_NewCFunction(ctx, js_net_tcp_connect, "__brokit_net_tcp_connect", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_write",
-        JS_NewCFunction(ctx, js_net_write, "__brokit_net_write", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_end",
-        JS_NewCFunction(ctx, js_net_end, "__brokit_net_end", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_close",
-        JS_NewCFunction(ctx, js_net_close, "__brokit_net_close", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_udp_open",
-        JS_NewCFunction(ctx, js_net_udp_open, "__brokit_net_udp_open", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_udp_bind",
-        JS_NewCFunction(ctx, js_net_udp_bind, "__brokit_net_udp_bind", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_udp_send",
-        JS_NewCFunction(ctx, js_net_udp_send, "__brokit_net_udp_send", 4));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_set_broadcast",
-        JS_NewCFunction(ctx, js_net_set_broadcast, "__brokit_net_set_broadcast", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_info",
-        JS_NewCFunction(ctx, js_net_info, "__brokit_net_info", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_poll",
-        JS_NewCFunction(ctx, js_net_poll, "__brokit_net_poll", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_tick",
-        JS_NewCFunction(ctx, js_net_tick, "__brokit_net_tick", 0));
-    JS_SetPropertyStr(ctx, global, "__brokit_net_has_pending",
-        JS_NewCFunction(ctx, js_net_has_pending, "__brokit_net_has_pending", 0));
-
-    JS_FreeValue(ctx, global);
+    ev::registerFunction("__brokit_net_tcp_listen", js_net_tcp_listen);
+    ev::registerFunction("__brokit_net_tcp_connect", js_net_tcp_connect);
+    ev::registerFunction("__brokit_net_write", js_net_write);
+    ev::registerFunction("__brokit_net_end", js_net_end);
+    ev::registerFunction("__brokit_net_close", js_net_close);
+    ev::registerFunction("__brokit_net_udp_open", js_net_udp_open);
+    ev::registerFunction("__brokit_net_udp_bind", js_net_udp_bind);
+    ev::registerFunction("__brokit_net_udp_send", js_net_udp_send);
+    ev::registerFunction("__brokit_net_set_broadcast", js_net_set_broadcast);
+    ev::registerFunction("__brokit_net_info", js_net_info);
+    ev::registerFunction("__brokit_net_poll", js_net_poll);
+    ev::registerFunction("__brokit_net_tick", js_net_tick);
+    ev::registerFunction("__brokit_net_has_pending", js_net_has_pending);
 }
 
 } // namespace brokit::api

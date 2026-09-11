@@ -1,18 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "buffer.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_buffer_main();
 
 namespace brokit::api {
 
-void installBuffer(JSContext* ctx)
+void installBuffer()
 {
-    JSValue r = JS_Eval(ctx, js_buffer, strlen(js_buffer), "<buffer>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_buffer_main);
 }
 
 } // namespace brokit::api

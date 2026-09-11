@@ -13,7 +13,7 @@ assertEqual(btoa('fooba'), 'Zm9vYmE=', 'btoa five chars');
 assertEqual(btoa('foobar'), 'Zm9vYmFy', 'btoa six chars');
 
 // --- btoa with binary data ---
-assertEqual(btoa('\x00\x01\x02'), 'AAEC', 'btoa binary');
+assertEqual(btoa(String.fromCharCode(0, 1, 2)), 'AAEC', 'btoa binary');
 assertEqual(btoa('\xff\xfe'), '//4=', 'btoa high bytes');
 assertEqual(btoa('Hello, World!'), 'SGVsbG8sIFdvcmxkIQ==', 'btoa hello world');
 

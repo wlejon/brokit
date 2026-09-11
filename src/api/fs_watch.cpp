@@ -1,8 +1,7 @@
 #include "api/fs_watch.h"
-
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "fs_watch.js.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
 
 #include <cstring>
 #include <filesystem>
@@ -10,6 +9,8 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+extern "C" void bronze_fs_watch_main();
 
 namespace brokit::api {
 
@@ -77,52 +78,13 @@ std::unique_ptr<FsWatcher> FsWatcher::create(const std::string& absPath,
 // JS bindings.
 // ---------------------------------------------------------------------------
 
-// Per-context registry: id -> FsWatcher. Lives in C++ statics keyed by JSContext.
-// Using a plain unordered_map is safe — JS is single-threaded and FsWatcher
-// owns its background thread internally.
 namespace {
 
 struct CtxState {
     std::unordered_map<int, std::unique_ptr<FsWatcher>> watchers;
 };
 
-static std::unordered_map<JSContext*, CtxState> g_state;
-
-CtxState& stateOf(JSContext* ctx) { return g_state[ctx]; }
-
-// Reuse fs.cpp's path resolver via the same global key. We re-implement it
-// here (rather than exposing a header symbol) because resolveFsPath is static
-// in fs.cpp; copying ~30 lines is cheaper than refactoring its visibility.
-static const char* kFsBasePathsKey = "__brokit_fs_base_paths";
-
-std::string resolvePath(JSContext* ctx, const char* path)
-{
-    fs::path p(path);
-    if (p.is_absolute()) return path;
-
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue arr    = JS_GetPropertyStr(ctx, global, kFsBasePathsKey);
-    std::string out = path;
-    if (JS_IsArray(arr)) {
-        JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
-        int32_t len = 0;
-        JS_ToInt32(ctx, &len, lenVal);
-        JS_FreeValue(ctx, lenVal);
-        for (int32_t i = len - 1; i >= 0; --i) {
-            JSValue elem = JS_GetPropertyUint32(ctx, arr, i);
-            const char* base = JS_ToCString(ctx, elem);
-            JS_FreeValue(ctx, elem);
-            if (!base) continue;
-            fs::path candidate = fs::path(base) / path;
-            JS_FreeCString(ctx, base);
-            std::error_code ec;
-            if (fs::exists(candidate, ec)) { out = candidate.string(); break; }
-        }
-    }
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, global);
-    return out;
-}
+thread_local CtxState g_state;
 
 const char* eventName(FsWatcher::EventType t)
 {
@@ -137,133 +99,87 @@ const char* eventName(FsWatcher::EventType t)
 } // namespace
 
 // __brokit_fs_watch_create(path, recursive) -> id (int) | throws
-static JSValue js_fs_watch_create(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_fs_watch_create(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "fs.watch: path required");
+    if (a.empty()) return ev::throwTypeError("fs.watch: path required");
 
-    const char* rawPath = JS_ToCString(ctx, argv[0]);
-    if (!rawPath) return JS_EXCEPTION;
-    std::string resolved = resolvePath(ctx, rawPath);
-    JS_FreeCString(ctx, rawPath);
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string resolved = resolveAssetPath(rawPath);
 
-    bool recursive = false;
-    if (argc >= 2) recursive = JS_ToBool(ctx, argv[1]);
+    bool recursive = a.size() >= 2 && ev::isBool(a[1]) && ev::toBool(a[1]);
 
     std::error_code ec;
     fs::path canonical = fs::weakly_canonical(resolved, ec);
     std::string absPath = ec ? resolved : canonical.string();
 
     if (!fs::exists(absPath)) {
-        return JS_ThrowReferenceError(
-            ctx, "fs.watch: path does not exist: %s", absPath.c_str());
+        return ev::throwTypeError(("fs.watch: path does not exist: " + absPath).c_str());
     }
 
     std::string err;
     auto w = FsWatcher::create(absPath, recursive, &err);
     if (!w) {
-        return JS_ThrowInternalError(
-            ctx, "fs.watch: %s", err.empty() ? "failed to start watcher" : err.c_str());
+        return ev::throwTypeError(
+            ("fs.watch: " + (err.empty() ? "failed to start watcher" : err)).c_str());
     }
 
     int id = w->id();
-    stateOf(ctx).watchers[id] = std::move(w);
-    return JS_NewInt32(ctx, id);
+    g_state.watchers[id] = std::move(w);
+    return ev::fromDouble(id);
 }
 
 // __brokit_fs_watch_close(id)
-static JSValue js_fs_watch_close(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_fs_watch_close(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_UNDEFINED;
-    int id = 0;
-    JS_ToInt32(ctx, &id, argv[0]);
-    auto& s = stateOf(ctx);
-    auto it = s.watchers.find(id);
-    if (it != s.watchers.end()) {
-        // Destructor joins the watcher thread.
-        s.watchers.erase(it);
-    }
-    return JS_UNDEFINED;
+    if (a.empty()) return ev::undefined();
+    int id = i32At(a, 0);
+    g_state.watchers.erase(id);
+    return ev::undefined();
 }
 
 // __brokit_fs_watch_tick() — drain every watcher, fire JS callbacks.
-// JS side installs `__brokit_fs_watch_dispatch(id, type, filename)` which
-// looks up the FSWatcher object and emits the appropriate event.
-static JSValue js_fs_watch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static bronze::Value js_fs_watch_tick(bronze::Value, std::span<const bronze::Value>)
 {
-    auto stateIt = g_state.find(ctx);
-    if (stateIt == g_state.end()) return JS_UNDEFINED;
+    bronze::Value dispatch = ev::getGlobal("__brokit_fs_watch_dispatch");
+    if (!ev::isFunction(dispatch)) return ev::undefined();
 
-    JSValue global   = JS_GetGlobalObject(ctx);
-    JSValue dispatch = JS_GetPropertyStr(ctx, global, "__brokit_fs_watch_dispatch");
-    bool haveDispatch = JS_IsFunction(ctx, dispatch);
-
-    // Drain everything into a flat (id, event) list first, then dispatch.
-    // A JS callback calling watcher.close() during dispatch will erase the
-    // watcher from this context's map; iterating that map directly would be
-    // a use-after-free. The JS-side dispatcher silently drops events for
-    // closed watchers (matches Node's fs.watch contract).
     struct Pending { int id; FsWatcher::Event ev; };
     std::vector<Pending> pending;
     {
         std::vector<FsWatcher::Event> buf;
-        for (auto& [id, w] : stateIt->second.watchers) {
+        for (auto& [id, w] : g_state.watchers) {
             buf.clear();
             w->drain(buf);
             for (auto& ev : buf) pending.push_back({id, std::move(ev)});
         }
     }
 
-    if (haveDispatch) {
-        for (auto& p : pending) {
-            JSValue args[3] = {
-                JS_NewInt32(ctx, p.id),
-                JS_NewString(ctx, eventName(p.ev.type)),
-                JS_NewString(ctx, p.ev.filename.c_str()),
-            };
-            JSValue ret = JS_Call(ctx, dispatch, JS_UNDEFINED, 3, args);
-            JS_FreeValue(ctx, args[0]);
-            JS_FreeValue(ctx, args[1]);
-            JS_FreeValue(ctx, args[2]);
-            if (JS_IsException(ret)) {
-                Runtime::checkException(ctx, ret);
-            } else {
-                JS_FreeValue(ctx, ret);
-            }
-        }
+    ev::Persistent dispP{dispatch};
+    for (auto& p : pending) {
+        ev::Persistent idVal{ev::fromDouble(p.id)};
+        ev::Persistent typeVal{ev::fromUtf8(eventName(p.ev.type))};
+        ev::Persistent fileVal{ev::fromUtf8(p.ev.filename)};
+        bronze::Value args[3] = { idVal.get(), typeVal.get(), fileVal.get() };
+        ev::call(dispP.get(), ev::undefined(), std::span<const bronze::Value>(args, 3));
     }
 
-    JS_FreeValue(ctx, dispatch);
-    JS_FreeValue(ctx, global);
-    return JS_UNDEFINED;
+    return ev::undefined();
 }
 
-// __brokit_fs_watch_has_pending() -> bool. Kept for symmetry with fetch / ws
-// and so test harnesses can decide when to stop pumping.
-static JSValue js_fs_watch_has_pending(JSContext* ctx, JSValueConst, int, JSValueConst*)
+// __brokit_fs_watch_has_pending() -> bool.
+static bronze::Value js_fs_watch_has_pending(bronze::Value, std::span<const bronze::Value>)
 {
-    auto stateIt = g_state.find(ctx);
-    if (stateIt == g_state.end()) return JS_NewBool(ctx, false);
-    return JS_NewBool(ctx, !stateIt->second.watchers.empty());
+    return ev::fromBool(!g_state.watchers.empty());
 }
 
-void installFSWatch(JSContext* ctx)
+void installFSWatch()
 {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_watch_create",
-        JS_NewCFunction(ctx, js_fs_watch_create, "__brokit_fs_watch_create", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_watch_close",
-        JS_NewCFunction(ctx, js_fs_watch_close, "__brokit_fs_watch_close", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_watch_tick",
-        JS_NewCFunction(ctx, js_fs_watch_tick, "__brokit_fs_watch_tick", 0));
-    JS_SetPropertyStr(ctx, global, "__brokit_fs_watch_has_pending",
-        JS_NewCFunction(ctx, js_fs_watch_has_pending, "__brokit_fs_watch_has_pending", 0));
-    JS_FreeValue(ctx, global);
+    ev::setGlobalFunction("__brokit_fs_watch_create", 2, js_fs_watch_create);
+    ev::setGlobalFunction("__brokit_fs_watch_close", 1, js_fs_watch_close);
+    ev::setGlobalFunction("__brokit_fs_watch_tick", 0, js_fs_watch_tick);
+    ev::setGlobalFunction("__brokit_fs_watch_has_pending", 0, js_fs_watch_has_pending);
 
-    // Install the JS facade (FSWatcher class + fs.watch wiring).
-    JSValue r = JS_Eval(ctx, js_fs_watch, strlen(js_fs_watch),
-                        "<fs_watch>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) Runtime::checkException(ctx, r);
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_fs_watch_main);
 }
 
 } // namespace brokit::api

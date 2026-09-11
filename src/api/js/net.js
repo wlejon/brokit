@@ -33,7 +33,7 @@
                 var fn = _drains[key];
                 if (!fn) break;
                 try { fn(ev); } catch (e) {
-                    if (globalThis.console && console.error)
+                    if (globalThis.console && globalThis.console.error)
                         console.error('net drain error:', e && e.message ? e.message : e);
                 }
                 if (ev.type === 'close') break; // native handle is gone

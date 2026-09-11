@@ -2,130 +2,162 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 
-extern "C" {
-#include "quickjs.h"
+#include "embed/embed.h"
+
+namespace bronze::embed {
+inline bool isDouble(Value v) { return isNumber(v); }
+inline void setGlobalValue(std::string_view name, Value val) {
+    registerGlobal(name, val);
+    auto g = globalValue("globalThis");
+    if (g.found && isObject(g.value)) setProperty(g.value, name, val);
 }
+inline void setGlobalFunction(std::string_view name, uint32_t arity, NativeFn fn) {
+    auto f = makeFunction(std::move(fn), arity, name);
+    registerGlobal(name, f);
+    auto g = globalValue("globalThis");
+    if (g.found && isObject(g.value)) setProperty(g.value, name, f);
+}
+inline void registerFunction(std::string_view name, NativeFn fn, uint32_t arity = 0) {
+    auto f = makeFunction(std::move(fn), arity, name);
+    registerGlobal(name, f);
+    auto g = globalValue("globalThis");
+    if (g.found && isObject(g.value)) setProperty(g.value, name, f);
+}
+inline Value getGlobal(std::string_view name) {
+    auto gv = globalValue(name);
+    return gv.found ? gv.value : undefined();
+}
+} // namespace bronze::embed
 
 namespace brokit::api {
 
-/// Install all brokit APIs on the given context.
-/// Call this once after creating the Runtime.
-void installAll(JSContext* ctx);
+namespace ev = bronze::embed;
+namespace elements = bronze::embed::elements;
+using Value = bronze::Value;
+
+/// Helper wrapping ev::Persistent with valid()/reset() semantics
+class PersistentSlot {
+public:
+    PersistentSlot() = default;
+    explicit PersistentSlot(bronze::Value v) : p_(v) {}
+
+    bool valid() const { return !bronze::embed::isUndefined(p_.get()); }
+    void reset() { p_.set(bronze::embed::undefined()); }
+    void set(bronze::Value v) { p_.set(v); }
+    bronze::Value get() const { return p_.get(); }
+
+private:
+    bronze::embed::Persistent p_;
+};
+
+void pushRequireDir(const std::filesystem::path& dir);
+void popRequireDir();
+
+struct RequireDirGuard {
+    explicit RequireDirGuard(const std::filesystem::path& dir) {
+        pushRequireDir(dir);
+    }
+    ~RequireDirGuard() {
+        popRequireDir();
+    }
+    RequireDirGuard(const RequireDirGuard&) = delete;
+    RequireDirGuard& operator=(const RequireDirGuard&) = delete;
+};
+
+/// Install all brokit APIs into the current thread's Bronze runtime.
+void installAll();
 
 // Individual API installers — consumers can pick and choose.
-void installConsole(JSContext* ctx);
-void installTimers(JSContext* ctx);
-void installURL(JSContext* ctx);
-void installCrypto(JSContext* ctx);
-void installSubtleCrypto(JSContext* ctx);
-void installEncoding(JSContext* ctx);
-void installTreeWalker(JSContext* ctx);
-void installAbortController(JSContext* ctx);
-void installStructuredClone(JSContext* ctx);
-void installBlob(JSContext* ctx);
-void installURLObject(JSContext* ctx);
-void installProcess(JSContext* ctx);
-void installOS(JSContext* ctx);
-void installPath(JSContext* ctx);
-void installReadableStream(JSContext* ctx);
-void installFetch(JSContext* ctx);
-/// Tear down per-context fetch state. Cancels in-flight requests, frees curl
-/// handles, and releases owned JSValues. Call before JS_FreeContext if the
-/// runtime is being destroyed while fetches may still be pending.
-void uninstallFetch(JSContext* ctx);
-void installFS(JSContext* ctx);
-void installFSWatch(JSContext* ctx);
-void installChildProcess(JSContext* ctx);
-void installStorage(JSContext* ctx);
-void setStoragePath(JSContext* ctx, const std::string& path);
-void cleanupStorage(JSContext* ctx);
-void installIndexedDB(JSContext* ctx);
-void installIndexedDBJS(JSContext* ctx);
-void setIndexedDBPath(JSContext* ctx, const std::string& path);
-void cleanupIndexedDB(JSContext* ctx);
-void installWritableStream(JSContext* ctx);
-void installWebSocket(JSContext* ctx);
-void installWebSocketJS(JSContext* ctx);
+void installConsole();
+void installTimers();
+void installURL();
+void installCrypto();
+void installSubtleCrypto();
+void installEncoding();
+void installTreeWalker();
+void installAbortController();
+void installStructuredClone();
+void installBlob();
+void installURLObject();
+void installProcess();
+void installOS();
+void installPath();
+void installReadableStream();
+void installFetch();
+/// Tear down per-context fetch state. Cancels in-flight requests and frees curl handles.
+void uninstallFetch();
+void installFS();
+void installFSWatch();
+void installChildProcess();
+void installStorage();
+void setStoragePath(const std::string& path);
+void cleanupStorage();
+void installIndexedDB();
+void installIndexedDBJS();
+void setIndexedDBPath(const std::string& path);
+void cleanupIndexedDB();
+void installWritableStream();
+void installWebSocket();
+void installWebSocketJS();
 /// Raw TCP/UDP sockets: native __brokit_net_* bindings (nonblocking, pumped
 /// by the host via __brokit_net_tick like fetch/websocket).
-void installNet(JSContext* ctx);
+void installNet();
 /// Node-compat `net` + `dgram` modules over installNet. Requires
 /// installEvents (EventEmitter) to have run first.
-void installNetJS(JSContext* ctx);
+void installNetJS();
 /// RFC 6455 WebSocketServer over the `net` module. Requires installNetJS,
 /// installEncoding, installBase64, and installTimers to have run first.
-void installWebSocketServerJS(JSContext* ctx);
-void installEventSource(JSContext* ctx);
-void installFormData(JSContext* ctx);
-void installFetchClasses(JSContext* ctx);
-void installBase64(JSContext* ctx);
-void installNavigator(JSContext* ctx);
-void installEventTarget(JSContext* ctx);
-void installMessageChannel(JSContext* ctx);
-void installBuffer(JSContext* ctx);
-void installCompression(JSContext* ctx);
-void installEvents(JSContext* ctx);
-void installUtil(JSContext* ctx);
+void installWebSocketServerJS();
+void installEventSource();
+void installFormData();
+void installFetchClasses();
+void installBase64();
+void installNavigator();
+void installEventTarget();
+void installMessageChannel();
+void installBuffer();
+void installCompression();
+void installEvents();
+void installUtil();
 #ifdef BROKIT_HAS_NOISE
-void installNoise(JSContext* ctx);
+void installNoise();
 #endif
 #ifdef BROKIT_HAS_IMAGE
-void installImage(JSContext* ctx);
+void installImage();
 #endif
 
 /// Add a base path for local file fetch resolution.
 /// Paths are searched in overlay order (last added = checked first).
 /// Call after installFetch() or installAll().
-void addFetchBasePath(JSContext* ctx, const std::string& path);
+void addFetchBasePath(const std::string& path);
 
 /// Add a base path for fs module relative path resolution.
 /// Relative paths are resolved against base paths (last added = checked first).
 /// Call after installFS() or installAll().
-void addFsBasePath(JSContext* ctx, const std::string& path);
+void addFsBasePath(const std::string& path);
 
 /// Mount a virtual prefix for both fs and fetch resolution. Paths beginning
 /// with "<prefix>/..." (or exactly "<prefix>") are rewritten to
 /// "<absPath>/<remainder>" before any base-path lookup.
-///
-/// Mount prefixes always start with `/` and have no trailing slash. The
-/// rewritten absolute path takes precedence over both base paths and the
-/// filesystem-absolute interpretation, so `/lib/foo.js` resolves through
-/// the mount even when `/lib/foo.js` happens to exist on disk.
-///
-/// Call after installFS() / installFetch() / installAll().
-void addFsPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath);
-void addFetchPrefixMount(JSContext* ctx, const std::string& prefix, const std::string& absPath);
+void addFsPrefixMount(const std::string& prefix, const std::string& absPath);
+void addFetchPrefixMount(const std::string& prefix, const std::string& absPath);
 
 /// Resolve a path the same way fs.* does: /<prefix>/... mounts and absolute
 /// paths are returned as-is; a relative path is checked against registered fs
 /// base paths (most-recently-added first) and rewritten to the first existing
 /// candidate, or returned unchanged if none exist (so it then resolves
 /// against the process's OS working directory).
-///
-/// For native bindings that take a path/dir argument straight from a JS
-/// string and hand it to C++ file I/O without going through fs.* (e.g. model
-/// loaders like bro.tts.loadKokoro) — resolve through this at the JS call
-/// boundary so their behavior matches fs.existsSync() regardless of which
-/// directory the process was actually launched from.
-std::string resolveAssetPath(JSContext* ctx, const std::string& path);
+std::string resolveAssetPath(const std::string& path);
 
-/// Bytes behind a Blob or File value, without copying and without going
-/// through the async `arrayBuffer()` / `text()` methods.
-///
-/// The web only exposes a Blob's contents asynchronously, which is fine for JS
-/// and wrong for a host: `URL.createObjectURL(blob)` returns its URL
-/// synchronously, so anything that has to resolve that URL natively — an
-/// <img src>, a texture upload, a media element — needs the bytes at the same
-/// instant, not a microtask later. The data is already sitting in the Blob's
-/// C++ buffer; this hands out a view of it.
-///
-/// Returns false if `val` is not a Blob or File — distinct from a Blob that
-/// happens to be empty, which returns true with *len == 0. The pointer belongs
-/// to the Blob and stays valid until it is garbage-collected, so copy before
-/// handing it anywhere that outlives the call. Never throws.
-bool blobBytes(JSContext* ctx, JSValueConst val, const uint8_t** data,
+/// Bytes behind a Blob or File value, without copying.
+/// Returns false if `val` is not a Blob or File.
+bool blobBytes(bronze::Value val, const uint8_t** data,
                size_t* len, std::string* type = nullptr);
 
 } // namespace brokit::api

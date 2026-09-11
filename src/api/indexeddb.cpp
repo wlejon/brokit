@@ -1,18 +1,15 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
 
 #include <cstring>
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <sstream>
-#include <algorithm>
+#include <span>
+#include <cstdio>
 
 #include "sqlite3.h"
-
-extern "C" {
-#include "quickjs.h"
-}
 
 namespace brokit::api {
 
@@ -26,59 +23,25 @@ namespace brokit::api {
 // Each database is a SQLite file: <basePath>/<dbName>.idb
 // ---------------------------------------------------------------------------
 
-static const char* kIdbBasePath = "__brokit_idb_base_path";
+struct IdbState {
+    std::unordered_map<std::string, sqlite3*> dbs;
+};
 
-static std::string getBasePath(JSContext* ctx) {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue val = JS_GetPropertyStr(ctx, global, kIdbBasePath);
-    std::string path;
-    if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) { path = s; JS_FreeCString(ctx, s); }
-    }
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, global);
-    return path;
-}
+static thread_local IdbState g_idbState;
+static thread_local std::string g_idbBasePath = ".";
 
-static std::string dbPath(JSContext* ctx, const std::string& name) {
-    std::string base = getBasePath(ctx);
+static std::string dbPath(const std::string& name) {
+    std::string base = g_idbBasePath;
     if (base.empty()) base = ".";
     if (base.back() != '/' && base.back() != '\\') base += '/';
     return base + name + ".idb";
 }
 
-// ---------------------------------------------------------------------------
-// DB handle cache — one SQLite connection per database name per context
-// ---------------------------------------------------------------------------
-struct IdbState {
-    std::unordered_map<std::string, sqlite3*> dbs;
-};
+static sqlite3* openDb(const std::string& name) {
+    auto it = g_idbState.dbs.find(name);
+    if (it != g_idbState.dbs.end()) return it->second;
 
-static const char* kIdbStateKey = "__brokit_idb_state_ptr";
-
-static IdbState* getIdbState(JSContext* ctx) {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue val = JS_GetPropertyStr(ctx, global, kIdbStateKey);
-    IdbState* state = nullptr;
-    if (JS_IsNumber(val)) {
-        int64_t ptr = 0;
-        JS_ToInt64(ctx, &ptr, val);
-        state = reinterpret_cast<IdbState*>(static_cast<intptr_t>(ptr));
-    }
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, global);
-    return state;
-}
-
-static sqlite3* openDb(JSContext* ctx, const std::string& name) {
-    auto* state = getIdbState(ctx);
-    if (!state) return nullptr;
-
-    auto it = state->dbs.find(name);
-    if (it != state->dbs.end()) return it->second;
-
-    std::string path = dbPath(ctx, name);
+    std::string path = dbPath(name);
     sqlite3* db = nullptr;
     int rc = sqlite3_open(path.c_str(), &db);
     if (rc != SQLITE_OK) {
@@ -93,7 +56,7 @@ static sqlite3* openDb(JSContext* ctx, const std::string& name) {
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS __idb_meta "
                       "(key TEXT PRIMARY KEY, value TEXT)", nullptr, nullptr, nullptr);
 
-    state->dbs[name] = db;
+    g_idbState.dbs[name] = db;
     return db;
 }
 
@@ -122,371 +85,265 @@ static void setVersion(sqlite3* db, int version) {
 // ---------------------------------------------------------------------------
 
 // __brokit_idb_open(name, version) → { db handle info }
-// Returns synchronously — real IndexedDB is async, JS wrapper handles that
-static JSValue js_idb_open(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_open(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "idb_open: name required");
+    if (args.empty()) return ev::throwTypeError("idb_open: name required");
 
-    const char* name = JS_ToCString(ctx, argv[0]);
-    if (!name) return JS_EXCEPTION;
-    std::string dbName(name);
-    JS_FreeCString(ctx, name);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    int requestedVersion = reader.getInt(1, 1);
 
-    int requestedVersion = 1;
-    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
-        JS_ToInt32(ctx, &requestedVersion, argv[1]);
-    }
-
-    sqlite3* db = openDb(ctx, dbName);
+    sqlite3* db = openDb(dbName);
     if (!db) {
-        return JS_ThrowInternalError(ctx, "idb_open: failed to open database");
+        return ev::throwError("idb_open: failed to open database");
     }
 
     int currentVersion = getVersion(db);
     bool needsUpgrade = (requestedVersion > currentVersion);
 
-    JSValue result = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, result, "name", JS_NewString(ctx, dbName.c_str()));
-    JS_SetPropertyStr(ctx, result, "version", JS_NewInt32(ctx, requestedVersion));
-    JS_SetPropertyStr(ctx, result, "oldVersion", JS_NewInt32(ctx, currentVersion));
-    JS_SetPropertyStr(ctx, result, "needsUpgrade", JS_NewBool(ctx, needsUpgrade));
+    ObjectBuilder result;
+    result.set("name", dbName);
+    result.set("version", static_cast<double>(requestedVersion));
+    result.set("oldVersion", static_cast<double>(currentVersion));
+    result.set("needsUpgrade", needsUpgrade);
 
     if (needsUpgrade) {
         setVersion(db, requestedVersion);
     }
 
-    return result;
+    return result.build();
 }
 
 // __brokit_idb_create_store(dbName, storeName, options?)
-static JSValue js_idb_create_store(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_create_store(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "create_store: dbName and storeName required");
+    if (args.size() < 2) return ev::throwTypeError("create_store: dbName and storeName required");
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
-    if (!dbName || !storeName) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        return JS_EXCEPTION;
-    }
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
 
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-
+    sqlite3* db = openDb(dbName);
     if (!db) {
-        JS_FreeCString(ctx, storeName);
-        return JS_ThrowInternalError(ctx, "create_store: database not open");
+        return ev::throwError("create_store: database not open");
     }
 
     // Check for autoIncrement option
     bool autoIncrement = false;
     std::string keyPath;
-    if (argc >= 3 && JS_IsObject(argv[2])) {
-        JSValue ai = JS_GetPropertyStr(ctx, argv[2], "autoIncrement");
-        autoIncrement = JS_ToBool(ctx, ai);
-        JS_FreeValue(ctx, ai);
+    if (args.size() >= 3 && ev::isObject(args[2])) {
+        bronze::Value ai = ev::getProperty(args[2], "autoIncrement");
+        autoIncrement = ev::isBool(ai) && ev::toBool(ai);
 
-        JSValue kp = JS_GetPropertyStr(ctx, argv[2], "keyPath");
-        if (JS_IsString(kp)) {
-            const char* s = JS_ToCString(ctx, kp);
-            if (s) { keyPath = s; JS_FreeCString(ctx, s); }
+        bronze::Value kp = ev::getProperty(args[2], "keyPath");
+        if (ev::isString(kp)) {
+            keyPath = ev::toUtf8(kp);
         }
-        JS_FreeValue(ctx, kp);
     }
 
     // Create table — key column + value column (JSON)
     std::string sql;
     if (autoIncrement) {
-        sql = "CREATE TABLE IF NOT EXISTS [" + std::string(storeName) +
+        sql = "CREATE TABLE IF NOT EXISTS [" + storeName +
               "](key INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)";
     } else {
-        sql = "CREATE TABLE IF NOT EXISTS [" + std::string(storeName) +
+        sql = "CREATE TABLE IF NOT EXISTS [" + storeName +
               "](key TEXT PRIMARY KEY, value TEXT)";
     }
 
     char* errMsg = nullptr;
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
-    JS_FreeCString(ctx, storeName);
 
     if (rc != SQLITE_OK) {
         std::string err = errMsg ? errMsg : "SQL error";
         if (errMsg) sqlite3_free(errMsg);
-        return JS_ThrowInternalError(ctx, "create_store: %s", err.c_str());
+        return ev::throwError("create_store: " + err);
     }
 
-    // Store metadata (keyPath, autoIncrement) in __idb_meta
-    // (simplified — store as store_<name>_keyPath etc.)
-
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // __brokit_idb_delete_store(dbName, storeName)
-static JSValue js_idb_delete_store(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_delete_store(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_FALSE;
+    if (args.size() < 2) return ev::fromBool(false);
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
-    if (!dbName || !storeName) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        return JS_FALSE;
-    }
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
 
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
+    sqlite3* db = openDb(dbName);
+    if (!db) return ev::fromBool(false);
 
-    if (!db) { JS_FreeCString(ctx, storeName); return JS_FALSE; }
-
-    std::string sql = "DROP TABLE IF EXISTS [" + std::string(storeName) + "]";
-    JS_FreeCString(ctx, storeName);
+    std::string sql = "DROP TABLE IF EXISTS [" + storeName + "]";
     sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr);
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // __brokit_idb_put(dbName, storeName, key, value) → key
-static JSValue js_idb_put(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_put(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 4) return JS_ThrowTypeError(ctx, "idb_put: requires dbName, storeName, key, value");
+    if (args.size() < 4) return ev::throwTypeError("idb_put: requires dbName, storeName, key, value");
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
-    const char* key = JS_ToCString(ctx, argv[2]);
-    const char* value = JS_ToCString(ctx, argv[3]);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
+    std::string key = reader.getString(2, "");
+    std::string value = reader.getString(3, "");
 
-    if (!dbName || !storeName || !key || !value) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        if (key) JS_FreeCString(ctx, key);
-        if (value) JS_FreeCString(ctx, value);
-        return JS_EXCEPTION;
-    }
-
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-
+    sqlite3* db = openDb(dbName);
     if (!db) {
-        JS_FreeCString(ctx, storeName);
-        JS_FreeCString(ctx, key);
-        JS_FreeCString(ctx, value);
-        return JS_ThrowInternalError(ctx, "idb_put: database not open");
+        return ev::throwError("idb_put: database not open");
     }
 
-    std::string sql = "INSERT OR REPLACE INTO [" + std::string(storeName) +
+    std::string sql = "INSERT OR REPLACE INTO [" + storeName +
                       "](key, value) VALUES(?, ?)";
-    JS_FreeCString(ctx, storeName);
 
     sqlite3_stmt* stmt;
     int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        JS_FreeCString(ctx, key);
-        JS_FreeCString(ctx, value);
-        return JS_ThrowInternalError(ctx, "idb_put: %s", sqlite3_errmsg(db));
+        return ev::throwError(std::string("idb_put: ") + sqlite3_errmsg(db));
     }
 
-    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, value.c_str(), -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 
-    JSValue result = JS_NewString(ctx, key);
-    JS_FreeCString(ctx, key);
-    JS_FreeCString(ctx, value);
-
     if (rc != SQLITE_DONE) {
-        JS_FreeValue(ctx, result);
-        return JS_ThrowInternalError(ctx, "idb_put: %s", sqlite3_errmsg(db));
+        return ev::throwError(std::string("idb_put: ") + sqlite3_errmsg(db));
     }
 
-    return result;
+    return ev::fromUtf8(key);
 }
 
 // __brokit_idb_get(dbName, storeName, key) → value string | undefined
-static JSValue js_idb_get(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_get(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 3) return JS_UNDEFINED;
+    if (args.size() < 3) return ev::undefined();
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
-    const char* key = JS_ToCString(ctx, argv[2]);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
+    std::string key = reader.getString(2, "");
 
-    if (!dbName || !storeName || !key) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        if (key) JS_FreeCString(ctx, key);
-        return JS_UNDEFINED;
-    }
+    sqlite3* db = openDb(dbName);
+    if (!db) return ev::undefined();
 
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-
-    if (!db) {
-        JS_FreeCString(ctx, storeName);
-        JS_FreeCString(ctx, key);
-        return JS_UNDEFINED;
-    }
-
-    std::string sql = "SELECT value FROM [" + std::string(storeName) + "] WHERE key=?";
-    JS_FreeCString(ctx, storeName);
+    std::string sql = "SELECT value FROM [" + storeName + "] WHERE key=?";
 
     sqlite3_stmt* stmt;
     int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        JS_FreeCString(ctx, key);
-        return JS_UNDEFINED;
+        return ev::undefined();
     }
 
-    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
-    JS_FreeCString(ctx, key);
+    sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
 
-    JSValue result = JS_UNDEFINED;
+    bronze::Value result = ev::undefined();
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        if (val) result = JS_NewString(ctx, val);
+        if (val) result = ev::fromUtf8(val);
     }
     sqlite3_finalize(stmt);
     return result;
 }
 
 // __brokit_idb_delete(dbName, storeName, key) → bool
-static JSValue js_idb_delete(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_delete(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 3) return JS_FALSE;
+    if (args.size() < 3) return ev::fromBool(false);
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
-    const char* key = JS_ToCString(ctx, argv[2]);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
+    std::string key = reader.getString(2, "");
 
-    if (!dbName || !storeName || !key) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        if (key) JS_FreeCString(ctx, key);
-        return JS_FALSE;
-    }
+    sqlite3* db = openDb(dbName);
+    if (!db) return ev::fromBool(false);
 
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-
-    if (!db) {
-        JS_FreeCString(ctx, storeName);
-        JS_FreeCString(ctx, key);
-        return JS_FALSE;
-    }
-
-    std::string sql = "DELETE FROM [" + std::string(storeName) + "] WHERE key=?";
-    JS_FreeCString(ctx, storeName);
+    std::string sql = "DELETE FROM [" + storeName + "] WHERE key=?";
 
     sqlite3_stmt* stmt;
     int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) { JS_FreeCString(ctx, key); return JS_FALSE; }
+    if (rc != SQLITE_OK) return ev::fromBool(false);
 
-    sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
-    JS_FreeCString(ctx, key);
+    sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return JS_NewBool(ctx, rc == SQLITE_DONE);
+    return ev::fromBool(rc == SQLITE_DONE);
 }
 
 // __brokit_idb_clear(dbName, storeName) → bool
-static JSValue js_idb_clear(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_clear(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_FALSE;
+    if (args.size() < 2) return ev::fromBool(false);
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
 
-    if (!dbName || !storeName) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        return JS_FALSE;
-    }
+    sqlite3* db = openDb(dbName);
+    if (!db) return ev::fromBool(false);
 
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-
-    if (!db) { JS_FreeCString(ctx, storeName); return JS_FALSE; }
-
-    std::string sql = "DELETE FROM [" + std::string(storeName) + "]";
-    JS_FreeCString(ctx, storeName);
-    return JS_NewBool(ctx, sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    std::string sql = "DELETE FROM [" + storeName + "]";
+    return ev::fromBool(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 // __brokit_idb_get_all(dbName, storeName, limit?) → [[key, value], ...]
-static JSValue js_idb_get_all(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_get_all(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_NewArray(ctx);
+    if (args.size() < 2) return hostArrayOf(std::span<const bronze::Value>{});
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
+    int limit = reader.getInt(2, -1);
 
-    if (!dbName || !storeName) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        return JS_NewArray(ctx);
-    }
+    sqlite3* db = openDb(dbName);
+    if (!db) return hostArrayOf(std::span<const bronze::Value>{});
 
-    int limit = -1;
-    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
-        JS_ToInt32(ctx, &limit, argv[2]);
-    }
-
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-
-    if (!db) { JS_FreeCString(ctx, storeName); return JS_NewArray(ctx); }
-
-    std::string sql = "SELECT key, value FROM [" + std::string(storeName) + "] ORDER BY key";
+    std::string sql = "SELECT key, value FROM [" + storeName + "] ORDER BY key";
     if (limit > 0) sql += " LIMIT " + std::to_string(limit);
-    JS_FreeCString(ctx, storeName);
 
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        return JS_NewArray(ctx);
+        return hostArrayOf(std::span<const bronze::Value>{});
     }
 
-    JSValue arr = JS_NewArray(ctx);
-    uint32_t idx = 0;
+    std::vector<bronze::Value> rows;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char* key = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-
-        JSValue pair = JS_NewArray(ctx);
-        JS_SetPropertyUint32(ctx, pair, 0, key ? JS_NewString(ctx, key) : JS_NULL);
-        JS_SetPropertyUint32(ctx, pair, 1, val ? JS_NewString(ctx, val) : JS_NULL);
-        JS_SetPropertyUint32(ctx, arr, idx++, pair);
+        bronze::Value pairArr[2] = {
+            key ? ev::fromUtf8(key) : ev::null(),
+            val ? ev::fromUtf8(val) : ev::null()
+        };
+        rows.push_back(hostArrayOf(std::span<const bronze::Value>(pairArr, 2)));
     }
     sqlite3_finalize(stmt);
-    return arr;
+    return hostArrayOf(rows);
 }
 
 // __brokit_idb_count(dbName, storeName) → int
-static JSValue js_idb_count(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_count(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_NewInt32(ctx, 0);
+    if (args.size() < 2) return ev::fromDouble(0);
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    const char* storeName = JS_ToCString(ctx, argv[1]);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
+    std::string storeName = reader.getString(1, "");
 
-    if (!dbName || !storeName) {
-        if (dbName) JS_FreeCString(ctx, dbName);
-        if (storeName) JS_FreeCString(ctx, storeName);
-        return JS_NewInt32(ctx, 0);
-    }
+    sqlite3* db = openDb(dbName);
+    if (!db) return ev::fromDouble(0);
 
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-
-    if (!db) { JS_FreeCString(ctx, storeName); return JS_NewInt32(ctx, 0); }
-
-    std::string sql = "SELECT COUNT(*) FROM [" + std::string(storeName) + "]";
-    JS_FreeCString(ctx, storeName);
+    std::string sql = "SELECT COUNT(*) FROM [" + storeName + "]";
 
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        return JS_NewInt32(ctx, 0);
+        return ev::fromDouble(0);
     }
 
     int count = 0;
@@ -494,131 +351,91 @@ static JSValue js_idb_count(JSContext* ctx, JSValueConst, int argc, JSValueConst
         count = sqlite3_column_int(stmt, 0);
     }
     sqlite3_finalize(stmt);
-    return JS_NewInt32(ctx, count);
+    return ev::fromDouble(count);
 }
 
 // __brokit_idb_store_names(dbName) → [name, ...]
-static JSValue js_idb_store_names(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_store_names(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_NewArray(ctx);
+    if (args.empty()) return hostArrayOf(std::span<const bronze::Value>{});
 
-    const char* dbName = JS_ToCString(ctx, argv[0]);
-    if (!dbName) return JS_NewArray(ctx);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
 
-    sqlite3* db = openDb(ctx, std::string(dbName));
-    JS_FreeCString(ctx, dbName);
-    if (!db) return JS_NewArray(ctx);
+    sqlite3* db = openDb(dbName);
+    if (!db) return hostArrayOf(std::span<const bronze::Value>{});
 
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db,
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '__idb_%'",
             -1, &stmt, nullptr) != SQLITE_OK) {
-        return JS_NewArray(ctx);
+        return hostArrayOf(std::span<const bronze::Value>{});
     }
 
-    JSValue arr = JS_NewArray(ctx);
-    uint32_t idx = 0;
+    std::vector<bronze::Value> names;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char* name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        if (name) JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, name));
+        if (name) names.push_back(ev::fromUtf8(name));
     }
     sqlite3_finalize(stmt);
-    return arr;
+    return hostArrayOf(names);
 }
 
 // __brokit_idb_delete_db(name) → bool
-static JSValue js_idb_delete_db(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_idb_delete_db(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_FALSE;
+    if (args.empty()) return ev::fromBool(false);
 
-    const char* name = JS_ToCString(ctx, argv[0]);
-    if (!name) return JS_FALSE;
-    std::string dbName(name);
-    JS_FreeCString(ctx, name);
+    ArgReader reader(args);
+    std::string dbName = reader.getString(0, "");
 
     // Close if open
-    auto* state = getIdbState(ctx);
-    if (state) {
-        auto it = state->dbs.find(dbName);
-        if (it != state->dbs.end()) {
-            sqlite3_close(it->second);
-            state->dbs.erase(it);
-        }
+    auto it = g_idbState.dbs.find(dbName);
+    if (it != g_idbState.dbs.end()) {
+        sqlite3_close(it->second);
+        g_idbState.dbs.erase(it);
     }
 
     // Delete the file
-    std::string path = dbPath(ctx, dbName);
+    std::string path = dbPath(dbName);
     remove(path.c_str());
     // Also remove WAL and SHM files
     remove((path + "-wal").c_str());
     remove((path + "-shm").c_str());
 
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 
-void installIndexedDB(JSContext* ctx)
+void installIndexedDB()
 {
-    auto* state = new IdbState();
-
-    JSValue global = JS_GetGlobalObject(ctx);
-
-    JS_SetPropertyStr(ctx, global, kIdbStateKey,
-                      JS_NewInt64(ctx, static_cast<int64_t>(
-                          reinterpret_cast<intptr_t>(state))));
-
-    // Default base path — current directory
-    JS_SetPropertyStr(ctx, global, kIdbBasePath, JS_NewString(ctx, "."));
-
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_open",
-        JS_NewCFunction(ctx, js_idb_open, "__brokit_idb_open", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_create_store",
-        JS_NewCFunction(ctx, js_idb_create_store, "__brokit_idb_create_store", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_delete_store",
-        JS_NewCFunction(ctx, js_idb_delete_store, "__brokit_idb_delete_store", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_put",
-        JS_NewCFunction(ctx, js_idb_put, "__brokit_idb_put", 4));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_get",
-        JS_NewCFunction(ctx, js_idb_get, "__brokit_idb_get", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_delete",
-        JS_NewCFunction(ctx, js_idb_delete, "__brokit_idb_delete", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_clear",
-        JS_NewCFunction(ctx, js_idb_clear, "__brokit_idb_clear", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_get_all",
-        JS_NewCFunction(ctx, js_idb_get_all, "__brokit_idb_get_all", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_count",
-        JS_NewCFunction(ctx, js_idb_count, "__brokit_idb_count", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_store_names",
-        JS_NewCFunction(ctx, js_idb_store_names, "__brokit_idb_store_names", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_idb_delete_db",
-        JS_NewCFunction(ctx, js_idb_delete_db, "__brokit_idb_delete_db", 1));
-
-    JS_FreeValue(ctx, global);
+    ev::registerFunction("__brokit_idb_open", js_idb_open);
+    ev::registerFunction("__brokit_idb_create_store", js_idb_create_store);
+    ev::registerFunction("__brokit_idb_delete_store", js_idb_delete_store);
+    ev::registerFunction("__brokit_idb_put", js_idb_put);
+    ev::registerFunction("__brokit_idb_get", js_idb_get);
+    ev::registerFunction("__brokit_idb_delete", js_idb_delete);
+    ev::registerFunction("__brokit_idb_clear", js_idb_clear);
+    ev::registerFunction("__brokit_idb_get_all", js_idb_get_all);
+    ev::registerFunction("__brokit_idb_count", js_idb_count);
+    ev::registerFunction("__brokit_idb_store_names", js_idb_store_names);
+    ev::registerFunction("__brokit_idb_delete_db", js_idb_delete_db);
 }
 
-void setIndexedDBPath(JSContext* ctx, const std::string& path)
+void setIndexedDBPath(const std::string& path)
 {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, kIdbBasePath, JS_NewString(ctx, path.c_str()));
-    JS_FreeValue(ctx, global);
+    g_idbBasePath = path;
 }
 
-void cleanupIndexedDB(JSContext* ctx)
+void cleanupIndexedDB()
 {
-    auto* state = getIdbState(ctx);
-    if (state) {
-        for (auto& [name, db] : state->dbs) {
-            sqlite3_close(db);
-        }
-        delete state;
+    for (auto& [name, db] : g_idbState.dbs) {
+        if (db) sqlite3_close(db);
     }
-
-    JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, kIdbStateKey, JS_UNDEFINED);
-    JS_FreeValue(ctx, global);
+    g_idbState.dbs.clear();
 }
 
 } // namespace brokit::api

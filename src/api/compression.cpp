@@ -1,34 +1,17 @@
 // CompressionStream / DecompressionStream — native codec layer.
-//
-// This file implements the incremental DEFLATE codec behind the web-standard
-// CompressionStream / DecompressionStream classes (the class shells live in
-// js/compression.js and wrap this in a TransformStream). Three formats:
-//
-//   "deflate"      ZLIB-wrapped DEFLATE (RFC 1950) — header + adler32 trailer
-//   "deflate-raw"  raw DEFLATE (RFC 1951) — no wrapper
-//   "gzip"         gzip (RFC 1952) — header + crc32/size trailer
-//
-// miniz handles the RFC 1950/1951 streams natively; the gzip header/trailer
-// (and its crc32/ISIZE bookkeeping) is implemented here around a raw stream.
-//
-// The JS side sees one hidden factory:
-//   __brokit_compression.create(mode, format)  →  codec object with
-//     .push(u8)   feed input, returns whatever output is ready (Uint8Array)
-//     .finish()   flush + emit trailer / verify trailer, returns Uint8Array
-//
-// All data errors (corrupt stream, truncated stream, trailing garbage, bad
-// gzip header/trailer) throw TypeError, matching Chrome's behavior of
-// erroring the stream with a TypeError.
 
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "compression.js.h"
+#include "api/arg_reader.h"
+#include "api/host_class.h"
+#include "api/object_builder.h"
 
 #include "miniz.h"
 
 #include <cstring>
 #include <string>
 #include <vector>
+
+extern "C" void bronze_compression_main();
 
 namespace brokit::api {
 
@@ -68,30 +51,20 @@ struct CodecState {
     }
 };
 
-// thread_local: each thread (main + each worker) has its own JSRuntime, so
-// each must allocate its own class ID from that runtime's counter (same
-// pattern as blob.cpp).
-thread_local JSClassID codecClassId = 0;
+static HostClass g_codecClass;
 
-void codecFinalizer(JSRuntime*, JSValue val)
+static void codecDtor(void* p)
 {
-    delete static_cast<CodecState*>(JS_GetOpaque(val, codecClassId));
+    delete static_cast<CodecState*>(p);
 }
 
-JSClassDef codecClassDef = {
-    "CompressionCodec",
-    codecFinalizer,
-    nullptr, nullptr, nullptr
-};
-
-CodecState* getCodec(JSContext* ctx, JSValueConst thisVal)
+static CodecState* getCodec(bronze::Value thisVal)
 {
-    auto* st = static_cast<CodecState*>(JS_GetOpaque(thisVal, codecClassId));
-    if (!st) JS_ThrowTypeError(ctx, "not a compression codec");
+    auto* st = static_cast<CodecState*>(g_codecClass.unwrap(thisVal));
     return st;
 }
 
-bool initDeflate(CodecState* st)
+static bool initDeflate(CodecState* st)
 {
     int windowBits = (st->format == Format::Zlib) ? MZ_DEFAULT_WINDOW_BITS
                                                   : -MZ_DEFAULT_WINDOW_BITS;
@@ -101,7 +74,7 @@ bool initDeflate(CodecState* st)
     return st->strmLive;
 }
 
-bool initInflate(CodecState* st)
+static bool initInflate(CodecState* st)
 {
     int windowBits = (st->format == Format::Zlib) ? MZ_DEFAULT_WINDOW_BITS
                                                   : -MZ_DEFAULT_WINDOW_BITS;
@@ -110,326 +83,295 @@ bool initInflate(CodecState* st)
     return st->strmLive;
 }
 
-void put32le(std::vector<uint8_t>& out, uint32_t v)
+static bronze::Value makeU8(const std::vector<uint8_t>& buf)
 {
-    out.push_back(static_cast<uint8_t>(v & 0xff));
-    out.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
-    out.push_back(static_cast<uint8_t>((v >> 16) & 0xff));
-    out.push_back(static_cast<uint8_t>((v >> 24) & 0xff));
+    bronze::Value v = ev::createTypedArray(elements::Uint8, static_cast<uint32_t>(buf.size()));
+    ev::fillTypedArray(v, buf);
+    return v;
 }
 
-// 10-byte fixed gzip header: magic, CM=deflate, no flags, mtime 0, XFL 0,
-// OS 255 (unknown).
-void writeGzipHeader(std::vector<uint8_t>& out)
+static bool pumpDeflate(CodecState* st, int flush, std::vector<uint8_t>& out)
 {
-    static const uint8_t hdr[10] = { 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff };
-    out.insert(out.end(), hdr, hdr + 10);
-}
-
-// Try to parse a complete gzip header from st->hdr. Returns the number of
-// header bytes consumed, 0 if more input is needed, or -1 on a malformed
-// header (bad magic / compression method / reserved flags).
-long parseGzipHeader(const std::vector<uint8_t>& h)
-{
-    if (h.size() < 10) return 0;
-    if (h[0] != 0x1f || h[1] != 0x8b) return -1;
-    if (h[2] != 8) return -1; // CM must be deflate
-    uint8_t flg = h[3];
-    if (flg & 0xe0) return -1; // reserved flag bits must be zero
-    size_t pos = 10;
-    if (flg & 0x04) { // FEXTRA: 2-byte little-endian length + payload
-        if (h.size() < pos + 2) return 0;
-        size_t xlen = h[pos] | (static_cast<size_t>(h[pos + 1]) << 8);
-        pos += 2;
-        if (h.size() < pos + xlen) return 0;
-        pos += xlen;
-    }
-    if (flg & 0x08) { // FNAME: NUL-terminated
-        while (pos < h.size() && h[pos] != 0) pos++;
-        if (pos >= h.size()) return 0;
-        pos++;
-    }
-    if (flg & 0x10) { // FCOMMENT: NUL-terminated
-        while (pos < h.size() && h[pos] != 0) pos++;
-        if (pos >= h.size()) return 0;
-        pos++;
-    }
-    if (flg & 0x02) { // FHCRC: 2-byte header crc (not verified — Chrome skips it too)
-        if (h.size() < pos + 2) return 0;
-        pos += 2;
-    }
-    return static_cast<long>(pos);
-}
-
-// Run mz_deflate/mz_inflate over [data, data+len), appending all produced
-// output to `out`. Returns MZ_OK / MZ_STREAM_END on success, else an error.
-// On MZ_STREAM_END, *remaining reports how many input bytes were NOT consumed.
-int pump(CodecState* st, const uint8_t* data, size_t len, int flushMode,
-         std::vector<uint8_t>& out, size_t* remaining)
-{
-    uint8_t buf[65536];
-    st->strm.next_in = data;
-    st->strm.avail_in = static_cast<unsigned int>(len);
+    uint8_t buf[16384];
     for (;;) {
         st->strm.next_out = buf;
         st->strm.avail_out = sizeof(buf);
-        int rc = st->compress ? mz_deflate(&st->strm, flushMode)
-                              : mz_inflate(&st->strm, flushMode);
-        size_t produced = sizeof(buf) - st->strm.avail_out;
-        if (produced) out.insert(out.end(), buf, buf + produced);
-        if (rc == MZ_STREAM_END) {
-            if (remaining) *remaining = st->strm.avail_in;
-            return MZ_STREAM_END;
+        int rc = mz_deflate(&st->strm, flush);
+        size_t written = sizeof(buf) - st->strm.avail_out;
+        if (written > 0) {
+            out.insert(out.end(), buf, buf + written);
         }
-        if (rc == MZ_BUF_ERROR) {
-            // No progress possible — needs more input (or, under MZ_FINISH
-            // with pending output, another spin, which `produced` covers).
-            if (produced == 0) { if (remaining) *remaining = st->strm.avail_in; return MZ_OK; }
-            continue;
-        }
-        if (rc != MZ_OK) return rc;
-        if (st->strm.avail_in == 0 && st->strm.avail_out != 0 && flushMode != MZ_FINISH) {
-            if (remaining) *remaining = 0;
-            return MZ_OK;
-        }
-        // Otherwise keep looping: either input remains or output filled the
-        // buffer exactly (or MZ_FINISH still draining).
-    }
-}
-
-JSValue makeU8(JSContext* ctx, const std::vector<uint8_t>& bytes)
-{
-    JSValue ab = JS_NewArrayBufferCopy(ctx, bytes.data(), bytes.size());
-    if (JS_IsException(ab)) return ab;
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
-    JS_FreeValue(ctx, global);
-    JSValue u8 = JS_CallConstructor(ctx, ctor, 1, &ab);
-    JS_FreeValue(ctx, ctor);
-    JS_FreeValue(ctx, ab);
-    return u8;
-}
-
-// Decompress `data` (post-gzip-header for gzip). Handles end-of-stream +
-// trailer/trailing-garbage policing. Returns false with a pending JS
-// exception on error.
-bool decompressChunk(JSContext* ctx, CodecState* st, const uint8_t* data,
-                     size_t len, std::vector<uint8_t>& out)
-{
-    if (st->finished) {
-        // Deflate stream already ended. gzip still collects its 8 trailer
-        // bytes; anything beyond that (any format) is trailing garbage.
-        if (st->format == Format::Gzip && st->trailer.size() < 8) {
-            size_t need = 8 - st->trailer.size();
-            size_t take = len < need ? len : need;
-            st->trailer.insert(st->trailer.end(), data, data + take);
-            data += take;
-            len -= take;
-        }
-        if (len > 0) {
-            JS_ThrowTypeError(ctx, "junk found after end of compressed data");
-            return false;
-        }
-        return true;
-    }
-
-    size_t before = out.size();
-    size_t remaining = 0;
-    int rc = pump(st, data, len, MZ_NO_FLUSH, out, &remaining);
-    if (rc != MZ_OK && rc != MZ_STREAM_END) {
-        JS_ThrowTypeError(ctx, "invalid compressed data (%s)", mz_error(rc));
-        return false;
-    }
-    if (st->format == Format::Gzip) {
-        size_t produced = out.size() - before;
-        if (produced) {
-            st->crcOut = mz_crc32(st->crcOut, out.data() + before, produced);
-            st->totalOut += produced;
-        }
-    }
-    if (rc == MZ_STREAM_END) {
-        st->finished = true;
-        if (remaining > 0) {
-            // Recurse once into the finished-path to consume the gzip
-            // trailer / detect trailing garbage.
-            return decompressChunk(ctx, st, data + (len - remaining), remaining, out);
-        }
+        if (rc == MZ_STREAM_END) return true;
+        if (rc != MZ_OK && rc != MZ_BUF_ERROR) return false;
+        if (st->strm.avail_out > 0) break;
     }
     return true;
 }
 
-JSValue js_codec_push(JSContext* ctx, JSValueConst thisVal, int argc,
-                      JSValueConst* argv)
+static bool pumpInflate(CodecState* st, std::vector<uint8_t>& out, bool& streamEnd)
 {
-    CodecState* st = getCodec(ctx, thisVal);
-    if (!st) return JS_EXCEPTION;
-    if (st->closed) return JS_ThrowTypeError(ctx, "codec is finished");
-    if (argc < 1) return JS_ThrowTypeError(ctx, "push: expected a Uint8Array");
+    uint8_t buf[16384];
+    streamEnd = false;
+    for (;;) {
+        st->strm.next_out = buf;
+        st->strm.avail_out = sizeof(buf);
+        int rc = mz_inflate(&st->strm, MZ_NO_FLUSH);
+        size_t written = sizeof(buf) - st->strm.avail_out;
+        if (written > 0) {
+            out.insert(out.end(), buf, buf + written);
+            st->crcOut = mz_crc32(st->crcOut, buf, written);
+            st->totalOut += written;
+        }
+        if (rc == MZ_STREAM_END) {
+            streamEnd = true;
+            return true;
+        }
+        if (rc != MZ_OK && rc != MZ_BUF_ERROR) return false;
+        if (st->strm.avail_out > 0) break;
+    }
+    return true;
+}
 
-    size_t byteOffset = 0, byteLen = 0, bpe = 0;
-    JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[0], &byteOffset, &byteLen, &bpe);
-    if (JS_IsException(ab)) return ab;
-    size_t abLen = 0;
-    uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, ab);
-    JS_FreeValue(ctx, ab); // argv[0] keeps the buffer alive for this call
-    if (!abPtr && byteLen > 0)
-        return JS_ThrowTypeError(ctx, "push: detached buffer");
-    const uint8_t* data = abPtr + byteOffset;
+static size_t parseGzipHeader(const uint8_t* p, size_t len)
+{
+    if (len < 10) return 0;
+    if (p[0] != 0x1f || p[1] != 0x8b) return 0;
+    if (p[2] != 8) return 0; // CM_DEFLATE
+    uint8_t flg = p[3];
+    size_t off = 10;
+
+    if (flg & 0x04) { // FEXTRA
+        if (off + 2 > len) return 0;
+        uint16_t xlen = static_cast<uint16_t>(p[off]) |
+                        (static_cast<uint16_t>(p[off + 1]) << 8);
+        off += 2 + xlen;
+        if (off > len) return 0;
+    }
+    if (flg & 0x08) { // FNAME
+        while (off < len && p[off] != 0) off++;
+        if (off >= len) return 0;
+        off++;
+    }
+    if (flg & 0x10) { // FCOMMENT
+        while (off < len && p[off] != 0) off++;
+        if (off >= len) return 0;
+        off++;
+    }
+    if (flg & 0x02) { // FHCRC
+        if (off + 2 > len) return 0;
+        off += 2;
+    }
+    return off;
+}
+
+static bronze::Value codecPush(bronze::Value thisVal, std::span<const bronze::Value> a)
+{
+    auto* st = getCodec(thisVal);
+    if (!st) return ev::throwTypeError("not a compression codec");
+    if (st->closed) return ev::throwTypeError("codec is closed");
+
+    if (a.empty()) return ev::throwTypeError("push() expects a chunk");
+    auto info = ev::typedArrayInfo(a[0]);
+    if (!info) return ev::throwTypeError("push() expects a TypedArray");
+
+    const uint8_t* inPtr = info.data;
+    size_t inLen = info.byteLength;
 
     std::vector<uint8_t> out;
 
     if (st->compress) {
         if (!st->strmLive && !initDeflate(st))
-            return JS_ThrowTypeError(ctx, "deflate init failed");
-        if (st->format == Format::Gzip) {
-            if (!st->wroteGzipHeader) {
-                writeGzipHeader(out);
-                st->wroteGzipHeader = true;
-            }
-            if (byteLen) st->crcIn = mz_crc32(st->crcIn, data, byteLen);
-            st->totalIn += byteLen;
+            return ev::throwTypeError("failed to initialize compressor");
+
+        if (st->format == Format::Gzip && !st->wroteGzipHeader) {
+            static const uint8_t kGzHdr[10] = {
+                0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03
+            };
+            out.insert(out.end(), kGzHdr, kGzHdr + sizeof(kGzHdr));
+            st->wroteGzipHeader = true;
         }
-        int rc = pump(st, data, byteLen, MZ_NO_FLUSH, out, nullptr);
-        if (rc != MZ_OK && rc != MZ_STREAM_END)
-            return JS_ThrowTypeError(ctx, "deflate failed (%s)", mz_error(rc));
+
+        if (inLen > 0) {
+            st->crcIn = mz_crc32(st->crcIn, inPtr, inLen);
+            st->totalIn += inLen;
+            st->strm.next_in = inPtr;
+            st->strm.avail_in = static_cast<unsigned int>(inLen);
+            if (!pumpDeflate(st, MZ_NO_FLUSH, out))
+                return ev::throwTypeError("deflate failed");
+        }
     } else {
-        size_t len = byteLen;
-        if (st->format == Format::Gzip && !st->headerDone) {
-            st->hdr.insert(st->hdr.end(), data, data + len);
-            long used = parseGzipHeader(st->hdr);
-            if (used < 0)
-                return JS_ThrowTypeError(ctx, "invalid gzip header");
-            if (used == 0)
-                return makeU8(ctx, out); // need more header bytes
-            st->headerDone = true;
-            if (!initInflate(st))
-                return JS_ThrowTypeError(ctx, "inflate init failed");
-            // Feed what followed the header out of the buffered bytes.
-            std::vector<uint8_t> rest(st->hdr.begin() + used, st->hdr.end());
-            st->hdr.clear();
-            st->hdr.shrink_to_fit();
-            if (!rest.empty() &&
-                !decompressChunk(ctx, st, rest.data(), rest.size(), out))
-                return JS_EXCEPTION;
-            return makeU8(ctx, out);
+        if (st->finished) {
+            if (st->format == Format::Gzip) {
+                st->trailer.insert(st->trailer.end(), inPtr, inPtr + inLen);
+                return makeU8(out);
+            }
+            if (inLen > 0)
+                return ev::throwTypeError("unexpected data after end of stream");
+            return makeU8(out);
         }
+
+        if (st->format == Format::Gzip && !st->headerDone) {
+            st->hdr.insert(st->hdr.end(), inPtr, inPtr + inLen);
+            size_t hdrSize = parseGzipHeader(st->hdr.data(), st->hdr.size());
+            if (hdrSize == 0) {
+                if (st->hdr.size() >= 2 && (st->hdr[0] != 0x1f || st->hdr[1] != 0x8b))
+                    return ev::throwTypeError("not a gzip stream (bad magic)");
+                return makeU8(out);
+            }
+            st->headerDone = true;
+            if (!st->strmLive && !initInflate(st))
+                return ev::throwTypeError("failed to initialize decompressor");
+
+            size_t remainder = st->hdr.size() - hdrSize;
+            if (remainder > 0) {
+                st->strm.next_in = st->hdr.data() + hdrSize;
+                st->strm.avail_in = static_cast<unsigned int>(remainder);
+                bool end = false;
+                if (!pumpInflate(st, out, end))
+                    return ev::throwTypeError("inflate failed");
+                if (end) {
+                    st->finished = true;
+                    if (st->strm.avail_in > 0) {
+                        st->trailer.insert(st->trailer.end(),
+                                           st->strm.next_in,
+                                           st->strm.next_in + st->strm.avail_in);
+                    }
+                }
+            }
+            return makeU8(out);
+        }
+
         if (!st->strmLive && !initInflate(st))
-            return JS_ThrowTypeError(ctx, "inflate init failed");
-        if (!decompressChunk(ctx, st, data, len, out))
-            return JS_EXCEPTION;
+            return ev::throwTypeError("failed to initialize decompressor");
+
+        if (inLen > 0) {
+            st->strm.next_in = inPtr;
+            st->strm.avail_in = static_cast<unsigned int>(inLen);
+            bool end = false;
+            if (!pumpInflate(st, out, end))
+                return ev::throwTypeError("inflate failed");
+            if (end) {
+                st->finished = true;
+                if (st->strm.avail_in > 0) {
+                    if (st->format == Format::Gzip) {
+                        st->trailer.insert(st->trailer.end(),
+                                           st->strm.next_in,
+                                           st->strm.next_in + st->strm.avail_in);
+                    } else {
+                        return ev::throwTypeError("unexpected trailing bytes after stream");
+                    }
+                }
+            }
+        }
     }
 
-    return makeU8(ctx, out);
+    return makeU8(out);
 }
 
-JSValue js_codec_finish(JSContext* ctx, JSValueConst thisVal, int, JSValueConst*)
+static bronze::Value codecFinish(bronze::Value thisVal, std::span<const bronze::Value>)
 {
-    CodecState* st = getCodec(ctx, thisVal);
-    if (!st) return JS_EXCEPTION;
-    if (st->closed) return JS_ThrowTypeError(ctx, "codec is finished");
+    auto* st = getCodec(thisVal);
+    if (!st) return ev::throwTypeError("not a compression codec");
+    if (st->closed) return ev::throwTypeError("codec is already closed");
     st->closed = true;
 
     std::vector<uint8_t> out;
 
     if (st->compress) {
         if (!st->strmLive && !initDeflate(st))
-            return JS_ThrowTypeError(ctx, "deflate init failed");
+            return ev::throwTypeError("failed to initialize compressor");
+
         if (st->format == Format::Gzip && !st->wroteGzipHeader) {
-            writeGzipHeader(out);
+            static const uint8_t kGzHdr[10] = {
+                0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03
+            };
+            out.insert(out.end(), kGzHdr, kGzHdr + sizeof(kGzHdr));
             st->wroteGzipHeader = true;
         }
-        int rc = pump(st, nullptr, 0, MZ_FINISH, out, nullptr);
-        if (rc != MZ_STREAM_END)
-            return JS_ThrowTypeError(ctx, "deflate flush failed (%s)", mz_error(rc));
-        st->finished = true;
+
+        st->strm.next_in = nullptr;
+        st->strm.avail_in = 0;
+        if (!pumpDeflate(st, MZ_FINISH, out))
+            return ev::throwTypeError("deflate finish failed");
+
         if (st->format == Format::Gzip) {
-            put32le(out, static_cast<uint32_t>(st->crcIn));
-            put32le(out, static_cast<uint32_t>(st->totalIn & 0xffffffffu));
+            uint32_t crc = static_cast<uint32_t>(st->crcIn);
+            uint32_t isize = static_cast<uint32_t>(st->totalIn & 0xffffffffu);
+            uint8_t tr[8] = {
+                static_cast<uint8_t>(crc & 0xff),
+                static_cast<uint8_t>((crc >> 8) & 0xff),
+                static_cast<uint8_t>((crc >> 16) & 0xff),
+                static_cast<uint8_t>((crc >> 24) & 0xff),
+                static_cast<uint8_t>(isize & 0xff),
+                static_cast<uint8_t>((isize >> 8) & 0xff),
+                static_cast<uint8_t>((isize >> 16) & 0xff),
+                static_cast<uint8_t>((isize >> 24) & 0xff),
+            };
+            out.insert(out.end(), tr, tr + sizeof(tr));
         }
-        return makeU8(ctx, out);
+        return makeU8(out);
     }
 
-    // Decompression: closing before the compressed stream (and, for gzip,
-    // its full 8-byte trailer) has been seen is a truncation error.
     if (!st->finished)
-        return JS_ThrowTypeError(ctx, "compressed data was truncated");
+        return ev::throwTypeError("compressed data was truncated");
     if (st->format == Format::Gzip) {
         if (st->trailer.size() < 8)
-            return JS_ThrowTypeError(ctx, "gzip trailer was truncated");
+            return ev::throwTypeError("gzip trailer was truncated");
+        if (st->trailer.size() > 8)
+            return ev::throwTypeError("unexpected trailing bytes after gzip stream");
         const uint8_t* t = st->trailer.data();
         uint32_t crc = static_cast<uint32_t>(t[0]) | (static_cast<uint32_t>(t[1]) << 8) |
                        (static_cast<uint32_t>(t[2]) << 16) | (static_cast<uint32_t>(t[3]) << 24);
         uint32_t isize = static_cast<uint32_t>(t[4]) | (static_cast<uint32_t>(t[5]) << 8) |
                          (static_cast<uint32_t>(t[6]) << 16) | (static_cast<uint32_t>(t[7]) << 24);
         if (crc != static_cast<uint32_t>(st->crcOut))
-            return JS_ThrowTypeError(ctx, "gzip crc32 check failed");
+            return ev::throwTypeError("gzip crc32 check failed");
         if (isize != static_cast<uint32_t>(st->totalOut & 0xffffffffu))
-            return JS_ThrowTypeError(ctx, "gzip size check failed");
+            return ev::throwTypeError("gzip size check failed");
     }
-    return makeU8(ctx, out);
+    return makeU8(out);
 }
 
-// __brokit_compression.create(mode, format)
-JSValue js_codec_create(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value codecCreate(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2)
-        return JS_ThrowTypeError(ctx, "create(mode, format) expects 2 arguments");
-    const char* modeStr = JS_ToCString(ctx, argv[0]);
-    if (!modeStr) return JS_EXCEPTION;
-    std::string mode(modeStr);
-    JS_FreeCString(ctx, modeStr);
-    const char* fmtStr = JS_ToCString(ctx, argv[1]);
-    if (!fmtStr) return JS_EXCEPTION;
-    std::string fmt(fmtStr);
-    JS_FreeCString(ctx, fmtStr);
+    if (a.size() < 2)
+        return ev::throwTypeError("create(mode, format) expects 2 arguments");
+
+    std::string mode = ev::toUtf8(a[0]);
+    std::string fmt = ev::toUtf8(a[1]);
 
     bool compress = (mode == "compress");
     if (!compress && mode != "decompress")
-        return JS_ThrowTypeError(ctx, "unknown codec mode '%s'", mode.c_str());
+        return ev::throwTypeError(("unknown codec mode '" + mode + "'").c_str());
 
     Format format;
     if (fmt == "gzip") format = Format::Gzip;
     else if (fmt == "deflate") format = Format::Zlib;
     else if (fmt == "deflate-raw") format = Format::Raw;
-    else return JS_ThrowTypeError(ctx, "Unsupported compression format: '%s'", fmt.c_str());
+    else return ev::throwTypeError(("Unsupported compression format: '" + fmt + "'").c_str());
 
-    JSValue obj = JS_NewObjectClass(ctx, static_cast<int>(codecClassId));
-    if (JS_IsException(obj)) return obj;
     auto* st = new CodecState();
     st->compress = compress;
     st->format = format;
-    JS_SetOpaque(obj, st);
-    JS_SetPropertyStr(ctx, obj, "push",
-        JS_NewCFunction(ctx, js_codec_push, "push", 1));
-    JS_SetPropertyStr(ctx, obj, "finish",
-        JS_NewCFunction(ctx, js_codec_finish, "finish", 0));
+
+    bronze::Value obj = g_codecClass.make(st, codecDtor);
     return obj;
 }
 
 } // namespace
 
-void installCompression(JSContext* ctx)
+void installCompression()
 {
-    JSRuntime* rt = JS_GetRuntime(ctx);
-    if (codecClassId == 0) JS_NewClassID(rt, &codecClassId);
-    if (!JS_IsRegisteredClass(rt, codecClassId)) {
-        JS_NewClass(rt, codecClassId, &codecClassDef);
-    }
+    g_codecClass.install("__BrokitCodec", 0, nullptr, [](ObjectBuilder& proto) {
+        proto.def("push", 1, codecPush);
+        proto.def("finish", 0, codecFinish);
+    });
 
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue ns = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, ns, "create",
-        JS_NewCFunction(ctx, js_codec_create, "create", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_compression", ns);
-    JS_FreeValue(ctx, global);
+    ObjectBuilder ns;
+    ns.def("create", 2, codecCreate);
+    ev::setGlobalValue("__brokit_compression", ns.get());
 
-    // JS layer: CompressionStream / DecompressionStream over TransformStream.
-    JSValue r = JS_Eval(ctx, js_compression, strlen(js_compression),
-                        "<compression>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_compression_main);
 }
 
 } // namespace brokit::api

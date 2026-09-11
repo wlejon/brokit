@@ -1,14 +1,13 @@
 #include "api/api.h"
+#include "api/arg_reader.h"
+#include "api/host_class.h"
+#include "api/object_builder.h"
 
 #include <cstring>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cctype>
-
-extern "C" {
-#include "quickjs.h"
-}
 
 #ifdef _WIN32
 #include <windows.h>
@@ -34,46 +33,36 @@ struct CryptoKeyData {
     uint32_t usages = 0;
 };
 
-static JSClassID cryptokey_class_id = 0;
+static HostClass g_cryptoKeyClass;
 
-static void cryptokey_finalizer(JSRuntime*, JSValue val) {
-    auto* key = static_cast<CryptoKeyData*>(JS_GetOpaque(val, cryptokey_class_id));
-    delete key;
+static void cryptoKeyDtor(void* p) {
+    delete static_cast<CryptoKeyData*>(p);
 }
 
-static JSClassDef cryptokey_class = {
-    "CryptoKey",
-    cryptokey_finalizer,
-};
-
-static uint32_t parseUsages(JSContext* ctx, JSValueConst arr) {
+static uint32_t parseUsages(bronze::Value arr) {
     uint32_t mask = 0;
-    if (!JS_IsArray(arr)) return mask;
-    JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
-    int32_t len = 0;
-    JS_ToInt32(ctx, &len, lenVal);
-    JS_FreeValue(ctx, lenVal);
-    for (int32_t i = 0; i < len; i++) {
-        JSValue item = JS_GetPropertyUint32(ctx, arr, static_cast<uint32_t>(i));
-        const char* s = JS_ToCString(ctx, item);
-        if (s) {
-            if (strcmp(s, "sign") == 0) mask |= 1;
-            else if (strcmp(s, "verify") == 0) mask |= 2;
-            else if (strcmp(s, "encrypt") == 0) mask |= 4;
-            else if (strcmp(s, "decrypt") == 0) mask |= 8;
-            JS_FreeCString(ctx, s);
+    if (!ev::isObject(arr)) return mask;
+    bronze::Value lenVal = ev::getProperty(arr, "length");
+    if (!ev::isDouble(lenVal)) return mask;
+    int len = static_cast<int>(ev::toDouble(lenVal));
+    for (int i = 0; i < len; i++) {
+        bronze::Value item = ev::getElement(arr, i);
+        if (ev::isString(item)) {
+            std::string s = ev::toUtf8(item);
+            if (s == "sign") mask |= 1;
+            else if (s == "verify") mask |= 2;
+            else if (s == "encrypt") mask |= 4;
+            else if (s == "decrypt") mask |= 8;
         }
-        JS_FreeValue(ctx, item);
     }
     return mask;
 }
 
-static JSValue makeCryptoKeyJS(JSContext* ctx, CryptoKeyData* key) {
-    JSValue obj = JS_NewObjectClass(ctx, static_cast<int>(cryptokey_class_id));
-    JS_SetOpaque(obj, key);
-    JS_SetPropertyStr(ctx, obj, "type", JS_NewString(ctx, "secret"));
-    JS_SetPropertyStr(ctx, obj, "extractable", JS_NewBool(ctx, key->extractable));
-    JS_SetPropertyStr(ctx, obj, "algorithm", JS_NewString(ctx, key->algorithm.c_str()));
+static bronze::Value makeCryptoKeyJS(CryptoKeyData* key) {
+    bronze::Value obj = g_cryptoKeyClass.make(key, cryptoKeyDtor);
+    ev::setProperty(obj, "type", ev::fromUtf8("secret"));
+    ev::setProperty(obj, "extractable", ev::fromBool(key->extractable));
+    ev::setProperty(obj, "algorithm", ev::fromUtf8(key->algorithm));
     return obj;
 }
 
@@ -86,60 +75,41 @@ struct AlgorithmInfo {
     std::string hash;
 };
 
-static bool parseAlgorithm(JSContext* ctx, JSValueConst algo, AlgorithmInfo& out) {
-    if (JS_IsString(algo)) {
-        const char* s = JS_ToCString(ctx, algo);
-        if (!s) return false;
-        out.name = s;
-        JS_FreeCString(ctx, s);
+static bool parseAlgorithm(bronze::Value algo, AlgorithmInfo& out) {
+    if (ev::isString(algo)) {
+        out.name = ev::toUtf8(algo);
         return true;
     }
-    // Object with name and hash
-    JSValue nameVal = JS_GetPropertyStr(ctx, algo, "name");
-    const char* n = JS_ToCString(ctx, nameVal);
-    if (n) { out.name = n; JS_FreeCString(ctx, n); }
-    JS_FreeValue(ctx, nameVal);
+    if (ev::isObject(algo)) {
+        bronze::Value nameVal = ev::getProperty(algo, "name");
+        if (ev::isString(nameVal)) out.name = ev::toUtf8(nameVal);
 
-    JSValue hashVal = JS_GetPropertyStr(ctx, algo, "hash");
-    if (!JS_IsUndefined(hashVal)) {
-        if (JS_IsString(hashVal)) {
-            const char* h = JS_ToCString(ctx, hashVal);
-            if (h) { out.hash = h; JS_FreeCString(ctx, h); }
-        } else {
-            // hash: { name: "SHA-256" }
-            JSValue hn = JS_GetPropertyStr(ctx, hashVal, "name");
-            const char* h = JS_ToCString(ctx, hn);
-            if (h) { out.hash = h; JS_FreeCString(ctx, h); }
-            JS_FreeValue(ctx, hn);
+        bronze::Value hashVal = ev::getProperty(algo, "hash");
+        if (!ev::isUndefined(hashVal)) {
+            if (ev::isString(hashVal)) {
+                out.hash = ev::toUtf8(hashVal);
+            } else if (ev::isObject(hashVal)) {
+                bronze::Value hn = ev::getProperty(hashVal, "name");
+                if (ev::isString(hn)) out.hash = ev::toUtf8(hn);
+            }
         }
+        return !out.name.empty();
     }
-    JS_FreeValue(ctx, hashVal);
-    return !out.name.empty();
+    return false;
 }
 
 // ---------------------------------------------------------------------------
 // Helper: extract bytes from ArrayBuffer or TypedArray
 // ---------------------------------------------------------------------------
 
-static bool getBytes(JSContext* ctx, JSValueConst val, std::vector<uint8_t>& out) {
-    // Try ArrayBuffer first
-    size_t len = 0;
-    uint8_t* ptr = JS_GetArrayBuffer(ctx, &len, val);
-    if (ptr) {
-        out.assign(ptr, ptr + len);
+static bool getBytes(bronze::Value val, std::vector<uint8_t>& out) {
+    if (auto info = ev::typedArrayInfo(val)) {
+        out.assign(info.data, info.data + info.byteLength);
         return true;
     }
-    // Try TypedArray
-    size_t offset = 0, bpe = 0;
-    JSValue buf = JS_GetTypedArrayBuffer(ctx, val, &offset, &len, &bpe);
-    if (!JS_IsException(buf)) {
-        size_t ab_len = 0;
-        uint8_t* ab_ptr = JS_GetArrayBuffer(ctx, &ab_len, buf);
-        if (ab_ptr && offset + len <= ab_len) {
-            out.assign(ab_ptr + offset, ab_ptr + offset + len);
-        }
-        JS_FreeValue(ctx, buf);
-        return !out.empty() || len == 0;
+    if (auto info = ev::arrayBufferInfo(val)) {
+        out.assign(info.data, info.data + info.byteLength);
+        return true;
     }
     return false;
 }
@@ -148,28 +118,17 @@ static bool getBytes(JSContext* ctx, JSValueConst val, std::vector<uint8_t>& out
 // Helper: wrap result in resolved/rejected Promise
 // ---------------------------------------------------------------------------
 
-static JSValue resolvePromise(JSContext* ctx, JSValue result) {
-    JSValue resolving[2];
-    JSValue promise = JS_NewPromiseCapability(ctx, resolving);
-    JSValue ret = JS_Call(ctx, resolving[0], JS_UNDEFINED, 1, &result);
-    JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, resolving[0]);
-    JS_FreeValue(ctx, resolving[1]);
-    JS_FreeValue(ctx, result);
-    return promise;
+static bronze::Value resolvePromise(bronze::Value result) {
+    ev::Persistent p{ev::createPromise()};
+    ev::resolvePromise(p.get(), result);
+    return p.get();
 }
 
-static JSValue rejectPromise(JSContext* ctx, const char* msg) {
-    JSValue resolving[2];
-    JSValue promise = JS_NewPromiseCapability(ctx, resolving);
-    JSValue err = JS_NewError(ctx);
-    JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, msg));
-    JSValue ret = JS_Call(ctx, resolving[1], JS_UNDEFINED, 1, &err);
-    JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, err);
-    JS_FreeValue(ctx, resolving[0]);
-    JS_FreeValue(ctx, resolving[1]);
-    return promise;
+static bronze::Value rejectPromise(const char* msg) {
+    ev::Persistent p{ev::createPromise()};
+    bronze::Value err = ev::throwTypeError(msg);
+    ev::rejectPromise(p.get(), err);
+    return p.get();
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +204,7 @@ static bool bcryptHMAC(const std::string& hashAlg,
     return true;
 }
 
-static bool bcryptEncrypt(const std::string& /*mode*/,
+static bool bcryptEncrypt(const std::string&,
                           const uint8_t* key, size_t keyLen,
                           const uint8_t* iv, size_t ivLen,
                           const uint8_t* data, size_t dataLen,
@@ -279,7 +238,6 @@ static bool bcryptEncrypt(const std::string& /*mode*/,
     }
 
     ULONG outLen = 0;
-    // Get required output size
     BCryptEncrypt(hKey, const_cast<PUCHAR>(data), static_cast<ULONG>(dataLen),
                   &authInfo, nullptr, 0, nullptr, 0, &outLen, 0);
     out.resize(outLen);
@@ -291,7 +249,7 @@ static bool bcryptEncrypt(const std::string& /*mode*/,
     return BCRYPT_SUCCESS(status);
 }
 
-static bool bcryptDecrypt(const std::string& /*mode*/,
+static bool bcryptDecrypt(const std::string&,
                           const uint8_t* key, size_t keyLen,
                           const uint8_t* iv, size_t ivLen,
                           const uint8_t* data, size_t dataLen,
@@ -335,15 +293,7 @@ static bool bcryptDecrypt(const std::string& /*mode*/,
     return BCRYPT_SUCCESS(status);
 }
 
-static bool fillRandom(uint8_t* buf, size_t len) {
-    if (len == 0) return true;
-    NTSTATUS status = BCryptGenRandom(nullptr, buf, static_cast<ULONG>(len),
-                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    return BCRYPT_SUCCESS(status);
-}
-
 #else
-// Linux stubs — use OpenSSL or similar in the future
 static bool bcryptDigest(const std::string&, const uint8_t*, size_t,
                          std::vector<uint8_t>&) { return false; }
 static bool bcryptHMAC(const std::string&, const uint8_t*, size_t,
@@ -356,443 +306,352 @@ static bool bcryptDecrypt(const std::string&, const uint8_t*, size_t,
                           const uint8_t*, size_t, const uint8_t*, size_t,
                           const uint8_t*, size_t, const uint8_t*, size_t,
                           std::vector<uint8_t>&) { return false; }
-static bool fillRandom(uint8_t* buf, size_t len) {
-    if (len == 0) return true;
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return false;
-    size_t total = 0;
-    while (total < len) {
-        ssize_t n = read(fd, buf + total, len - total);
-        if (n <= 0) { close(fd); return false; }
-        total += static_cast<size_t>(n);
-    }
-    close(fd);
-    return true;
-}
 #endif
 
 // ---------------------------------------------------------------------------
 // subtle.digest(algorithm, data)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_digest(JSContext* ctx, JSValueConst,
-                                int argc, JSValueConst* argv) {
-    if (argc < 2) return rejectPromise(ctx, "digest requires algorithm and data");
+static bronze::Value subtleDigest(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 2) return rejectPromise("digest requires algorithm and data");
 
     AlgorithmInfo algo;
-    if (!parseAlgorithm(ctx, argv[0], algo))
-        return rejectPromise(ctx, "invalid algorithm");
+    if (!parseAlgorithm(a[0], algo))
+        return rejectPromise("invalid algorithm");
 
-    // digest uses the algorithm name directly as the hash
     std::string hashName = algo.name.empty() ? algo.hash : algo.name;
     if (hashName.empty() && !algo.hash.empty()) hashName = algo.hash;
 
     std::vector<uint8_t> data;
-    if (!getBytes(ctx, argv[1], data))
-        return rejectPromise(ctx, "digest: data must be ArrayBuffer or TypedArray");
+    if (!getBytes(a[1], data))
+        return rejectPromise("digest: data must be ArrayBuffer or TypedArray");
 
     std::vector<uint8_t> result;
     if (!bcryptDigest(hashName, data.data(), data.size(), result))
-        return rejectPromise(ctx, "digest: unsupported algorithm or OS error");
+        return rejectPromise("digest: unsupported algorithm or OS error");
 
-    JSValue ab = JS_NewArrayBufferCopy(ctx, result.data(), result.size());
-    return resolvePromise(ctx, ab);
+    bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(result));
+    return resolvePromise(ab);
 }
 
 // ---------------------------------------------------------------------------
 // subtle.importKey(format, keyData, algorithm, extractable, keyUsages)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_importKey(JSContext* ctx, JSValueConst,
-                                   int argc, JSValueConst* argv) {
-    if (argc < 5) return rejectPromise(ctx, "importKey requires 5 arguments");
+static bronze::Value subtleImportKey(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 5) return rejectPromise("importKey requires format, keyData, algorithm, extractable, keyUsages");
 
-    const char* fmt = JS_ToCString(ctx, argv[0]);
-    if (!fmt) return rejectPromise(ctx, "importKey: invalid format");
-    std::string format = fmt;
-    JS_FreeCString(ctx, fmt);
+    if (!ev::isString(a[0])) return rejectPromise("importKey: format must be string");
+    std::string format = ev::toUtf8(a[0]);
 
-    if (format != "raw" && format != "jwk")
-        return rejectPromise(ctx, "importKey: only 'raw' and 'jwk' formats supported");
+    std::vector<uint8_t> keyBytes;
+    if (!getBytes(a[1], keyBytes))
+        return rejectPromise("importKey: keyData must be ArrayBuffer or TypedArray");
 
     AlgorithmInfo algo;
-    if (!parseAlgorithm(ctx, argv[2], algo))
-        return rejectPromise(ctx, "importKey: invalid algorithm");
+    if (!parseAlgorithm(a[2], algo))
+        return rejectPromise("importKey: invalid algorithm");
 
-    bool extractable = JS_ToBool(ctx, argv[3]);
-    uint32_t usages = parseUsages(ctx, argv[4]);
+    bool extractable = ev::isBool(a[3]) && ev::toBool(a[3]);
+    uint32_t usages = parseUsages(a[4]);
 
-    std::vector<uint8_t> rawKey;
     if (format == "raw") {
-        if (!getBytes(ctx, argv[1], rawKey))
-            return rejectPromise(ctx, "importKey: keyData must be ArrayBuffer/TypedArray");
-    } else {
-        // JWK: extract "k" field (base64url-encoded key)
-        JSValue kVal = JS_GetPropertyStr(ctx, argv[1], "k");
-        const char* kStr = JS_ToCString(ctx, kVal);
-        if (!kStr) {
-            JS_FreeValue(ctx, kVal);
-            return rejectPromise(ctx, "importKey: JWK missing 'k' field");
-        }
-        // Base64url decode
-        std::string b64 = kStr;
-        JS_FreeCString(ctx, kStr);
-        JS_FreeValue(ctx, kVal);
-        // Replace base64url chars
-        for (auto& c : b64) {
-            if (c == '-') c = '+';
-            else if (c == '_') c = '/';
-        }
-        // Pad
-        while (b64.size() % 4 != 0) b64 += '=';
-        // Use atob via JS
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue atobFn = JS_GetPropertyStr(ctx, global, "atob");
-        JSValue b64Val = JS_NewString(ctx, b64.c_str());
-        JSValue decoded = JS_Call(ctx, atobFn, JS_UNDEFINED, 1, &b64Val);
-        JS_FreeValue(ctx, b64Val);
-        JS_FreeValue(ctx, atobFn);
-        JS_FreeValue(ctx, global);
-
-        if (JS_IsException(decoded))
-            return rejectPromise(ctx, "importKey: JWK base64url decode failed");
-
-        const char* decStr = JS_ToCString(ctx, decoded);
-        if (decStr) {
-            size_t len = strlen(decStr);
-            rawKey.resize(len);
-            for (size_t i = 0; i < len; i++)
-                rawKey[i] = static_cast<uint8_t>(decStr[i]);
-            JS_FreeCString(ctx, decStr);
-        }
-        JS_FreeValue(ctx, decoded);
+        auto* key = new CryptoKeyData();
+        key->rawKey = std::move(keyBytes);
+        key->algorithm = algo.name;
+        key->hash = algo.hash;
+        key->extractable = extractable;
+        key->usages = usages;
+        return resolvePromise(makeCryptoKeyJS(key));
     }
 
-    auto* key = new CryptoKeyData{std::move(rawKey), algo.name, algo.hash,
-                                   extractable, usages};
-    JSValue keyObj = makeCryptoKeyJS(ctx, key);
-    return resolvePromise(ctx, keyObj);
+    return rejectPromise("importKey: unsupported format (only 'raw' supported)");
 }
 
 // ---------------------------------------------------------------------------
 // subtle.generateKey(algorithm, extractable, keyUsages)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_generateKey(JSContext* ctx, JSValueConst,
-                                     int argc, JSValueConst* argv) {
-    if (argc < 3) return rejectPromise(ctx, "generateKey requires 3 arguments");
+static bronze::Value subtleGenerateKey(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 3) return rejectPromise("generateKey requires algorithm, extractable, keyUsages");
 
     AlgorithmInfo algo;
-    if (!parseAlgorithm(ctx, argv[0], algo))
-        return rejectPromise(ctx, "generateKey: invalid algorithm");
+    if (!parseAlgorithm(a[0], algo))
+        return rejectPromise("generateKey: invalid algorithm");
 
-    bool extractable = JS_ToBool(ctx, argv[1]);
-    uint32_t usages = parseUsages(ctx, argv[2]);
+    bool extractable = ev::isBool(a[1]) && ev::toBool(a[1]);
+    uint32_t usages = parseUsages(a[2]);
 
-    // Determine key length
-    size_t keyLen = 0;
+    int keyLenBytes = 0;
     if (algo.name == "HMAC") {
-        // Default to hash output length
-        if (algo.hash == "SHA-256") keyLen = 32;
-        else if (algo.hash == "SHA-384") keyLen = 48;
-        else if (algo.hash == "SHA-512") keyLen = 64;
-        else if (algo.hash == "SHA-1") keyLen = 20;
-        else return rejectPromise(ctx, "generateKey: unsupported HMAC hash");
-
-        // Check for explicit length override
-        JSValue lenVal = JS_GetPropertyStr(ctx, argv[0], "length");
-        if (!JS_IsUndefined(lenVal)) {
-            int32_t bits = 0;
-            JS_ToInt32(ctx, &bits, lenVal);
-            if (bits > 0) keyLen = static_cast<size_t>((bits + 7) / 8);
+        if (!ev::isObject(a[0])) return rejectPromise("generateKey: HMAC requires length or hash");
+        bronze::Value lenVal = ev::getProperty(a[0], "length");
+        if (ev::isDouble(lenVal)) {
+            keyLenBytes = static_cast<int>(ev::toDouble(lenVal)) / 8;
+        } else {
+            if (algo.hash == "SHA-256") keyLenBytes = 32;
+            else if (algo.hash == "SHA-384") keyLenBytes = 48;
+            else if (algo.hash == "SHA-512") keyLenBytes = 64;
+            else if (algo.hash == "SHA-1")   keyLenBytes = 20;
+            else return rejectPromise("generateKey: HMAC unknown hash length");
         }
-        JS_FreeValue(ctx, lenVal);
     } else if (algo.name == "AES-GCM" || algo.name == "AES-CBC") {
-        JSValue lenVal = JS_GetPropertyStr(ctx, argv[0], "length");
-        int32_t bits = 256;
-        if (!JS_IsUndefined(lenVal)) JS_ToInt32(ctx, &bits, lenVal);
-        JS_FreeValue(ctx, lenVal);
-        if (bits != 128 && bits != 192 && bits != 256)
-            return rejectPromise(ctx, "generateKey: AES key length must be 128, 192, or 256");
-        keyLen = static_cast<size_t>(bits / 8);
+        if (!ev::isObject(a[0])) return rejectPromise("generateKey: AES requires length");
+        bronze::Value lenVal = ev::getProperty(a[0], "length");
+        if (ev::isDouble(lenVal)) {
+            int bits = static_cast<int>(ev::toDouble(lenVal));
+            if (bits != 128 && bits != 192 && bits != 256)
+                return rejectPromise("generateKey: AES length must be 128, 192, or 256");
+            keyLenBytes = bits / 8;
+        } else {
+            keyLenBytes = 32; // default 256-bit
+        }
     } else {
-        return rejectPromise(ctx, "generateKey: unsupported algorithm");
+        return rejectPromise("generateKey: unsupported algorithm");
     }
 
-    std::vector<uint8_t> rawKey(keyLen);
-    if (!fillRandom(rawKey.data(), keyLen))
-        return rejectPromise(ctx, "generateKey: random generation failed");
+    std::vector<uint8_t> randomBytes(keyLenBytes);
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return rejectPromise("generateKey: OS RNG failed");
+    ssize_t n = read(fd, randomBytes.data(), keyLenBytes);
+    close(fd);
+    if (n < keyLenBytes) return rejectPromise("generateKey: OS RNG read failed");
 
-    auto* key = new CryptoKeyData{std::move(rawKey), algo.name, algo.hash,
-                                   extractable, usages};
-    JSValue keyObj = makeCryptoKeyJS(ctx, key);
-    return resolvePromise(ctx, keyObj);
+    auto* key = new CryptoKeyData();
+    key->rawKey = std::move(randomBytes);
+    key->algorithm = algo.name;
+    key->hash = algo.hash;
+    key->extractable = extractable;
+    key->usages = usages;
+    return resolvePromise(makeCryptoKeyJS(key));
 }
 
 // ---------------------------------------------------------------------------
 // subtle.sign(algorithm, key, data)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_sign(JSContext* ctx, JSValueConst,
-                              int argc, JSValueConst* argv) {
-    if (argc < 3) return rejectPromise(ctx, "sign requires algorithm, key, data");
+static bronze::Value subtleSign(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 3) return rejectPromise("sign requires algorithm, key, data");
 
     AlgorithmInfo algo;
-    if (!parseAlgorithm(ctx, argv[0], algo))
-        return rejectPromise(ctx, "sign: invalid algorithm");
+    if (!parseAlgorithm(a[0], algo))
+        return rejectPromise("sign: invalid algorithm");
 
-    auto* key = static_cast<CryptoKeyData*>(JS_GetOpaque(argv[1], cryptokey_class_id));
-    if (!key) return rejectPromise(ctx, "sign: invalid CryptoKey");
+    auto* key = static_cast<CryptoKeyData*>(g_cryptoKeyClass.unwrap(a[1]));
+    if (!key) return rejectPromise("sign: invalid CryptoKey");
     if (!(key->usages & 1))
-        return rejectPromise(ctx, "sign: key does not have 'sign' usage");
+        return rejectPromise("sign: key does not have 'sign' usage");
 
     std::vector<uint8_t> data;
-    if (!getBytes(ctx, argv[2], data))
-        return rejectPromise(ctx, "sign: data must be ArrayBuffer or TypedArray");
+    if (!getBytes(a[2], data))
+        return rejectPromise("sign: data must be ArrayBuffer or TypedArray");
 
-    std::string hashAlg = algo.hash.empty() ? key->hash : algo.hash;
-
-    if (algo.name == "HMAC" || key->algorithm == "HMAC") {
+    if (algo.name == "HMAC") {
+        std::string hashAlg = algo.hash.empty() ? key->hash : algo.hash;
         std::vector<uint8_t> sig;
         if (!bcryptHMAC(hashAlg, key->rawKey.data(), key->rawKey.size(),
                         data.data(), data.size(), sig))
-            return rejectPromise(ctx, "sign: HMAC failed");
-        JSValue ab = JS_NewArrayBufferCopy(ctx, sig.data(), sig.size());
-        return resolvePromise(ctx, ab);
+            return rejectPromise("sign: HMAC failed");
+
+        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(sig));
+        return resolvePromise(ab);
     }
 
-    return rejectPromise(ctx, "sign: unsupported algorithm");
+    return rejectPromise("sign: unsupported algorithm");
 }
 
 // ---------------------------------------------------------------------------
 // subtle.verify(algorithm, key, signature, data)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_verify(JSContext* ctx, JSValueConst,
-                                int argc, JSValueConst* argv) {
-    if (argc < 4) return rejectPromise(ctx, "verify requires algorithm, key, signature, data");
+static bronze::Value subtleVerify(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 4) return rejectPromise("verify requires algorithm, key, signature, data");
 
     AlgorithmInfo algo;
-    if (!parseAlgorithm(ctx, argv[0], algo))
-        return rejectPromise(ctx, "verify: invalid algorithm");
+    if (!parseAlgorithm(a[0], algo))
+        return rejectPromise("verify: invalid algorithm");
 
-    auto* key = static_cast<CryptoKeyData*>(JS_GetOpaque(argv[1], cryptokey_class_id));
-    if (!key) return rejectPromise(ctx, "verify: invalid CryptoKey");
+    auto* key = static_cast<CryptoKeyData*>(g_cryptoKeyClass.unwrap(a[1]));
+    if (!key) return rejectPromise("verify: invalid CryptoKey");
     if (!(key->usages & 2))
-        return rejectPromise(ctx, "verify: key does not have 'verify' usage");
+        return rejectPromise("verify: key does not have 'verify' usage");
 
-    std::vector<uint8_t> signature, data;
-    if (!getBytes(ctx, argv[2], signature))
-        return rejectPromise(ctx, "verify: signature must be ArrayBuffer or TypedArray");
-    if (!getBytes(ctx, argv[3], data))
-        return rejectPromise(ctx, "verify: data must be ArrayBuffer or TypedArray");
+    std::vector<uint8_t> sig;
+    if (!getBytes(a[2], sig))
+        return rejectPromise("verify: signature must be ArrayBuffer or TypedArray");
 
-    std::string hashAlg = algo.hash.empty() ? key->hash : algo.hash;
+    std::vector<uint8_t> data;
+    if (!getBytes(a[3], data))
+        return rejectPromise("verify: data must be ArrayBuffer or TypedArray");
 
-    if (algo.name == "HMAC" || key->algorithm == "HMAC") {
-        std::vector<uint8_t> expected;
+    if (algo.name == "HMAC") {
+        std::string hashAlg = algo.hash.empty() ? key->hash : algo.hash;
+        std::vector<uint8_t> expectedSig;
         if (!bcryptHMAC(hashAlg, key->rawKey.data(), key->rawKey.size(),
-                        data.data(), data.size(), expected))
-            return rejectPromise(ctx, "verify: HMAC failed");
+                        data.data(), data.size(), expectedSig))
+            return rejectPromise("verify: HMAC failed");
 
-        bool match = (signature.size() == expected.size()) &&
-                     (memcmp(signature.data(), expected.data(), expected.size()) == 0);
-        return resolvePromise(ctx, JS_NewBool(ctx, match));
+        bool match = (sig.size() == expectedSig.size());
+        if (match) {
+            uint8_t diff = 0;
+            for (size_t i = 0; i < sig.size(); i++) diff |= (sig[i] ^ expectedSig[i]);
+            match = (diff == 0);
+        }
+        return resolvePromise(ev::fromBool(match));
     }
 
-    return rejectPromise(ctx, "verify: unsupported algorithm");
+    return rejectPromise("verify: unsupported algorithm");
 }
 
 // ---------------------------------------------------------------------------
 // subtle.encrypt(algorithm, key, data)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_encrypt(JSContext* ctx, JSValueConst,
-                                 int argc, JSValueConst* argv) {
-    if (argc < 3) return rejectPromise(ctx, "encrypt requires algorithm, key, data");
+static bronze::Value subtleEncrypt(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 3) return rejectPromise("encrypt requires algorithm, key, data");
 
     AlgorithmInfo algo;
-    if (!parseAlgorithm(ctx, argv[0], algo))
-        return rejectPromise(ctx, "encrypt: invalid algorithm");
+    if (!parseAlgorithm(a[0], algo))
+        return rejectPromise("encrypt: invalid algorithm");
 
-    auto* key = static_cast<CryptoKeyData*>(JS_GetOpaque(argv[1], cryptokey_class_id));
-    if (!key) return rejectPromise(ctx, "encrypt: invalid CryptoKey");
+    auto* key = static_cast<CryptoKeyData*>(g_cryptoKeyClass.unwrap(a[1]));
+    if (!key) return rejectPromise("encrypt: invalid CryptoKey");
     if (!(key->usages & 4))
-        return rejectPromise(ctx, "encrypt: key does not have 'encrypt' usage");
+        return rejectPromise("encrypt: key does not have 'encrypt' usage");
 
     std::vector<uint8_t> data;
-    if (!getBytes(ctx, argv[2], data))
-        return rejectPromise(ctx, "encrypt: data must be ArrayBuffer or TypedArray");
+    if (!getBytes(a[2], data))
+        return rejectPromise("encrypt: data must be ArrayBuffer or TypedArray");
 
     if (algo.name == "AES-GCM") {
-        // Extract IV
-        JSValue ivVal = JS_GetPropertyStr(ctx, argv[0], "iv");
+        bronze::Value ivVal = ev::getProperty(a[0], "iv");
         std::vector<uint8_t> iv;
-        if (!getBytes(ctx, ivVal, iv)) {
-            JS_FreeValue(ctx, ivVal);
-            return rejectPromise(ctx, "encrypt: AES-GCM requires 'iv'");
+        if (!getBytes(ivVal, iv)) {
+            return rejectPromise("encrypt: AES-GCM requires 'iv'");
         }
-        JS_FreeValue(ctx, ivVal);
 
-        // Optional additional data
         std::vector<uint8_t> aad;
-        JSValue aadVal = JS_GetPropertyStr(ctx, argv[0], "additionalData");
-        if (!JS_IsUndefined(aadVal)) getBytes(ctx, aadVal, aad);
-        JS_FreeValue(ctx, aadVal);
+        bronze::Value aadVal = ev::getProperty(a[0], "additionalData");
+        if (!ev::isUndefined(aadVal)) getBytes(aadVal, aad);
 
         std::vector<uint8_t> ciphertext, tag;
         if (!bcryptEncrypt("AES-GCM", key->rawKey.data(), key->rawKey.size(),
                            iv.data(), iv.size(), data.data(), data.size(),
                            aad.empty() ? nullptr : aad.data(), aad.size(),
                            ciphertext, tag))
-            return rejectPromise(ctx, "encrypt: AES-GCM failed");
+            return rejectPromise("encrypt: AES-GCM failed");
 
-        // Concatenate ciphertext + tag (Web Crypto convention)
         std::vector<uint8_t> result;
         result.reserve(ciphertext.size() + tag.size());
         result.insert(result.end(), ciphertext.begin(), ciphertext.end());
         result.insert(result.end(), tag.begin(), tag.end());
 
-        JSValue ab = JS_NewArrayBufferCopy(ctx, result.data(), result.size());
-        return resolvePromise(ctx, ab);
+        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(result));
+        return resolvePromise(ab);
     }
 
-    return rejectPromise(ctx, "encrypt: unsupported algorithm");
+    return rejectPromise("encrypt: unsupported algorithm");
 }
 
 // ---------------------------------------------------------------------------
 // subtle.decrypt(algorithm, key, data)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_decrypt(JSContext* ctx, JSValueConst,
-                                 int argc, JSValueConst* argv) {
-    if (argc < 3) return rejectPromise(ctx, "decrypt requires algorithm, key, data");
+static bronze::Value subtleDecrypt(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 3) return rejectPromise("decrypt requires algorithm, key, data");
 
     AlgorithmInfo algo;
-    if (!parseAlgorithm(ctx, argv[0], algo))
-        return rejectPromise(ctx, "decrypt: invalid algorithm");
+    if (!parseAlgorithm(a[0], algo))
+        return rejectPromise("decrypt: invalid algorithm");
 
-    auto* key = static_cast<CryptoKeyData*>(JS_GetOpaque(argv[1], cryptokey_class_id));
-    if (!key) return rejectPromise(ctx, "decrypt: invalid CryptoKey");
+    auto* key = static_cast<CryptoKeyData*>(g_cryptoKeyClass.unwrap(a[1]));
+    if (!key) return rejectPromise("decrypt: invalid CryptoKey");
     if (!(key->usages & 8))
-        return rejectPromise(ctx, "decrypt: key does not have 'decrypt' usage");
+        return rejectPromise("decrypt: key does not have 'decrypt' usage");
 
     std::vector<uint8_t> ciphertextAndTag;
-    if (!getBytes(ctx, argv[2], ciphertextAndTag))
-        return rejectPromise(ctx, "decrypt: data must be ArrayBuffer or TypedArray");
+    if (!getBytes(a[2], ciphertextAndTag))
+        return rejectPromise("decrypt: data must be ArrayBuffer or TypedArray");
 
     if (algo.name == "AES-GCM") {
-        JSValue ivVal = JS_GetPropertyStr(ctx, argv[0], "iv");
+        bronze::Value ivVal = ev::getProperty(a[0], "iv");
         std::vector<uint8_t> iv;
-        if (!getBytes(ctx, ivVal, iv)) {
-            JS_FreeValue(ctx, ivVal);
-            return rejectPromise(ctx, "decrypt: AES-GCM requires 'iv'");
+        if (!getBytes(ivVal, iv)) {
+            return rejectPromise("decrypt: AES-GCM requires 'iv'");
         }
-        JS_FreeValue(ctx, ivVal);
 
-        // Optional tag length (default 128 bits = 16 bytes)
         int tagLen = 16;
-        JSValue tlVal = JS_GetPropertyStr(ctx, argv[0], "tagLength");
-        if (!JS_IsUndefined(tlVal)) {
-            int32_t tl = 0;
-            JS_ToInt32(ctx, &tl, tlVal);
-            tagLen = tl / 8;
+        bronze::Value tlVal = ev::getProperty(a[0], "tagLength");
+        if (ev::isDouble(tlVal)) {
+            tagLen = static_cast<int>(ev::toDouble(tlVal)) / 8;
         }
-        JS_FreeValue(ctx, tlVal);
 
         if (static_cast<int>(ciphertextAndTag.size()) < tagLen)
-            return rejectPromise(ctx, "decrypt: ciphertext too short for tag");
+            return rejectPromise("decrypt: ciphertext too short for tag");
 
         size_t ctLen = ciphertextAndTag.size() - static_cast<size_t>(tagLen);
         const uint8_t* ctData = ciphertextAndTag.data();
         const uint8_t* tagData = ciphertextAndTag.data() + ctLen;
 
         std::vector<uint8_t> aad;
-        JSValue aadVal = JS_GetPropertyStr(ctx, argv[0], "additionalData");
-        if (!JS_IsUndefined(aadVal)) getBytes(ctx, aadVal, aad);
-        JS_FreeValue(ctx, aadVal);
+        bronze::Value aadVal = ev::getProperty(a[0], "additionalData");
+        if (!ev::isUndefined(aadVal)) getBytes(aadVal, aad);
 
         std::vector<uint8_t> plaintext;
         if (!bcryptDecrypt("AES-GCM", key->rawKey.data(), key->rawKey.size(),
                            iv.data(), iv.size(), ctData, ctLen,
                            aad.empty() ? nullptr : aad.data(), aad.size(),
                            tagData, static_cast<size_t>(tagLen), plaintext))
-            return rejectPromise(ctx, "decrypt: AES-GCM failed (bad key or tampered data)");
+            return rejectPromise("decrypt: AES-GCM failed (bad key or tampered data)");
 
-        JSValue ab = JS_NewArrayBufferCopy(ctx, plaintext.data(), plaintext.size());
-        return resolvePromise(ctx, ab);
+        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(plaintext));
+        return resolvePromise(ab);
     }
 
-    return rejectPromise(ctx, "decrypt: unsupported algorithm");
+    return rejectPromise("decrypt: unsupported algorithm");
 }
 
 // ---------------------------------------------------------------------------
 // subtle.exportKey(format, key)
 // ---------------------------------------------------------------------------
 
-static JSValue js_subtle_exportKey(JSContext* ctx, JSValueConst,
-                                   int argc, JSValueConst* argv) {
-    if (argc < 2) return rejectPromise(ctx, "exportKey requires format and key");
+static bronze::Value subtleExportKey(bronze::Value, std::span<const bronze::Value> a) {
+    if (a.size() < 2) return rejectPromise("exportKey requires format and key");
 
-    const char* fmt = JS_ToCString(ctx, argv[0]);
-    if (!fmt) return rejectPromise(ctx, "exportKey: invalid format");
-    std::string format = fmt;
-    JS_FreeCString(ctx, fmt);
+    if (!ev::isString(a[0])) return rejectPromise("exportKey: invalid format");
+    std::string format = ev::toUtf8(a[0]);
 
-    auto* key = static_cast<CryptoKeyData*>(JS_GetOpaque(argv[1], cryptokey_class_id));
-    if (!key) return rejectPromise(ctx, "exportKey: invalid CryptoKey");
+    auto* key = static_cast<CryptoKeyData*>(g_cryptoKeyClass.unwrap(a[1]));
+    if (!key) return rejectPromise("exportKey: invalid CryptoKey");
     if (!key->extractable)
-        return rejectPromise(ctx, "exportKey: key is not extractable");
+        return rejectPromise("exportKey: key is not extractable");
 
     if (format == "raw") {
-        JSValue ab = JS_NewArrayBufferCopy(ctx, key->rawKey.data(), key->rawKey.size());
-        return resolvePromise(ctx, ab);
+        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(key->rawKey));
+        return resolvePromise(ab);
     }
 
-    return rejectPromise(ctx, "exportKey: only 'raw' format supported");
+    return rejectPromise("exportKey: only 'raw' format supported");
 }
 
-// ---------------------------------------------------------------------------
-// installSubtleCrypto
-// ---------------------------------------------------------------------------
-
-void installSubtleCrypto(JSContext* ctx) {
-    JSRuntime* rt = JS_GetRuntime(ctx);
-
-    // Register CryptoKey class
-    if (cryptokey_class_id == 0) {
-        JS_NewClassID(rt, &cryptokey_class_id);
-        JS_NewClass(rt, cryptokey_class_id, &cryptokey_class);
+void installSubtleCrypto() {
+    bronze::Value crypto = ev::getGlobal("crypto");
+    if (!ev::isObject(crypto)) {
+        crypto = ev::createObject();
+        ev::setGlobalValue("crypto", crypto);
     }
 
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue crypto = JS_GetPropertyStr(ctx, global, "crypto");
-    if (JS_IsUndefined(crypto)) {
-        crypto = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, global, "crypto", JS_DupValue(ctx, crypto));
-    }
+    ObjectBuilder subtle;
+    subtle.def("digest", 2, subtleDigest);
+    subtle.def("importKey", 5, subtleImportKey);
+    subtle.def("generateKey", 3, subtleGenerateKey);
+    subtle.def("sign", 3, subtleSign);
+    subtle.def("verify", 4, subtleVerify);
+    subtle.def("encrypt", 3, subtleEncrypt);
+    subtle.def("decrypt", 3, subtleDecrypt);
+    subtle.def("exportKey", 2, subtleExportKey);
 
-    JSValue subtle = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, subtle, "digest",
-        JS_NewCFunction(ctx, js_subtle_digest, "digest", 2));
-    JS_SetPropertyStr(ctx, subtle, "importKey",
-        JS_NewCFunction(ctx, js_subtle_importKey, "importKey", 5));
-    JS_SetPropertyStr(ctx, subtle, "generateKey",
-        JS_NewCFunction(ctx, js_subtle_generateKey, "generateKey", 3));
-    JS_SetPropertyStr(ctx, subtle, "sign",
-        JS_NewCFunction(ctx, js_subtle_sign, "sign", 3));
-    JS_SetPropertyStr(ctx, subtle, "verify",
-        JS_NewCFunction(ctx, js_subtle_verify, "verify", 4));
-    JS_SetPropertyStr(ctx, subtle, "encrypt",
-        JS_NewCFunction(ctx, js_subtle_encrypt, "encrypt", 3));
-    JS_SetPropertyStr(ctx, subtle, "decrypt",
-        JS_NewCFunction(ctx, js_subtle_decrypt, "decrypt", 3));
-    JS_SetPropertyStr(ctx, subtle, "exportKey",
-        JS_NewCFunction(ctx, js_subtle_exportKey, "exportKey", 2));
-
-    JS_SetPropertyStr(ctx, crypto, "subtle", subtle);
-    JS_FreeValue(ctx, crypto);
-    JS_FreeValue(ctx, global);
+    ev::setProperty(crypto, "subtle", subtle.get());
 }
 
 } // namespace brokit::api

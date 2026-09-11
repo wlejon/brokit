@@ -1,5 +1,6 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
 
 #include <cstdio>
 #include <cstring>
@@ -39,54 +40,29 @@ static bool fillRandom(uint8_t* buf, size_t len)
 #endif
 }
 
-// crypto.getRandomValues(typedArray)
-// Safety: generate into a stack/heap buffer first, then copy into JS memory.
-// Never let BCryptGenRandom write directly into QuickJS-managed memory.
-static JSValue js_crypto_getRandomValues(JSContext* ctx, JSValueConst,
-                                          int argc, JSValueConst* argv)
+static bronze::Value getRandomValues(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "crypto.getRandomValues: expected TypedArray");
-
-    size_t byte_offset = 0;
-    size_t byte_len = 0;
-    size_t bytes_per_element = 0;
-
-    JSValue buf = JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_len, &bytes_per_element);
-    if (JS_IsException(buf)) return buf;
-    if (byte_len > 65536) {
-        JS_FreeValue(ctx, buf);
-        return JS_ThrowRangeError(ctx, "crypto.getRandomValues: quota exceeded (max 65536 bytes)");
+    if (a.empty()) return ev::throwTypeError("crypto.getRandomValues: expected TypedArray");
+    auto info = ev::typedArrayInfo(a[0]);
+    if (!info) return ev::throwTypeError("crypto.getRandomValues: expected TypedArray");
+    if (info.byteLength > 65536) {
+        return ev::throwRangeError("crypto.getRandomValues: quota exceeded (max 65536 bytes)");
     }
 
-    // Generate random bytes into a safe stack buffer
-    std::vector<uint8_t> random_buf(byte_len);
-    if (byte_len > 0 && !fillRandom(random_buf.data(), byte_len)) {
-        JS_FreeValue(ctx, buf);
-        return JS_ThrowInternalError(ctx, "crypto.getRandomValues: OS RNG failed");
+    if (info.byteLength > 0 && !fillRandom(info.data, info.byteLength)) {
+        return ev::throwTypeError("crypto.getRandomValues: OS RNG failed");
     }
 
-    // Copy into the ArrayBuffer backing the typed array
-    if (byte_len > 0) {
-        size_t ab_len = 0;
-        uint8_t* ab_ptr = JS_GetArrayBuffer(ctx, &ab_len, buf);
-        if (ab_ptr) {
-            memcpy(ab_ptr + byte_offset, random_buf.data(), byte_len);
-        }
-    }
-    JS_FreeValue(ctx, buf);
-    return JS_DupValue(ctx, argv[0]);
+    return a[0];
 }
 
-// crypto.randomUUID() — returns a v4 UUID string
-static JSValue js_crypto_randomUUID(JSContext* ctx, JSValueConst,
-                                     int, JSValueConst*)
+static bronze::Value randomUUID(bronze::Value, std::span<const bronze::Value>)
 {
     uint8_t bytes[16];
     if (!fillRandom(bytes, 16)) {
-        return JS_ThrowInternalError(ctx, "crypto.randomUUID: OS RNG failed");
+        return ev::throwTypeError("crypto.randomUUID: OS RNG failed");
     }
 
-    // Set version (4) and variant (10xx)
     bytes[6] = (bytes[6] & 0x0F) | 0x40;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
 
@@ -99,21 +75,16 @@ static JSValue js_crypto_randomUUID(JSContext* ctx, JSValueConst,
              bytes[8], bytes[9],
              bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
 
-    return JS_NewString(ctx, uuid);
+    return ev::fromUtf8(uuid);
 }
 
-void installCrypto(JSContext* ctx)
+void installCrypto()
 {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue crypto = JS_NewObject(ctx);
-
-    JS_SetPropertyStr(ctx, crypto, "getRandomValues",
-                      JS_NewCFunction(ctx, js_crypto_getRandomValues, "getRandomValues", 1));
-    JS_SetPropertyStr(ctx, crypto, "randomUUID",
-                      JS_NewCFunction(ctx, js_crypto_randomUUID, "randomUUID", 0));
-
-    JS_SetPropertyStr(ctx, global, "crypto", crypto);
-    JS_FreeValue(ctx, global);
+    bronze::Value existing = ev::getGlobal("crypto");
+    ObjectBuilder b(ev::isObject(existing) ? existing : ev::createObject());
+    b.def("getRandomValues", 1, getRandomValues);
+    b.def("randomUUID", 0, randomUUID);
+    ev::setGlobalValue("crypto", b.get());
 }
 
 } // namespace brokit::api

@@ -246,7 +246,7 @@
         function deprecated() {
             if (!warned) {
                 warned = true;
-                if (typeof console !== 'undefined' && console.warn) {
+                if (typeof console !== 'undefined' && globalThis.console.warn) {
                     console.warn(msg);
                 }
             }

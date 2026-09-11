@@ -4,7 +4,7 @@
 [![CodeQL](https://github.com/wlejon/brokit/actions/workflows/codeql.yml/badge.svg)](https://github.com/wlejon/brokit/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-brokit (broke-it) is a standalone C++20 JavaScript runtime library built on [QuickJS](https://bellard.org/quickjs/). Provides web-standard APIs (WinterCG-aligned) and system APIs (Node.js conventions) without owning a DOM or rendering engine.
+brokit (broke-it) is a standalone C++20 JavaScript runtime library built on [Bronze](https://github.com/wlejon/bronze) (AOT compiler and runtime) and [Brass](https://github.com/wlejon/brass). Provides web-standard APIs (WinterCG-aligned) and system APIs (Node.js conventions) without owning a DOM or rendering engine.
 
 Built as a dependency for [bro](https://github.com/wlejon/bro).
 
@@ -72,7 +72,8 @@ cmake --build build --config Debug    # or Release
 ```
 
 Dependencies:
-- **QuickJS** — JavaScript engine (bundled git submodule)
+- **Bronze** — AOT JavaScript compiler & runtime (from `../bronze` or `third_party/bronze`)
+- **Brass** — Compiler IR / code generator (from `../brass`)
 - **libcurl** — HTTP/WebSocket (bundled git submodule, static, Schannel TLS on Windows)
 - **SQLite** — IndexedDB persistence (bundled amalgamation)
 - **FastNoise2** — SIMD noise generation (bundled git submodule, gated by `BROKIT_ENABLE_NOISE`)
@@ -82,7 +83,7 @@ Optional features are gated by CMake options (both default ON): `BROKIT_ENABLE_N
 
 ## Test
 
-42 test files under `tests/js/`, one per API. The C++ harness (`tests/main.cpp`) evals each file, pumps the async subsystems (timers, fetch, sockets), and tallies per-file pass/fail.
+56 test suites under `tests/js/`. The C++ harness (`tests/main.cpp`) compiles and runs each test file, pumps the async subsystems (timers, fetch, sockets), and tallies per-file pass/fail.
 
 ```bash
 # Windows (MSVC)
@@ -108,7 +109,7 @@ target_link_libraries(my_target PUBLIC brokit)
 #include "api/api.h"
 
 brokit::Runtime rt;
-brokit::api::installAll(rt.context());  // install all APIs
+brokit::api::installAll();  // install all APIs into the runtime
 rt.eval("fetch('https://example.com').then(r => r.text()).then(console.log)", "<main>");
 rt.executePendingJobs();
 ```
@@ -116,26 +117,26 @@ rt.executePendingJobs();
 Individual APIs can be installed selectively:
 
 ```cpp
-brokit::api::installConsole(rt.context());
-brokit::api::installFetch(rt.context());
-brokit::api::installFS(rt.context());
+brokit::api::installConsole();
+brokit::api::installFetch();
+brokit::api::installFS();
 ```
 
 ## Architecture
 
 ```
-src/runtime/   Runtime class: QuickJS wrapper, ES module loader, exception handling
-src/api/       Modular API installers (one .cpp per API, optional .js polyfill)
-src/api/js/    JS polyfills embedded into C++ at build time via cmake/embed_js.cmake
-tests/         C++ test harness (tests/main.cpp) that evals JS test files and pumps async subsystems
-tests/js/      JavaScript test files, one per API
-third_party/   QuickJS, libcurl, SQLite, FastNoise2 (broimage links from the sibling repo)
+src/runtime/   Runtime class: Bronze module compiler, dlopen module loading, microtask pump
+src/api/       Modular API installers (one .cpp per API, HostClass / HostProxy / ObjectBuilder)
+src/api/js/    JS polyfills compiled ahead of time with Bronze (bronze_compile_js)
+tests/         C++ test harness (tests/main.cpp) that builds & runs JS test files and pumps async subsystems
+tests/js/      JavaScript test files (56 suites)
+third_party/   libcurl, SQLite, FastNoise2 (bronze, brass, and broimage link from sibling repos)
 ```
 
 **Design principles:**
 - No DOM, no rendering, no windowing — purely JS runtime + platform APIs
 - Each API is independently installable (`installAll()` or pick-and-choose)
-- All state is per-JSContext, no globals
+- All 32 JS polyfills are compiled AOT via Bronze into native object files
 - JS polyfills for complex logic, native C++ for performance-critical ops
 - Static CRT on Windows (runs in Windows Sandbox without vcruntime DLLs)
 

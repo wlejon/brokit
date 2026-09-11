@@ -80,21 +80,16 @@
     // The host runtime (e.g. bro) may pre-install a performance object with
     // just .now(); in that case we augment it in place rather than replace.
     var _perfHost = globalThis.performance;
-    var _needsPerfInit = typeof _perfHost === 'undefined';
-    var _needsTimingApi = _needsPerfInit ||
-        typeof _perfHost.mark !== 'function';
-    if (_needsTimingApi) {
+    var _target;
+    if (typeof _perfHost === 'undefined') {
         var _startTime = globalThis.__brokit_now();
-        var _entries = [];
-        var _marks = Object.create(null);
-
-        var _target;
-        if (_needsPerfInit) {
-            _target = { now: function() { return globalThis.__brokit_now() - _startTime; } };
-            globalThis.performance = _target;
-        } else {
-            _target = _perfHost;
-        }
+        _target = { now: function() { return globalThis.__brokit_now() - _startTime; } };
+        globalThis.performance = _target;
+    } else {
+        _target = _perfHost;
+    }
+    var _entries = [];
+    var _marks = Object.create(null);
 
         _target.mark = function(name, options) {
             var startTime = (options && typeof options.startTime === 'number')
@@ -179,7 +174,6 @@
                 return false;
             });
         };
-    }
 
     // requestIdleCallback / cancelIdleCallback — polyfill over setTimeout.
     // No real "idle" detection; each callback gets a nominal 50ms budget so

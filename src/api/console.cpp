@@ -1,22 +1,27 @@
 #include "api/api.h"
+#include "api/object_builder.h"
+#include "api/arg_reader.h"
 #include "runtime/runtime.h"
-#include "console_time.js.h"
 
-#include <cstring>
+#include <chrono>
 #include <string>
+#include <unordered_map>
 
 namespace brokit::api {
 
-// Format JS values into a space-separated string (like browser console)
-static std::string formatArgs(JSContext* ctx, int argc, JSValueConst* argv)
-{
+namespace {
+
+std::string formatArgs(std::span<const Value> args) {
     std::string result;
-    for (int i = 0; i < argc; i++) {
+    for (size_t i = 0; i < args.size(); ++i) {
         if (i > 0) result += ' ';
-        const char* str = JS_ToCString(ctx, argv[i]);
-        if (str) {
-            result += str;
-            JS_FreeCString(ctx, str);
+        Value v = args[i];
+        if (ev::isUndefined(v)) {
+            result += "undefined";
+        } else if (ev::isNull(v)) {
+            result += "null";
+        } else if (ev::isString(v) || ev::isNumber(v) || ev::isBool(v)) {
+            result += ev::toUtf8(v);
         } else {
             result += "[object]";
         }
@@ -24,56 +29,92 @@ static std::string formatArgs(JSContext* ctx, int argc, JSValueConst* argv)
     return result;
 }
 
-static JSValue js_console_log(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    Runtime::log(Runtime::LogLevel::Info, "%s", formatArgs(ctx, argc, argv).c_str());
-    return JS_UNDEFINED;
+std::unordered_map<std::string, std::chrono::steady_clock::time_point>& consoleTimers() {
+    static std::unordered_map<std::string, std::chrono::steady_clock::time_point> timers;
+    return timers;
 }
 
-static JSValue js_console_warn(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    Runtime::log(Runtime::LogLevel::Warn, "%s", formatArgs(ctx, argc, argv).c_str());
-    return JS_UNDEFINED;
-}
+} // namespace
 
-static JSValue js_console_error(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    Runtime::log(Runtime::LogLevel::Error, "%s", formatArgs(ctx, argc, argv).c_str());
-    return JS_UNDEFINED;
-}
+void installConsole() {
+    ObjectBuilder console;
 
-static JSValue js_console_debug(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    Runtime::log(Runtime::LogLevel::Debug, "%s", formatArgs(ctx, argc, argv).c_str());
-    return JS_UNDEFINED;
-}
+    console.def("log", 0, [](Value, std::span<const Value> a) {
+        Runtime::log(Runtime::LogLevel::Info, "%s", formatArgs(a).c_str());
+        return ev::undefined();
+    });
 
-static JSValue js_console_assert(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
-    if (argc < 1) return JS_UNDEFINED;
-    if (JS_ToBool(ctx, argv[0])) return JS_UNDEFINED;
-    std::string msg = "Assertion failed";
-    if (argc > 1) {
-        msg += ": " + formatArgs(ctx, argc - 1, argv + 1);
-    }
-    Runtime::log(Runtime::LogLevel::Error, "%s", msg.c_str());
-    return JS_UNDEFINED;
-}
+    console.def("info", 0, [](Value, std::span<const Value> a) {
+        Runtime::log(Runtime::LogLevel::Info, "%s", formatArgs(a).c_str());
+        return ev::undefined();
+    });
 
-void installConsole(JSContext* ctx)
-{
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue console = JS_NewObject(ctx);
+    console.def("warn", 0, [](Value, std::span<const Value> a) {
+        Runtime::log(Runtime::LogLevel::Warn, "%s", formatArgs(a).c_str());
+        return ev::undefined();
+    });
 
-    JS_SetPropertyStr(ctx, console, "log",   JS_NewCFunction(ctx, js_console_log,   "log",   1));
-    JS_SetPropertyStr(ctx, console, "info",  JS_NewCFunction(ctx, js_console_log,   "info",  1));
-    JS_SetPropertyStr(ctx, console, "warn",  JS_NewCFunction(ctx, js_console_warn,  "warn",  1));
-    JS_SetPropertyStr(ctx, console, "error", JS_NewCFunction(ctx, js_console_error, "error", 1));
-    JS_SetPropertyStr(ctx, console, "debug", JS_NewCFunction(ctx, js_console_debug, "debug", 1));
-    JS_SetPropertyStr(ctx, console, "assert",JS_NewCFunction(ctx, js_console_assert,"assert",2));
+    console.def("error", 0, [](Value, std::span<const Value> a) {
+        Runtime::log(Runtime::LogLevel::Error, "%s", formatArgs(a).c_str());
+        return ev::undefined();
+    });
 
-    JS_SetPropertyStr(ctx, global, "console", console);
+    console.def("debug", 0, [](Value, std::span<const Value> a) {
+        Runtime::log(Runtime::LogLevel::Debug, "%s", formatArgs(a).c_str());
+        return ev::undefined();
+    });
 
-    // console.time / timeEnd / timeLog as JS polyfill
-    JSValue r = JS_Eval(ctx, js_console_time, strlen(js_console_time),
-                        "<console>", JS_EVAL_TYPE_GLOBAL);
-    JS_FreeValue(ctx, r);
-    JS_FreeValue(ctx, global);
+    console.def("assert", 1, [](Value, std::span<const Value> a) {
+        if (a.empty()) return ev::undefined();
+        if (boolAt(a, 0)) return ev::undefined();
+        std::string msg = "Assertion failed";
+        if (a.size() > 1) {
+            msg += ": " + formatArgs(a.subspan(1));
+        }
+        Runtime::log(Runtime::LogLevel::Error, "%s", msg.c_str());
+        return ev::undefined();
+    });
+
+    console.def("time", 0, [](Value, std::span<const Value> a) {
+        std::string label = hasArg(a, 0) ? strAt(a, 0) : "default";
+        consoleTimers()[label] = std::chrono::steady_clock::now();
+        return ev::undefined();
+    });
+
+    console.def("timeLog", 0, [](Value, std::span<const Value> a) {
+        std::string label = hasArg(a, 0) ? strAt(a, 0) : "default";
+        auto& t = consoleTimers();
+        auto it = t.find(label);
+        if (it == t.end()) {
+            Runtime::log(Runtime::LogLevel::Warn, "Timer '%s' does not exist", label.c_str());
+            return ev::undefined();
+        }
+        auto now = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - it->second).count();
+        std::string extra;
+        if (a.size() > 1) {
+            extra = " " + formatArgs(a.subspan(1));
+        }
+        Runtime::log(Runtime::LogLevel::Info, "%s: %.3fms%s", label.c_str(), ms, extra.c_str());
+        return ev::undefined();
+    });
+
+    console.def("timeEnd", 0, [](Value, std::span<const Value> a) {
+        std::string label = hasArg(a, 0) ? strAt(a, 0) : "default";
+        auto& t = consoleTimers();
+        auto it = t.find(label);
+        if (it == t.end()) {
+            Runtime::log(Runtime::LogLevel::Warn, "Timer '%s' does not exist", label.c_str());
+            return ev::undefined();
+        }
+        auto now = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - it->second).count();
+        t.erase(it);
+        Runtime::log(Runtime::LogLevel::Info, "%s: %.3fms", label.c_str(), ms);
+        return ev::undefined();
+    });
+
+    ev::setGlobalValue("console", console.get());
 }
 
 } // namespace brokit::api

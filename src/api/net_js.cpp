@@ -1,28 +1,15 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "net.js.h"
-#include "dgram.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_net_main();
+extern "C" void bronze_dgram_main();
 
 namespace brokit::api {
 
-// JS layer for the native net bindings: the Node-compat `net` and `dgram`
-// modules. Both extend EventEmitter, so installNetJS must run after
-// installEvents (api.cpp orders it so).
-void installNetJS(JSContext* ctx)
+void installNetJS()
 {
-    JSValue r = JS_Eval(ctx, js_net, strlen(js_net), "<net>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
-
-    r = JS_Eval(ctx, js_dgram, strlen(js_dgram), "<dgram>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_net_main);
+    bronze::embed::runEntry(bronze_dgram_main);
 }
 
 } // namespace brokit::api

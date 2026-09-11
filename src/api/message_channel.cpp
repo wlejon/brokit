@@ -1,19 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "message_channel.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_message_channel_main();
 
 namespace brokit::api {
 
-void installMessageChannel(JSContext* ctx)
+void installMessageChannel()
 {
-    JSValue r = JS_Eval(ctx, js_message_channel, strlen(js_message_channel),
-                        "<message-channel>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_message_channel_main);
 }
 
 } // namespace brokit::api

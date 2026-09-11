@@ -1,6 +1,5 @@
 add_executable(brokit_test main.cpp)
-target_link_libraries(brokit_test PRIVATE brokit)
-target_include_directories(brokit_test PRIVATE ${CMAKE_SOURCE_DIR}/third_party/quickjs)
+target_link_libraries(brokit_test PRIVATE brokit bronze::runtime_shared)
 
 # Register one ctest per JS file so `ctest` drives the suite uniformly across
 # platforms (brokit_test <file.js> runs a single file and returns non-zero on

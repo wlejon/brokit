@@ -1,19 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "treewalker.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_treewalker_main();
 
 namespace brokit::api {
 
-void installTreeWalker(JSContext* ctx)
+void installTreeWalker()
 {
-    JSValue r = JS_Eval(ctx, js_treewalker, strlen(js_treewalker),
-                        "<treewalker>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_treewalker_main);
 }
 
 } // namespace brokit::api

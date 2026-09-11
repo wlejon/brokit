@@ -1,194 +1,217 @@
 #include "runtime/runtime.h"
 
-#include <fstream>
-#include <sstream>
-#include <cstring>
+#include "cli/driver.h"
+#include "embed/embed.h"
+#include "api/api.h"
+
+#include <optional>
+
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <atomic>
 
-extern "C" {
-#include "quickjs.h"
-}
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+namespace fs = std::filesystem;
 
 namespace brokit {
 
-// ---------------------------------------------------------------------------
-// Module loader helpers (file-based)
-// ---------------------------------------------------------------------------
+namespace {
 
-static char* module_normalize(JSContext* ctx, const char* base_name,
-                              const char* name, void* /*opaque*/)
-{
-    if (!name) return nullptr;
+constexpr const char* kFingerprintSymbol = "bronze_object_abi_fingerprint";
+constexpr const char* kEntrySymbol = "bronze_main";
 
-    std::string result;
-    if (name[0] == '.' && base_name) {
-        // Resolve relative to the directory of the base module.
-        std::string base(base_name);
-        auto slash = base.find_last_of("/\\");
-        if (slash != std::string::npos) {
-            result = base.substr(0, slash + 1) + name;
-        } else {
-            result = name;
-        }
-    } else {
-        result = name;
-    }
+using ModuleHandle = void*;
 
-    char* buf = static_cast<char*>(js_malloc(ctx, result.size() + 1));
-    if (buf) {
-        std::memcpy(buf, result.c_str(), result.size() + 1);
-    }
-    return buf;
-}
-
-static JSModuleDef* module_loader(JSContext* ctx, const char* module_name,
-                                  void* /*opaque*/)
-{
-    std::ifstream file(module_name, std::ios::in | std::ios::binary);
-    if (!file) {
-        JS_ThrowReferenceError(ctx, "could not load module '%s'", module_name);
+ModuleHandle openModule(const std::string& path, std::string& error) {
+#ifdef _WIN32
+    std::error_code ec;
+    const fs::path abs = fs::absolute(path, ec);
+    const std::wstring wide = (ec ? fs::path(path) : abs).wstring();
+    HMODULE h = ::LoadLibraryExW(wide.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!h) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "Windows error %lu",
+                      static_cast<unsigned long>(::GetLastError()));
+        error = buf;
         return nullptr;
     }
-
-    std::ostringstream ss;
-    ss << file.rdbuf();
-    std::string source = ss.str();
-
-    JSValue func = JS_Eval(ctx, source.c_str(), source.size(), module_name,
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (JS_IsException(func)) {
-        Runtime::checkException(ctx, func);
+    return reinterpret_cast<ModuleHandle>(h);
+#else
+    void* h = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char* msg = ::dlerror();
+        error = msg ? msg : "dlopen failed";
         return nullptr;
     }
-
-    JSModuleDef* m = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(func));
-    JS_FreeValue(ctx, func);
-    return m;
+    return h;
+#endif
 }
 
-// ---------------------------------------------------------------------------
-// Runtime implementation
-// ---------------------------------------------------------------------------
+void* moduleSymbol(ModuleHandle handle, const char* name) {
+#ifdef _WIN32
+    return reinterpret_cast<void*>(
+        ::GetProcAddress(reinterpret_cast<HMODULE>(handle), name));
+#else
+    return ::dlsym(handle, name);
+#endif
+}
+
+static std::atomic<uint64_t> g_evalCounter{1};
+
+} // namespace
 
 Runtime::Runtime()
 {
-    rt_ = JS_NewRuntime();
-    if (!rt_) {
-        log(LogLevel::Error, "Failed to create QuickJS runtime");
-        return;
-    }
-
-    JS_SetMemoryLimit(rt_, 256 * 1024 * 1024); // 256 MB
-    JS_SetMaxStackSize(rt_, 8 * 1024 * 1024);  // 8 MB stack
-
-    ctx_ = JS_NewContext(rt_);
-    if (!ctx_) {
-        log(LogLevel::Error, "Failed to create QuickJS context");
-        JS_FreeRuntime(rt_);
-        rt_ = nullptr;
-        return;
+    // Try to find default brokit.globals
+    for (const auto& candidate : {
+        fs::current_path() / "src/api/brokit.globals",
+        fs::current_path() / "brokit.globals",
+        fs::path(__FILE__).parent_path().parent_path() / "api/brokit.globals"
+    }) {
+        if (fs::exists(candidate)) {
+            globalsPath_ = candidate.string();
+            break;
+        }
     }
 }
 
 Runtime::~Runtime()
 {
-    if (ctx_) {
-        JS_FreeContext(ctx_);
-        ctx_ = nullptr;
-    }
-    if (rt_) {
-        JS_FreeRuntime(rt_);
-        rt_ = nullptr;
-    }
 }
 
-bool Runtime::eval(const std::string& code, const std::string& filename)
+bool Runtime::loadModule(const std::string& modulePath)
 {
-    JSValue result = JS_Eval(ctx_, code.c_str(), code.size(),
-                             filename.c_str(), JS_EVAL_TYPE_GLOBAL);
-    if (checkException(ctx_, result)) {
-        return false;
-    }
-    JS_FreeValue(ctx_, result);
-    return true;
-}
-
-bool Runtime::evalModule(const std::string& code, const std::string& filename)
-{
-    JSValue func = JS_Eval(ctx_, code.c_str(), code.size(),
-                           filename.c_str(),
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (checkException(ctx_, func)) {
+    std::string error;
+    ModuleHandle handle = openModule(modulePath, error);
+    if (!handle) {
+        log(LogLevel::Error, "Could not load module %s: %s", modulePath.c_str(), error.c_str());
         return false;
     }
 
-    JSValue result = JS_EvalFunction(ctx_, func);
-    if (checkException(ctx_, result)) {
+    const auto* moduleAbi = static_cast<const uint32_t*>(moduleSymbol(handle, kFingerprintSymbol));
+    if (!moduleAbi) {
+        log(LogLevel::Error, "%s exports no %s (not a bronze module)", modulePath.c_str(), kFingerprintSymbol);
         return false;
     }
-    JS_FreeValue(ctx_, result);
+
+    const uint32_t kRuntimeAbi = bronze::embed::abiFingerprint();
+    if (*moduleAbi != kRuntimeAbi) {
+        log(LogLevel::Error, "%s compiled against bronze ABI %08x, but runtime speaks %08x",
+            modulePath.c_str(), *moduleAbi, kRuntimeAbi);
+        return false;
+    }
+
+    auto entry = reinterpret_cast<void (*)()>(moduleSymbol(handle, kEntrySymbol));
+    if (!entry) {
+        log(LogLevel::Error, "%s carries bronze ABI stamp but exports no %s", modulePath.c_str(), kEntrySymbol);
+        return false;
+    }
+
+    bronze::embed::runEntry(entry);
     return true;
 }
 
 bool Runtime::loadFile(const std::string& path)
 {
-    std::ifstream file(path, std::ios::in | std::ios::binary);
-    if (!file) {
-        log(LogLevel::Error, "Failed to open file: %s", path.c_str());
+    fs::path p(path);
+    if (!fs::exists(p)) {
+        log(LogLevel::Error, "loadFile: file not found: %s", path.c_str());
         return false;
     }
 
-    std::ostringstream ss;
-    ss << file.rdbuf();
-    return eval(ss.str(), path);
+    std::string ext = p.extension().string();
+    if (ext == ".so" || ext == ".dll" || ext == ".dylib") {
+        return loadModule(path);
+    }
+
+    // Compile .js to a loadable shared library module
+    fs::path scratchDir = fs::temp_directory_path() / "brokit_build";
+    fs::create_directories(scratchDir);
+
+    std::error_code ec;
+    fs::path absPath = fs::absolute(p, ec);
+    fs::path absScratch = fs::absolute(scratchDir, ec);
+
+    std::optional<api::RequireDirGuard> guard;
+    if (absPath.parent_path() != absScratch) {
+        guard.emplace(absPath.parent_path());
+    }
+
+    uint64_t id = g_evalCounter.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    fs::path outSo = scratchDir / (p.stem().string() + "_" + std::to_string(id) + ".dll");
+#elif defined(__APPLE__)
+    fs::path outSo = scratchDir / (p.stem().string() + "_" + std::to_string(id) + ".dylib");
+#else
+    fs::path outSo = scratchDir / (p.stem().string() + "_" + std::to_string(id) + ".so");
+#endif
+
+    std::string err;
+    int status = bronze::cli::runBuild(
+        path,
+        outSo.string(),
+        &err,
+        /*infer=*/true,
+        /*timings=*/false,
+        /*emitObj=*/false,
+        /*hostGlobalsPath=*/globalsPath_,
+        /*inferStats=*/false,
+        /*statsOut=*/nullptr,
+        /*moduleRoots=*/{},
+        /*entrySymbol=*/{},
+        /*emitShared=*/true
+    );
+
+    if (status != 0) {
+        log(LogLevel::Error, "Compilation failed for %s:\n%s", path.c_str(), err.c_str());
+        return false;
+    }
+
+    return loadModule(outSo.string());
 }
 
-JSValue Runtime::globalObject() const
+bool Runtime::eval(const std::string& code, const std::string& filename)
 {
-    return JS_GetGlobalObject(ctx_);
+    fs::path scratchDir = fs::temp_directory_path() / "brokit_build";
+    fs::create_directories(scratchDir);
+
+    uint64_t id = g_evalCounter.fetch_add(1, std::memory_order_relaxed);
+    fs::path tempJs = scratchDir / ("eval_" + std::to_string(id) + ".js");
+
+    std::ofstream out(tempJs, std::ios::out | std::ios::binary);
+    if (!out) {
+        log(LogLevel::Error, "eval: failed to create temporary script file: %s", tempJs.string().c_str());
+        return false;
+    }
+    out << code;
+    out.close();
+
+    return loadFile(tempJs.string());
+}
+
+bool Runtime::evalModule(const std::string& code, const std::string& filename)
+{
+    return eval(code, filename);
 }
 
 void Runtime::executePendingJobs()
 {
-    JSContext* pctx = nullptr;
-    while (JS_ExecutePendingJob(rt_, &pctx) > 0) {
-        // keep draining
-    }
+    bronze::embed::drainMicrotasks();
 }
 
-void Runtime::setModuleLoader(const std::string& basePath)
+void Runtime::collectGarbage()
 {
-    moduleBasePath_ = basePath;
-    JS_SetModuleLoaderFunc(rt_, module_normalize, module_loader, nullptr);
-}
-
-bool Runtime::checkException(JSContext* ctx, JSValue val)
-{
-    if (!JS_IsException(val))
-        return false;
-
-    JSValue exception = JS_GetException(ctx);
-    const char* str = JS_ToCString(ctx, exception);
-    if (str) {
-        log(LogLevel::Error, "JS Exception: %s", str);
-        JS_FreeCString(ctx, str);
-    }
-
-    if (JS_IsObject(exception)) {
-        JSValue stack = JS_GetPropertyStr(ctx, exception, "stack");
-        if (!JS_IsUndefined(stack)) {
-            const char* stack_str = JS_ToCString(ctx, stack);
-            if (stack_str) {
-                log(LogLevel::Error, "Stack:\n%s", stack_str);
-                JS_FreeCString(ctx, stack_str);
-            }
-        }
-        JS_FreeValue(ctx, stack);
-    }
-
-    JS_FreeValue(ctx, exception);
-    return true;
+    bronze::embed::collectGarbage();
 }
 
 void Runtime::setLogCallback(LogCallback cb)

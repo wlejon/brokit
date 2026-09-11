@@ -1,50 +1,29 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
+#include "api/arg_reader.h"
+#include "api/host_proxy.h"
+#include "api/object_builder.h"
 
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <string>
-
-extern "C" {
-#include "quickjs.h"
-}
+#include <vector>
 
 namespace brokit::api {
 
-// ---------------------------------------------------------------------------
-// Per-context storage state (heap-allocated, pointer stashed in JS global)
-// ---------------------------------------------------------------------------
+namespace {
 
 struct StorageState {
-    std::map<std::string, std::string> storage;
-    std::string storagePath; // empty = in-memory only (sessionStorage)
+    std::map<std::string, std::string> items;
+    std::string storagePath; // empty = in-memory only
 };
 
-static const char* kLocalStorageKey = "__brokit_localStorage_ptr";
-static const char* kSessionStorageKey = "__brokit_sessionStorage_ptr";
-
-static StorageState* getState(JSContext* ctx, const char* key) {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue val = JS_GetPropertyStr(ctx, global, key);
-    StorageState* state = nullptr;
-    if (JS_IsNumber(val)) {
-        int64_t ptr = 0;
-        JS_ToInt64(ctx, &ptr, val);
-        state = reinterpret_cast<StorageState*>(static_cast<intptr_t>(ptr));
-    }
-    JS_FreeValue(ctx, val);
-    JS_FreeValue(ctx, global);
-    return state;
-}
-
-// ---------------------------------------------------------------------------
-// JSON persistence (minimal, no external deps)
-// ---------------------------------------------------------------------------
+thread_local StorageState g_localStorage;
+thread_local StorageState g_sessionStorage;
 
 static void loadStorage(StorageState* state)
 {
-    state->storage.clear();
+    state->items.clear();
     if (state->storagePath.empty()) return;
 
     std::ifstream file(state->storagePath);
@@ -93,7 +72,7 @@ static void loadStorage(StorageState* state)
 
         std::string value = parseString(pos);
         if (!key.empty()) {
-            state->storage[key] = value;
+            state->items[key] = value;
         }
     }
 }
@@ -121,7 +100,7 @@ static void saveStorage(StorageState* state)
 
     file << "{\n";
     bool first = true;
-    for (auto& [key, val] : state->storage) {
+    for (const auto& [key, val] : state->items) {
         if (!first) file << ",\n";
         file << "  \"" << escapeJson(key) << "\": \"" << escapeJson(val) << "\"";
         first = false;
@@ -129,141 +108,106 @@ static void saveStorage(StorageState* state)
     file << "\n}\n";
 }
 
-// ---------------------------------------------------------------------------
-// Shared JS callback implementations
-// ---------------------------------------------------------------------------
+bronze::Value makeStorageValue(StorageState* st)
+{
+    ObjectBuilder b;
+    b.def("getItem", 1, [st](bronze::Value, std::span<const bronze::Value> a) {
+        bronze::Value keyV = argAt(a, 0);
+        if (ev::isObject(keyV) || ev::isUndefined(keyV)) return ev::null();
+        std::string key = ev::toUtf8(keyV);
+        auto it = st->items.find(key);
+        if (it == st->items.end()) return ev::null();
+        return ev::fromUtf8(it->second);
+    });
 
-static std::string jsStr(JSContext* ctx, JSValueConst val) {
-    const char* s = JS_ToCString(ctx, val);
-    std::string r = s ? s : "";
-    if (s) JS_FreeCString(ctx, s);
-    return r;
+    b.def("setItem", 2, [st](bronze::Value, std::span<const bronze::Value> a) {
+        bronze::Value keyV = argAt(a, 0);
+        bronze::Value valV = argAt(a, 1);
+        if (!ev::isObject(keyV) && !ev::isUndefined(keyV)) {
+            std::string key = ev::toUtf8(keyV);
+            std::string val = (!ev::isObject(valV) && !ev::isUndefined(valV)) ? ev::toUtf8(valV) : "";
+            st->items[key] = val;
+            saveStorage(st);
+        }
+        return ev::undefined();
+    });
+
+    b.def("removeItem", 1, [st](bronze::Value, std::span<const bronze::Value> a) {
+        bronze::Value keyV = argAt(a, 0);
+        if (!ev::isObject(keyV) && !ev::isUndefined(keyV)) {
+            st->items.erase(ev::toUtf8(keyV));
+            saveStorage(st);
+        }
+        return ev::undefined();
+    });
+
+    b.def("clear", 0, [st](bronze::Value, std::span<const bronze::Value>) {
+        st->items.clear();
+        saveStorage(st);
+        return ev::undefined();
+    });
+
+    b.def("key", 1, [st](bronze::Value, std::span<const bronze::Value> a) {
+        int idx = i32At(a, 0);
+        if (idx < 0 || static_cast<size_t>(idx) >= st->items.size()) return ev::null();
+        auto it = st->items.begin();
+        std::advance(it, idx);
+        return ev::fromUtf8(it->first);
+    });
+
+    b.accessor("length", [st](bronze::Value, std::span<const bronze::Value>) {
+        return ev::fromDouble(static_cast<double>(st->items.size()));
+    }, nullptr);
+
+    HostProxyTraps t;
+    t.methods = b.get();
+    t.get = [st](const std::string& key, bronze::Value& out) {
+        auto it = st->items.find(key);
+        if (it == st->items.end()) return false;
+        out = ev::fromUtf8(it->second);
+        return true;
+    };
+    t.set = [st](const std::string& key, bronze::Value v) {
+        if (ev::isObject(v)) return;
+        st->items[key] = ev::isUndefined(v) ? "undefined" : ev::toUtf8(v);
+        saveStorage(st);
+    };
+    t.has = [st](const std::string& key) {
+        return st->items.find(key) != st->items.end();
+    };
+    t.ownKeys = [st]() {
+        std::vector<std::string> keys;
+        for (const auto& [k, v] : st->items) {
+            (void)v;
+            keys.push_back(k);
+        }
+        return keys;
+    };
+    t.remove = [st](const std::string& key) {
+        if (st->items.erase(key)) saveStorage(st);
+    };
+
+    return makeHostProxy(std::move(t));
 }
 
-// Template-based factory for storage JS functions — avoids duplicating
-// localStorage and sessionStorage implementations.
-struct StorageFunctions {
-    const char* stateKey;
+} // namespace
 
-    StorageState* get(JSContext* ctx) const {
-        return getState(ctx, stateKey);
-    }
-};
-
-static StorageFunctions g_localFns  = { kLocalStorageKey };
-static StorageFunctions g_sessionFns = { kSessionStorageKey };
-
-// Macro to define JS functions for a storage type
-#define DEFINE_STORAGE_FUNCS(PREFIX, FNSPTR)                                 \
-static JSValue PREFIX##_getItem(JSContext* ctx, JSValueConst, int argc,      \
-                                JSValueConst* argv) {                        \
-    if (argc < 1) return JS_NULL;                                            \
-    auto* st = FNSPTR.get(ctx); if (!st) return JS_NULL;                     \
-    auto it = st->storage.find(jsStr(ctx, argv[0]));                         \
-    if (it == st->storage.end()) return JS_NULL;                             \
-    return JS_NewString(ctx, it->second.c_str());                            \
-}                                                                            \
-static JSValue PREFIX##_setItem(JSContext* ctx, JSValueConst, int argc,      \
-                                JSValueConst* argv) {                        \
-    if (argc < 2) return JS_UNDEFINED;                                       \
-    auto* st = FNSPTR.get(ctx); if (!st) return JS_UNDEFINED;                \
-    st->storage[jsStr(ctx, argv[0])] = jsStr(ctx, argv[1]);                  \
-    saveStorage(st);                                                         \
-    return JS_UNDEFINED;                                                     \
-}                                                                            \
-static JSValue PREFIX##_removeItem(JSContext* ctx, JSValueConst, int argc,   \
-                                   JSValueConst* argv) {                     \
-    if (argc < 1) return JS_UNDEFINED;                                       \
-    auto* st = FNSPTR.get(ctx); if (!st) return JS_UNDEFINED;                \
-    st->storage.erase(jsStr(ctx, argv[0]));                                  \
-    saveStorage(st);                                                         \
-    return JS_UNDEFINED;                                                     \
-}                                                                            \
-static JSValue PREFIX##_clear(JSContext* ctx, JSValueConst, int,             \
-                              JSValueConst*) {                               \
-    auto* st = FNSPTR.get(ctx); if (!st) return JS_UNDEFINED;                \
-    st->storage.clear();                                                     \
-    saveStorage(st);                                                         \
-    return JS_UNDEFINED;                                                     \
-}                                                                            \
-static JSValue PREFIX##_key(JSContext* ctx, JSValueConst, int argc,          \
-                            JSValueConst* argv) {                            \
-    if (argc < 1) return JS_NULL;                                            \
-    auto* st = FNSPTR.get(ctx); if (!st) return JS_NULL;                     \
-    int32_t idx = 0; JS_ToInt32(ctx, &idx, argv[0]);                         \
-    if (idx < 0 || (size_t)idx >= st->storage.size()) return JS_NULL;        \
-    auto it = st->storage.begin(); std::advance(it, idx);                    \
-    return JS_NewString(ctx, it->first.c_str());                             \
-}                                                                            \
-static JSValue PREFIX##_length(JSContext* ctx, JSValueConst) {               \
-    auto* st = FNSPTR.get(ctx);                                              \
-    if (!st) return JS_NewInt32(ctx, 0);                                     \
-    return JS_NewInt32(ctx, (int32_t)st->storage.size());                    \
-}                                                                            \
-static const JSCFunctionListEntry PREFIX##_funcs[] = {                       \
-    JS_CFUNC_DEF("getItem", 1, PREFIX##_getItem),                            \
-    JS_CFUNC_DEF("setItem", 2, PREFIX##_setItem),                            \
-    JS_CFUNC_DEF("removeItem", 1, PREFIX##_removeItem),                      \
-    JS_CFUNC_DEF("clear", 0, PREFIX##_clear),                                \
-    JS_CFUNC_DEF("key", 1, PREFIX##_key),                                    \
-    JS_CGETSET_DEF("length", PREFIX##_length, nullptr),                      \
-};
-
-DEFINE_STORAGE_FUNCS(ls, g_localFns)
-DEFINE_STORAGE_FUNCS(ss, g_sessionFns)
-
-// ---------------------------------------------------------------------------
-// Install helpers
-// ---------------------------------------------------------------------------
-
-static void installStorageObject(JSContext* ctx, const char* name,
-                                 const char* stateKey, StorageState* state,
-                                 const JSCFunctionListEntry* funcs, int count)
+void installStorage()
 {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, stateKey,
-                      JS_NewInt64(ctx, static_cast<int64_t>(
-                          reinterpret_cast<intptr_t>(state))));
-
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, obj, funcs, count);
-    JS_SetPropertyStr(ctx, global, name, obj);
-    JS_FreeValue(ctx, global);
+    ev::setGlobalValue("localStorage", makeStorageValue(&g_localStorage));
+    ev::setGlobalValue("sessionStorage", makeStorageValue(&g_sessionStorage));
 }
 
-void installStorage(JSContext* ctx)
+void setStoragePath(const std::string& path)
 {
-    // localStorage — in-memory by default, call setStoragePath() for persistence
-    auto* localState = new StorageState();
-    installStorageObject(ctx, "localStorage", kLocalStorageKey, localState,
-                         ls_funcs, sizeof(ls_funcs) / sizeof(ls_funcs[0]));
-
-    // sessionStorage — always in-memory
-    auto* sessionState = new StorageState();
-    installStorageObject(ctx, "sessionStorage", kSessionStorageKey, sessionState,
-                         ss_funcs, sizeof(ss_funcs) / sizeof(ss_funcs[0]));
+    g_localStorage.storagePath = path;
+    loadStorage(&g_localStorage);
 }
 
-void setStoragePath(JSContext* ctx, const std::string& path)
+void cleanupStorage()
 {
-    auto* state = getState(ctx, kLocalStorageKey);
-    if (state) {
-        state->storagePath = path;
-        loadStorage(state);
-    }
-}
-
-void cleanupStorage(JSContext* ctx)
-{
-    auto* ls = getState(ctx, kLocalStorageKey);
-    delete ls;
-    auto* ss = getState(ctx, kSessionStorageKey);
-    delete ss;
-
-    JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, kLocalStorageKey, JS_UNDEFINED);
-    JS_SetPropertyStr(ctx, global, kSessionStorageKey, JS_UNDEFINED);
-    JS_FreeValue(ctx, global);
+    g_localStorage.items.clear();
+    g_sessionStorage.items.clear();
 }
 
 } // namespace brokit::api

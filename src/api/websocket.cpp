@@ -1,10 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
 
 #include <cstring>
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <span>
+#include <array>
 
 #include <curl/curl.h>
 
@@ -15,14 +18,13 @@ namespace brokit::api {
 // ---------------------------------------------------------------------------
 struct WSConnection {
     CURL* easy = nullptr;
-    JSContext* ctx = nullptr;
     int id = 0;
 
     // Connection state: 0=connecting, 1=open, 2=closing, 3=closed
     int state = 0;
 
     // Promise for initial connection
-    JSValue resolving[2] = { JS_UNDEFINED, JS_UNDEFINED };
+    PersistentSlot promise;
 
     // Buffered received messages (text or binary)
     struct Message {
@@ -46,10 +48,7 @@ struct WSConnection {
     std::string errorMsg;
 
     // Ticks a closed (state 3) connection has survived without a JS reader
-    // claiming its close event. A connection wrapped by a WebSocket instance is
-    // drained and erased in the same tick it closes; anything still counting up
-    // here is orphaned (opened through the raw __brokit_ws_* bindings) and gets
-    // reaped so it stops holding __brokit_ws_has_pending() true forever.
+    // claiming its close event.
     int closedSweeps = 0;
 };
 
@@ -70,31 +69,22 @@ static size_t wsWriteCallback(char*, size_t size, size_t nmemb, void*)
 // ---------------------------------------------------------------------------
 // __brokit_ws_connect(url, protocols?) → { id, promise }
 // ---------------------------------------------------------------------------
-static JSValue js_ws_connect(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_ws_connect(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "ws_connect: URL required");
+    ArgReader reader(args);
+    std::string url = reader.getString(0, "");
+    if (url.empty()) return ev::throwTypeError("ws_connect: URL required");
 
-    const char* urlStr = JS_ToCString(ctx, argv[0]);
-    if (!urlStr) return JS_EXCEPTION;
-    std::string url(urlStr);
-    JS_FreeCString(ctx, urlStr);
-
-    // Get optional protocols string
-    std::string protocols;
-    if (argc >= 2 && JS_IsString(argv[1])) {
-        const char* p = JS_ToCString(ctx, argv[1]);
-        if (p) { protocols = p; JS_FreeCString(ctx, p); }
-    }
+    std::string protocols = reader.getString(1, "");
 
     auto* conn = new WSConnection();
-    conn->ctx = ctx;
     conn->id = g_ws_nextId++;
     conn->state = 0; // connecting
 
     conn->easy = curl_easy_init();
     if (!conn->easy) {
         delete conn;
-        return JS_ThrowInternalError(ctx, "ws_connect: curl_easy_init failed");
+        return ev::throwError("ws_connect: curl_easy_init failed");
     }
 
     curl_easy_setopt(conn->easy, CURLOPT_URL, url.c_str());
@@ -110,17 +100,10 @@ static JSValue js_ws_connect(JSContext* ctx, JSValueConst, int argc, JSValueCons
         struct curl_slist* hdrs = nullptr;
         hdrs = curl_slist_append(hdrs, header.c_str());
         curl_easy_setopt(conn->easy, CURLOPT_HTTPHEADER, hdrs);
-        // Note: curl_slist leak — in production we'd track and free this.
-        // For now, it lives as long as the easy handle.
     }
 
     // Create promise for connection result
-    JSValue promise = JS_NewPromiseCapability(ctx, conn->resolving);
-    if (JS_IsException(promise)) {
-        curl_easy_cleanup(conn->easy);
-        delete conn;
-        return promise;
-    }
+    conn->promise.set(ev::createPromise());
 
     // Add to multi
     if (!g_ws_multi) {
@@ -131,77 +114,68 @@ static JSValue js_ws_connect(JSContext* ctx, JSValueConst, int argc, JSValueCons
     g_ws_conns[conn->id] = conn;
 
     // Return { id, promise }
-    JSValue result = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, result, "id", JS_NewInt32(ctx, conn->id));
-    JS_SetPropertyStr(ctx, result, "promise", JS_DupValue(ctx, promise));
-    JS_FreeValue(ctx, promise);
-    return result;
+    ObjectBuilder result;
+    result.set("id", static_cast<double>(conn->id));
+    result.set("promise", conn->promise.get());
+    return result.build();
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_ws_send(id, data, binary) → bool
 // ---------------------------------------------------------------------------
-static JSValue js_ws_send(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_ws_send(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_FALSE;
+    ArgReader reader(args);
+    if (args.size() < 2) return ev::fromBool(false);
 
-    int id = 0;
-    JS_ToInt32(ctx, &id, argv[0]);
-
+    int id = reader.getInt(0, 0);
     auto it = g_ws_conns.find(id);
     if (it == g_ws_conns.end() || it->second->state != 1)
-        return JS_FALSE;
+        return ev::fromBool(false);
 
     WSConnection* conn = it->second;
-    bool binary = (argc >= 3 && JS_ToBool(ctx, argv[2]));
+    bool binary = reader.getBool(2, false);
+    bronze::Value dataVal = reader.get(1);
 
     size_t sent = 0;
-    CURLcode rc;
+    CURLcode rc = CURLE_OK;
 
     if (binary) {
-        // ArrayBuffer or Uint8Array
-        size_t len = 0;
-        uint8_t* buf = JS_GetUint8Array(ctx, &len, argv[1]);
-        if (!buf) {
-            // Try ArrayBuffer
-            buf = JS_GetArrayBuffer(ctx, &len, argv[1]);
+        if (auto info = ev::typedArrayInfo(dataVal)) {
+            rc = curl_ws_send(conn->easy, info.data, info.byteLength, &sent, 0, CURLWS_BINARY);
+        } else if (auto info = ev::arrayBufferInfo(dataVal)) {
+            rc = curl_ws_send(conn->easy, info.data, info.byteLength, &sent, 0, CURLWS_BINARY);
+        } else {
+            return ev::fromBool(false);
         }
-        if (!buf) return JS_FALSE;
-
-        rc = curl_ws_send(conn->easy, buf, len, &sent, 0, CURLWS_BINARY);
     } else {
-        // Text string
-        const char* str = JS_ToCString(ctx, argv[1]);
-        if (!str) return JS_FALSE;
-        size_t len = strlen(str);
-        rc = curl_ws_send(conn->easy, str, len, &sent, 0, CURLWS_TEXT);
-        JS_FreeCString(ctx, str);
+        std::string str = ev::toUtf8(dataVal);
+        rc = curl_ws_send(conn->easy, str.data(), str.size(), &sent, 0, CURLWS_TEXT);
     }
 
-    return JS_NewBool(ctx, rc == CURLE_OK);
+    return ev::fromBool(rc == CURLE_OK);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_ws_close(id, code?, reason?) → bool
 // ---------------------------------------------------------------------------
-static JSValue js_ws_close(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_ws_close(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_FALSE;
+    if (args.empty()) return ev::fromBool(false);
 
-    int id = 0;
-    JS_ToInt32(ctx, &id, argv[0]);
+    ArgReader reader(args);
+    int id = reader.getInt(0, 0);
 
     auto it = g_ws_conns.find(id);
-    if (it == g_ws_conns.end()) return JS_FALSE;
+    if (it == g_ws_conns.end()) return ev::fromBool(false);
 
     WSConnection* conn = it->second;
-    if (conn->state >= 2) return JS_FALSE; // already closing/closed
+    if (conn->state >= 2) return ev::fromBool(false); // already closing/closed
 
     // If still connecting, abort immediately
     if (conn->state == 0) {
         if (conn->easy && g_ws_multi) {
             curl_multi_remove_handle(g_ws_multi, conn->easy);
-            // Remove from connecting list
             for (auto it2 = g_ws_connecting.begin(); it2 != g_ws_connecting.end(); ++it2) {
                 if (*it2 == conn) { g_ws_connecting.erase(it2); break; }
             }
@@ -209,30 +183,16 @@ static JSValue js_ws_close(JSContext* ctx, JSValueConst, int argc, JSValueConst*
         if (conn->easy) { curl_easy_cleanup(conn->easy); conn->easy = nullptr; }
         conn->state = 3; // closed
         conn->closeCode = 1006;
-        // Free promise callbacks
-        JS_FreeValue(ctx, conn->resolving[0]);
-        JS_FreeValue(ctx, conn->resolving[1]);
-        conn->resolving[0] = JS_UNDEFINED;
-        conn->resolving[1] = JS_UNDEFINED;
-        // Clean up from map
+        conn->promise.reset();
         g_ws_conns.erase(it);
         delete conn;
-        return JS_TRUE;
+        return ev::fromBool(true);
     }
 
     conn->state = 2; // closing
 
-    // Build close frame payload: 2-byte code + optional reason
-    int code = 1000;
-    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
-        JS_ToInt32(ctx, &code, argv[1]);
-    }
-
-    std::string reason;
-    if (argc >= 3 && JS_IsString(argv[2])) {
-        const char* r = JS_ToCString(ctx, argv[2]);
-        if (r) { reason = r; JS_FreeCString(ctx, r); }
-    }
+    int code = reader.getInt(1, 1000);
+    std::string reason = reader.getString(2, "");
 
     // Close frame: 2-byte network-order code + reason
     std::vector<uint8_t> payload;
@@ -246,22 +206,21 @@ static JSValue js_ws_close(JSContext* ctx, JSValueConst, int argc, JSValueConst*
     conn->closeCode = code;
     conn->closeReason = reason;
 
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_ws_recv(id) → { type, data, binary, code, reason } | null
-// Poll for received messages.
 // ---------------------------------------------------------------------------
-static JSValue js_ws_recv(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_ws_recv(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_NULL;
+    if (args.empty()) return ev::null();
 
-    int id = 0;
-    JS_ToInt32(ctx, &id, argv[0]);
+    ArgReader reader(args);
+    int id = reader.getInt(0, 0);
 
     auto it = g_ws_conns.find(id);
-    if (it == g_ws_conns.end()) return JS_NULL;
+    if (it == g_ws_conns.end()) return ev::null();
 
     WSConnection* conn = it->second;
 
@@ -269,70 +228,66 @@ static JSValue js_ws_recv(JSContext* ctx, JSValueConst, int argc, JSValueConst* 
         auto msg = std::move(conn->inbox.front());
         conn->inbox.erase(conn->inbox.begin());
 
-        JSValue result = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, result, "type", JS_NewString(ctx, "message"));
-        JS_SetPropertyStr(ctx, result, "binary", JS_NewBool(ctx, msg.binary));
+        ObjectBuilder result;
+        result.set("type", "message");
+        result.set("binary", msg.binary);
 
         if (msg.binary) {
-            JSValue u8 = JS_NewUint8ArrayCopy(ctx, msg.data.data(), msg.data.size());
-            JS_SetPropertyStr(ctx, result, "data", u8);
+            bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(msg.data.data(), msg.data.size()));
+            bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(msg.data.size()));
+            result.set("data", u8);
         } else {
-            JS_SetPropertyStr(ctx, result, "data",
-                JS_NewStringLen(ctx, reinterpret_cast<const char*>(msg.data.data()),
-                                msg.data.size()));
+            result.set("data", std::string(reinterpret_cast<const char*>(msg.data.data()), msg.data.size()));
         }
-        return result;
+        return result.build();
     }
 
     // Check if connection has an error
     if (!conn->errorMsg.empty()) {
-        JSValue result = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, result, "type", JS_NewString(ctx, "error"));
-        JS_SetPropertyStr(ctx, result, "data",
-            JS_NewString(ctx, conn->errorMsg.c_str()));
+        ObjectBuilder result;
+        result.set("type", "error");
+        result.set("data", conn->errorMsg);
         conn->errorMsg.clear();
-        return result;
+        return result.build();
     }
 
     // Check if closed
     if (conn->state == 3) {
-        JSValue result = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, result, "type", JS_NewString(ctx, "close"));
-        JS_SetPropertyStr(ctx, result, "code", JS_NewInt32(ctx, conn->closeCode));
-        JS_SetPropertyStr(ctx, result, "reason",
-            JS_NewString(ctx, conn->closeReason.c_str()));
-        // Clean up (established handles are still in the multi — see js_ws_tick)
+        ObjectBuilder result;
+        result.set("type", "close");
+        result.set("code", static_cast<double>(conn->closeCode));
+        result.set("reason", conn->closeReason);
         g_ws_conns.erase(it);
         if (conn->easy) {
             if (g_ws_multi) curl_multi_remove_handle(g_ws_multi, conn->easy);
             curl_easy_cleanup(conn->easy);
         }
         delete conn;
-        return result;
+        return result.build();
     }
 
-    return JS_NULL;
+    return ev::null();
 }
 
 // ---------------------------------------------------------------------------
-// __brokit_ws_state(id) → int  (0=connecting, 1=open, 2=closing, 3=closed, -1=gone)
+// __brokit_ws_state(id) → int (0=connecting, 1=open, 2=closing, 3=closed, -1=gone)
 // ---------------------------------------------------------------------------
-static JSValue js_ws_state(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_ws_state(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_NewInt32(ctx, -1);
-    int id = 0;
-    JS_ToInt32(ctx, &id, argv[0]);
+    if (args.empty()) return ev::fromDouble(-1);
+    ArgReader reader(args);
+    int id = reader.getInt(0, 0);
     auto it = g_ws_conns.find(id);
-    if (it == g_ws_conns.end()) return JS_NewInt32(ctx, -1);
-    return JS_NewInt32(ctx, it->second->state);
+    if (it == g_ws_conns.end()) return ev::fromDouble(-1);
+    return ev::fromDouble(it->second->state);
 }
 
 // ---------------------------------------------------------------------------
 // Tick: pump connecting handles and poll for incoming frames
 // ---------------------------------------------------------------------------
-static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static bronze::Value js_ws_tick(bronze::Value, std::span<const bronze::Value>)
 {
-    if (!g_ws_multi && g_ws_conns.empty()) return JS_NewInt32(ctx, 0);
+    if (!g_ws_multi && g_ws_conns.empty()) return ev::fromDouble(0);
 
     // Pump curl_multi for connecting handles
     if (g_ws_multi && !g_ws_connecting.empty()) {
@@ -356,53 +311,35 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
             }
             if (!conn) continue;
 
-            // NOTE: on success the easy handle STAYS in the multi. With
-            // CONNECT_ONLY=2 the upgraded TCP connection is owned by the
-            // multi's pool; curl_multi_remove_handle here makes curl return
-            // the connection to the pool and close it ("left intact" then
-            // "closing connection"), after which every curl_ws_recv/send
-            // fails with CURLE_BAD_FUNCTION_ARGUMENT ("[WS] connection not
-            // found"). Removal happens at teardown, right before
-            // curl_easy_cleanup.
             if (msg->data.result != CURLE_OK)
                 curl_multi_remove_handle(g_ws_multi, easy);
 
             if (msg->data.result == CURLE_OK) {
                 conn->state = 1; // open
                 conn->connected = true;
-                // Resolve promise with true
-                JSValue val = JS_TRUE;
-                JSValue ret = JS_Call(ctx, conn->resolving[0], JS_UNDEFINED, 1, &val);
-                JS_FreeValue(ctx, ret);
+                if (conn->promise.valid()) {
+                    ev::resolvePromise(conn->promise.get(), ev::fromBool(true));
+                    conn->promise.reset();
+                }
             } else {
                 conn->state = 3; // closed (failed)
                 conn->errorMsg = curl_easy_strerror(msg->data.result);
-                // Reject promise
-                JSValue err = JS_NewError(ctx);
-                JS_SetPropertyStr(ctx, err, "message",
-                    JS_NewString(ctx, conn->errorMsg.c_str()));
-                JSValue ret = JS_Call(ctx, conn->resolving[1], JS_UNDEFINED, 1, &err);
-                JS_FreeValue(ctx, ret);
-                JS_FreeValue(ctx, err);
+                if (conn->promise.valid()) {
+                    auto errRes = ev::construct(ev::getGlobal("Error"),
+                        std::array<bronze::Value, 1>{ev::fromUtf8(conn->errorMsg)});
+                    ev::rejectPromise(conn->promise.get(), errRes.value);
+                    conn->promise.reset();
+                }
             }
-
-            JS_FreeValue(ctx, conn->resolving[0]);
-            JS_FreeValue(ctx, conn->resolving[1]);
-            conn->resolving[0] = JS_UNDEFINED;
-            conn->resolving[1] = JS_UNDEFINED;
         }
     }
 
     // Call JS drain to deliver connection results from promise resolution
     {
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue drainFn = JS_GetPropertyStr(ctx, global, "__brokit_ws_drain_all");
-        if (JS_IsFunction(ctx, drainFn)) {
-            JSValue ret = JS_Call(ctx, drainFn, JS_UNDEFINED, 0, nullptr);
-            JS_FreeValue(ctx, ret);
+        bronze::Value drainFn = ev::getGlobal("__brokit_ws_drain_all");
+        if (ev::isFunction(drainFn)) {
+            ev::call(drainFn, ev::undefined(), {});
         }
-        JS_FreeValue(ctx, drainFn);
-        JS_FreeValue(ctx, global);
     }
 
     // Poll open connections for incoming frames
@@ -410,20 +347,17 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
         if (conn->state != 1 && conn->state != 2) continue;
         if (!conn->easy) continue;
 
-        // Try to receive frames (non-blocking since CONNECT_ONLY)
         char buf[4096];
-        for (int polls = 0; polls < 10; polls++) { // process multiple frames per tick
+        for (int polls = 0; polls < 10; polls++) {
             size_t nread = 0;
             const struct curl_ws_frame* meta = nullptr;
             CURLcode rc = curl_ws_recv(conn->easy, buf, sizeof(buf), &nread, &meta);
 
-            if (rc == CURLE_AGAIN) break; // no data available
+            if (rc == CURLE_AGAIN) break;
             if (rc != CURLE_OK) {
-                // Connection error or closed — surface WHICH error so the JS
-                // side can report something better than a bare 1006.
                 if (conn->state != 3) {
                     conn->state = 3;
-                    if (conn->closeCode == 0) conn->closeCode = 1006; // abnormal
+                    if (conn->closeCode == 0) conn->closeCode = 1006;
                     if (conn->errorMsg.empty())
                         conn->errorMsg = std::string("curl_ws_recv: ") +
                                          curl_easy_strerror(rc);
@@ -434,7 +368,6 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
             if (!meta) break;
 
             if (meta->flags & CURLWS_CLOSE) {
-                // Parse close frame
                 if (nread >= 2) {
                     conn->closeCode = (static_cast<uint8_t>(buf[0]) << 8) |
                                        static_cast<uint8_t>(buf[1]);
@@ -442,14 +375,13 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
                         conn->closeReason.assign(buf + 2, nread - 2);
                     }
                 } else {
-                    conn->closeCode = 1005; // no status
+                    conn->closeCode = 1005;
                 }
                 conn->state = 3;
                 break;
             }
 
             if (meta->flags & CURLWS_PING) {
-                // Auto-pong
                 size_t sent = 0;
                 curl_ws_send(conn->easy, buf, nread, &sent, 0, CURLWS_PONG);
                 continue;
@@ -458,11 +390,9 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
             if ((meta->flags & CURLWS_TEXT) || (meta->flags & CURLWS_BINARY)) {
                 bool binary = (meta->flags & CURLWS_BINARY) != 0;
 
-                // Start or continue accumulating
                 conn->partialData.insert(conn->partialData.end(), buf, buf + nread);
                 conn->partialBinary = binary;
 
-                // Check if this is a complete frame (bytesleft == 0 and not CONT)
                 if (meta->bytesleft == 0) {
                     WSConnection::Message msg;
                     msg.data = std::move(conn->partialData);
@@ -471,7 +401,6 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
                     conn->partialData.clear();
                 }
             } else if (meta->flags & CURLWS_CONT) {
-                // Continuation frame
                 conn->partialData.insert(conn->partialData.end(), buf, buf + nread);
                 if (meta->bytesleft == 0) {
                     WSConnection::Message msg;
@@ -486,24 +415,13 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
 
     // Drain events to JS instances after frame polling
     {
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue drainFn = JS_GetPropertyStr(ctx, global, "__brokit_ws_drain_all");
-        if (JS_IsFunction(ctx, drainFn)) {
-            JSValue ret = JS_Call(ctx, drainFn, JS_UNDEFINED, 0, nullptr);
-            JS_FreeValue(ctx, ret);
+        bronze::Value drainFn = ev::getGlobal("__brokit_ws_drain_all");
+        if (ev::isFunction(drainFn)) {
+            ev::call(drainFn, ev::undefined(), {});
         }
-        JS_FreeValue(ctx, drainFn);
-        JS_FreeValue(ctx, global);
     }
 
-    // Reap orphaned closed connections. When a connection reaches state 3 its
-    // close event is delivered to a bound WebSocket instance within this same
-    // tick (drain → recv → erase, above). Any connection still in state 3 on a
-    // later tick has no instance draining it — it was opened through the raw
-    // __brokit_ws_* bindings with no WebSocket wrapper — and would otherwise keep
-    // __brokit_ws_has_pending() true forever, pinning the event-loop pump until
-    // it hits its iteration budget. Give the close event one tick to be claimed,
-    // then drop it.
+    // Reap orphaned closed connections
     for (auto it = g_ws_conns.begin(); it != g_ws_conns.end();) {
         WSConnection* conn = it->second;
         if (conn->state == 3 && conn->inbox.empty() && ++conn->closedSweeps > 1) {
@@ -518,46 +436,35 @@ static JSValue js_ws_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
         }
     }
 
-    return JS_NewInt32(ctx, 0);
+    return ev::fromDouble(0);
 }
 
 // ---------------------------------------------------------------------------
 // __brokit_ws_has_pending() → bool
 // ---------------------------------------------------------------------------
-static JSValue js_ws_has_pending(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static bronze::Value js_ws_has_pending(bronze::Value, std::span<const bronze::Value>)
 {
-    if (!g_ws_connecting.empty()) return JS_NewBool(ctx, true);
+    if (!g_ws_connecting.empty()) return ev::fromBool(true);
     for (auto& [id, conn] : g_ws_conns) {
-        if (conn->state == 1 || conn->state == 2) return JS_NewBool(ctx, true);
-        if (!conn->inbox.empty()) return JS_NewBool(ctx, true);
-        if (conn->state == 3) return JS_NewBool(ctx, true); // close event pending
+        if (conn->state == 1 || conn->state == 2) return ev::fromBool(true);
+        if (!conn->inbox.empty()) return ev::fromBool(true);
+        if (conn->state == 3) return ev::fromBool(true);
     }
-    return JS_NewBool(ctx, false);
+    return ev::fromBool(false);
 }
 
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
-void installWebSocket(JSContext* ctx)
+void installWebSocket()
 {
-    JSValue global = JS_GetGlobalObject(ctx);
-
-    JS_SetPropertyStr(ctx, global, "__brokit_ws_connect",
-        JS_NewCFunction(ctx, js_ws_connect, "__brokit_ws_connect", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_ws_send",
-        JS_NewCFunction(ctx, js_ws_send, "__brokit_ws_send", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_ws_close",
-        JS_NewCFunction(ctx, js_ws_close, "__brokit_ws_close", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_ws_recv",
-        JS_NewCFunction(ctx, js_ws_recv, "__brokit_ws_recv", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_ws_state",
-        JS_NewCFunction(ctx, js_ws_state, "__brokit_ws_state", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_ws_tick",
-        JS_NewCFunction(ctx, js_ws_tick, "__brokit_ws_tick", 0));
-    JS_SetPropertyStr(ctx, global, "__brokit_ws_has_pending",
-        JS_NewCFunction(ctx, js_ws_has_pending, "__brokit_ws_has_pending", 0));
-
-    JS_FreeValue(ctx, global);
+    ev::registerFunction("__brokit_ws_connect", js_ws_connect);
+    ev::registerFunction("__brokit_ws_send", js_ws_send);
+    ev::registerFunction("__brokit_ws_close", js_ws_close);
+    ev::registerFunction("__brokit_ws_recv", js_ws_recv);
+    ev::registerFunction("__brokit_ws_state", js_ws_state);
+    ev::registerFunction("__brokit_ws_tick", js_ws_tick);
+    ev::registerFunction("__brokit_ws_has_pending", js_ws_has_pending);
 }
 
 } // namespace brokit::api

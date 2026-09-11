@@ -1,6 +1,6 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "fetch_helpers.js.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
 
 #include <cstring>
 #include <string>
@@ -9,8 +9,12 @@
 #include <unordered_map>
 #include <fstream>
 #include <algorithm>
+#include <span>
+#include <array>
 
 #include <curl/curl.h>
+
+extern "C" void bronze_fetch_helpers_main();
 
 namespace brokit::api {
 
@@ -20,8 +24,7 @@ namespace brokit::api {
 struct FetchRequest {
     CURL* easy = nullptr;
 
-    JSValue resolving[2] = { JS_UNDEFINED, JS_UNDEFINED };
-    JSContext* ctx = nullptr;
+    PersistentSlot promise;
 
     std::vector<uint8_t> body;
     std::vector<std::string> headers;
@@ -37,7 +40,7 @@ struct FetchRequest {
     bool bodyComplete = false;
     bool hasReceivedData = false;
     std::vector<std::vector<uint8_t>> chunks;
-    JSValue waitCallback = JS_UNDEFINED;
+    PersistentSlot waitCallback;
 
     ~FetchRequest() {
         if (requestHeaders) curl_slist_free_all(requestHeaders);
@@ -45,86 +48,49 @@ struct FetchRequest {
 };
 
 // ---------------------------------------------------------------------------
-// Per-context state. Mirrors the pattern used in fs_watch.cpp.
+// Per-thread state
 // ---------------------------------------------------------------------------
 namespace {
 
-// Ownership model: `streams` owns every live FetchRequest (keyed by streamId).
-// `pending` is a non-owning working set of in-flight curl handles consulted
-// each tick(); entries are removed from `pending` when curl reports DONE,
-// but the request stays in `streams` until JS finishes draining the body.
-struct CtxState {
+struct FetchState {
     CURLM* multi = nullptr;
     std::unordered_map<int, std::unique_ptr<FetchRequest>> streams;
     std::vector<FetchRequest*> pending; // non-owning view into streams
     int nextStreamId = 1;
 };
 
-static std::unordered_map<JSContext*, CtxState> g_state;
+static thread_local FetchState g_fetchState;
 
-CtxState& stateOf(JSContext* ctx) { return g_state[ctx]; }
-CtxState* findState(JSContext* ctx) {
-    auto it = g_state.find(ctx);
-    return it == g_state.end() ? nullptr : &it->second;
-}
-
-void removePending(CtxState& s, FetchRequest* req) {
+void removePending(FetchState& s, FetchRequest* req) {
     for (auto it = s.pending.begin(); it != s.pending.end(); ++it) {
         if (*it == req) { s.pending.erase(it); return; }
     }
 }
 
+static thread_local std::vector<std::string> g_fetchBasePaths;
+
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Per-context fetch base path stack (last added = checked first)
-// ---------------------------------------------------------------------------
-static const char* kFetchBasePathsKey = "__brokit_fetch_base_paths";
-
-static std::vector<std::string> getBasePaths(JSContext* ctx)
+void addFetchBasePath(const std::string& path)
 {
-    std::vector<std::string> paths;
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue arr = JS_GetPropertyStr(ctx, global, kFetchBasePathsKey);
-    if (JS_IsArray(arr)) {
-        JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
-        int32_t len = 0;
-        JS_ToInt32(ctx, &len, lenVal);
-        JS_FreeValue(ctx, lenVal);
-        for (int32_t i = 0; i < len; i++) {
-            JSValue elem = JS_GetPropertyUint32(ctx, arr, i);
-            const char* s = JS_ToCString(ctx, elem);
-            if (s) { paths.emplace_back(s); JS_FreeCString(ctx, s); }
-            JS_FreeValue(ctx, elem);
-        }
-    }
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, global);
-    return paths;
+    g_fetchBasePaths.push_back(path);
 }
 
 // ---------------------------------------------------------------------------
 // Helpers backed by JS factories from fetch_helpers.js
 // ---------------------------------------------------------------------------
-static JSValue callInternal(JSContext* ctx, const char* fnName,
-                            int argc, JSValueConst* argv)
+static bronze::Value callInternal(const char* fnName, std::span<const bronze::Value> args)
 {
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue internals = JS_GetPropertyStr(ctx, global, "__brokit_fetch_internals");
-    JS_FreeValue(ctx, global);
-    if (!JS_IsObject(internals)) {
-        JS_FreeValue(ctx, internals);
-        return JS_ThrowInternalError(ctx, "fetch: internals not installed");
+    bronze::Value internals = ev::getGlobal("__brokit_fetch_internals");
+    if (!ev::isObject(internals)) {
+        return ev::throwError("fetch: internals not installed");
     }
-    JSValue fn = JS_GetPropertyStr(ctx, internals, fnName);
-    JS_FreeValue(ctx, internals);
-    if (!JS_IsFunction(ctx, fn)) {
-        JS_FreeValue(ctx, fn);
-        return JS_ThrowInternalError(ctx, "fetch: missing internal helper '%s'", fnName);
+    bronze::Value fn = ev::getProperty(internals, fnName);
+    if (!ev::isFunction(fn)) {
+        return ev::throwError(std::string("fetch: missing internal helper '") + fnName + "'");
     }
-    JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, argc, argv);
-    JS_FreeValue(ctx, fn);
-    return ret;
+    auto ret = ev::call(fn, ev::undefined(), args);
+    return ret.value;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,12 +134,11 @@ static std::string detectMimeType(const std::string& path)
     return "application/octet-stream";
 }
 
-// Defined in fs.cpp — engine prefix mounts (e.g. /lib, /system).
-extern std::string resolveBrokitPrefixMount(JSContext* ctx, const std::string& path);
+extern std::string resolveBrokitPrefixMount(const std::string& path);
 
-static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
+static std::string resolveLocalPath(const std::string& url)
 {
-    std::string mounted = resolveBrokitPrefixMount(ctx, url);
+    std::string mounted = resolveBrokitPrefixMount(url);
     if (!mounted.empty()) return mounted;
 
     std::string clean = url;
@@ -182,18 +147,33 @@ static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
 
     if (clean.size() >= 2 && clean[1] == ':') return clean;
     if (!clean.empty() && (clean[0] == '/' || clean[0] == '\\')) {
-        // A leading slash is ambiguous: it may be a genuine absolute POSIX path
-        // (e.g. /tmp/foo.txt) or a web-root-relative path to resolve against the
-        // base paths. Honor a real absolute file first; only strip-and-search
-        // when nothing exists at the rooted location.
         std::ifstream absTest(clean, std::ios::binary);
         if (absTest.good()) return clean;
         clean = clean.substr(1);
     }
 
-    auto paths = getBasePaths(ctx);
-    for (int i = static_cast<int>(paths.size()) - 1; i >= 0; i--) {
-        std::string candidate = paths[i];
+    auto g = ev::globalValue("globalThis");
+    if (g.found && ev::isObject(g.value)) {
+        auto arr = ev::getProperty(g.value, "__brokit_fetch_base_paths");
+        if (ev::isObject(arr)) {
+            auto lenVal = ev::getProperty(arr, "length");
+            int32_t len = static_cast<int32_t>(ev::toDouble(lenVal));
+            for (int32_t i = len - 1; i >= 0; --i) {
+                auto elem = ev::getElement(arr, static_cast<uint32_t>(i));
+                if (ev::isString(elem)) {
+                    std::string candidate = ev::toUtf8(elem);
+                    if (!candidate.empty() && candidate.back() != '/' && candidate.back() != '\\')
+                        candidate += '/';
+                    candidate += clean;
+                    std::ifstream test(candidate, std::ios::binary);
+                    if (test.good()) return candidate;
+                }
+            }
+        }
+    }
+
+    for (int i = static_cast<int>(g_fetchBasePaths.size()) - 1; i >= 0; i--) {
+        std::string candidate = g_fetchBasePaths[i];
         if (!candidate.empty() && candidate.back() != '/' && candidate.back() != '\\')
             candidate += '/';
         candidate += clean;
@@ -205,9 +185,9 @@ static std::string resolveLocalPath(JSContext* ctx, const std::string& url)
 }
 
 // Build a Headers-like JS object from a flat header list ("name: value" lines).
-static JSValue buildHeaders(JSContext* ctx, const std::vector<std::string>& headers)
+static bronze::Value buildHeaders(const std::vector<std::string>& headers)
 {
-    JSValue hdrs = JS_NewObject(ctx);
+    ObjectBuilder hdrs;
     for (auto& h : headers) {
         auto colon = h.find(':');
         if (colon != std::string::npos) {
@@ -215,19 +195,16 @@ static JSValue buildHeaders(JSContext* ctx, const std::vector<std::string>& head
             std::string value = h.substr(colon + 1);
             while (!value.empty() && value[0] == ' ') value.erase(0, 1);
             for (auto& c : name) c = static_cast<char>(tolower(c));
-            JS_SetPropertyStr(ctx, hdrs, name.c_str(), JS_NewString(ctx, value.c_str()));
+            hdrs.set(name, value);
         }
     }
 
-    JSValueConst args[1] = { hdrs };
-    JSValue result = callInternal(ctx, "headers", 1, args);
-    JS_FreeValue(ctx, hdrs);
-    return result;
+    bronze::Value hdrsVal = hdrs.build();
+    return callInternal("headers", std::array<bronze::Value, 1>{hdrsVal});
 }
 
 // Build a Response for a data: URL — RFC 2397.
-// Format: data:[<mediatype>][;base64],<data>
-static JSValue buildDataUrlResponse(JSContext* ctx, const std::string& url)
+static bronze::Value buildDataUrlResponse(const std::string& url)
 {
     std::string rest = url.substr(5); // strip "data:"
     auto comma = rest.find(',');
@@ -235,7 +212,6 @@ static JSValue buildDataUrlResponse(JSContext* ctx, const std::string& url)
     std::string meta;
     std::string payload;
     if (comma == std::string::npos) {
-        // Malformed — no comma. Treat the whole thing as payload, no mime.
         payload = rest;
     } else {
         meta    = rest.substr(0, comma);
@@ -263,9 +239,7 @@ static JSValue buildDataUrlResponse(JSContext* ctx, const std::string& url)
 
     std::vector<uint8_t> data;
     if (isBase64) {
-        // Strip whitespace and decode standard base64.
         static const int8_t tbl[128] = {
-            // 0..63 mapping for A-Z, a-z, 0-9, +, /  (others -1)
             -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
             -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
             -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
@@ -306,46 +280,39 @@ static JSValue buildDataUrlResponse(JSContext* ctx, const std::string& url)
         }
     }
 
-    JSValue resp = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 200));
-    JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, "OK"));
-    JS_SetPropertyStr(ctx, resp, "ok", JS_TRUE);
-    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
-
     std::vector<std::string> headerLines = {
         "content-type: " + mime,
         "content-length: " + std::to_string(data.size()),
     };
-    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, headerLines));
 
-    JSValue bodyAB = JS_NewArrayBufferCopy(ctx, data.data(), data.size());
-    JS_SetPropertyStr(ctx, resp, "__body", bodyAB);
+    ObjectBuilder resp;
+    resp.set("status", 200.0);
+    resp.set("statusText", "OK");
+    resp.set("ok", true);
+    resp.set("url", url);
+    resp.set("headers", buildHeaders(headerLines));
+    resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(data.data(), data.size())));
 
-    JSValueConst args[1] = { resp };
-    JSValue ret = callInternal(ctx, "applyFileBody", 1, args);
-    JS_FreeValue(ctx, ret);
-    return resp;
+    bronze::Value respVal = resp.build();
+    callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
+    return respVal;
 }
 
 // Build a Response for a local file read
-static JSValue buildFileResponse(JSContext* ctx, const std::string& url,
-                                  const std::string& resolvedPath)
+static bronze::Value buildFileResponse(const std::string& url, const std::string& resolvedPath)
 {
     std::ifstream file(resolvedPath, std::ios::in | std::ios::binary | std::ios::ate);
     if (!file) {
-        // 404 — resolve promise with a not-ok Response (matches browser behavior
-        // for HTTP missing resources).
-        JSValue resp = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 404));
-        JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, "Not Found"));
-        JS_SetPropertyStr(ctx, resp, "ok", JS_FALSE);
-        JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
-        JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, {}));
+        ObjectBuilder resp;
+        resp.set("status", 404.0);
+        resp.set("statusText", "Not Found");
+        resp.set("ok", false);
+        resp.set("url", url);
+        resp.set("headers", buildHeaders({}));
 
-        JSValueConst args[1] = { resp };
-        JSValue ret = callInternal(ctx, "applyNotFoundBody", 1, args);
-        JS_FreeValue(ctx, ret);
-        return resp;
+        bronze::Value respVal = resp.build();
+        callInternal("applyNotFoundBody", std::array<bronze::Value, 1>{respVal});
+        return respVal;
     }
 
     auto size = file.tellg();
@@ -353,26 +320,23 @@ static JSValue buildFileResponse(JSContext* ctx, const std::string& url,
     std::vector<uint8_t> data(static_cast<size_t>(size));
     file.read(reinterpret_cast<char*>(data.data()), size);
 
-    JSValue resp = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 200));
-    JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, "OK"));
-    JS_SetPropertyStr(ctx, resp, "ok", JS_TRUE);
-    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, url.c_str()));
-
     std::string mime = detectMimeType(resolvedPath);
     std::vector<std::string> headerLines = {
         "content-type: " + mime,
         "content-length: " + std::to_string(data.size()),
     };
-    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, headerLines));
 
-    JSValue bodyAB = JS_NewArrayBufferCopy(ctx, data.data(), data.size());
-    JS_SetPropertyStr(ctx, resp, "__body", bodyAB);
+    ObjectBuilder resp;
+    resp.set("status", 200.0);
+    resp.set("statusText", "OK");
+    resp.set("ok", true);
+    resp.set("url", url);
+    resp.set("headers", buildHeaders(headerLines));
+    resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(data.data(), data.size())));
 
-    JSValueConst args[1] = { resp };
-    JSValue ret = callInternal(ctx, "applyFileBody", 1, args);
-    JS_FreeValue(ctx, ret);
-    return resp;
+    bronze::Value respVal = resp.build();
+    callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
+    return respVal;
 }
 
 static size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
@@ -408,41 +372,37 @@ static size_t headerCallback(char* buffer, size_t size, size_t nitems, void* use
     return bytes;
 }
 
-// Build a Response object for a streaming response (resolved early, body not complete)
-static JSValue buildStreamingResponse(JSContext* ctx, FetchRequest* req)
+// Build a Response object for a streaming response
+static bronze::Value buildStreamingResponse(FetchRequest* req)
 {
-    JSValue resp = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, static_cast<int>(req->statusCode)));
-    JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, req->statusText.c_str()));
-    JS_SetPropertyStr(ctx, resp, "ok", JS_NewBool(ctx, req->statusCode >= 200 && req->statusCode < 300));
-    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, req->url.c_str()));
-    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, req->headers));
-    JS_SetPropertyStr(ctx, resp, "__streamId", JS_NewInt32(ctx, req->streamId));
+    ObjectBuilder resp;
+    resp.set("status", static_cast<double>(req->statusCode));
+    resp.set("statusText", req->statusText);
+    resp.set("ok", req->statusCode >= 200 && req->statusCode < 300);
+    resp.set("url", req->url);
+    resp.set("headers", buildHeaders(req->headers));
+    resp.set("__streamId", static_cast<double>(req->streamId));
 
-    JSValueConst args[1] = { resp };
-    JSValue ret = callInternal(ctx, "applyStreamingBody", 1, args);
-    JS_FreeValue(ctx, ret);
-    return resp;
+    bronze::Value respVal = resp.build();
+    callInternal("applyStreamingBody", std::array<bronze::Value, 1>{respVal});
+    return respVal;
 }
 
-// Build a Response for a completed response (all body available)
-static JSValue buildCompleteResponse(JSContext* ctx, FetchRequest* req)
+// Build a Response for a completed response
+static bronze::Value buildCompleteResponse(FetchRequest* req)
 {
-    JSValue resp = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, static_cast<int>(req->statusCode)));
-    JS_SetPropertyStr(ctx, resp, "statusText", JS_NewString(ctx, req->statusText.c_str()));
-    JS_SetPropertyStr(ctx, resp, "ok", JS_NewBool(ctx, req->statusCode >= 200 && req->statusCode < 300));
-    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, req->url.c_str()));
-    JS_SetPropertyStr(ctx, resp, "headers", buildHeaders(ctx, req->headers));
+    ObjectBuilder resp;
+    resp.set("status", static_cast<double>(req->statusCode));
+    resp.set("statusText", req->statusText);
+    resp.set("ok", req->statusCode >= 200 && req->statusCode < 300);
+    resp.set("url", req->url);
+    resp.set("headers", buildHeaders(req->headers));
+    resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(req->body.data(), req->body.size())));
+    resp.set("__streamId", static_cast<double>(req->streamId));
 
-    JSValue bodyAB = JS_NewArrayBufferCopy(ctx, req->body.data(), req->body.size());
-    JS_SetPropertyStr(ctx, resp, "__body", bodyAB);
-    JS_SetPropertyStr(ctx, resp, "__streamId", JS_NewInt32(ctx, req->streamId));
-
-    JSValueConst args[1] = { resp };
-    JSValue ret = callInternal(ctx, "applyCompleteBody", 1, args);
-    JS_FreeValue(ctx, ret);
-    return resp;
+    bronze::Value respVal = resp.build();
+    callInternal("applyCompleteBody", std::array<bronze::Value, 1>{respVal});
+    return respVal;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,21 +410,19 @@ static JSValue buildCompleteResponse(JSContext* ctx, FetchRequest* req)
 // ---------------------------------------------------------------------------
 
 // __brokit_fetch_stream_read(streamId) → {value: Uint8Array, done: false} | {done: true} | null
-static JSValue js_fetch_stream_read(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_fetch_stream_read(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_NULL;
-    int streamId = 0;
-    JS_ToInt32(ctx, &streamId, argv[0]);
+    if (args.empty()) return ev::null();
+    ArgReader reader(args);
+    int streamId = reader.getInt(0, 0);
 
-    CtxState* s = findState(ctx);
-    if (!s) return JS_NULL;
-
-    auto it = s->streams.find(streamId);
-    if (it == s->streams.end() || !it->second) {
-        JSValue obj = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, obj, "done", JS_TRUE);
-        JS_SetPropertyStr(ctx, obj, "value", JS_UNDEFINED);
-        return obj;
+    auto& s = g_fetchState;
+    auto it = s.streams.find(streamId);
+    if (it == s.streams.end() || !it->second) {
+        ObjectBuilder obj;
+        obj.set("done", true);
+        obj.set("value", ev::undefined());
+        return obj.build();
     }
 
     FetchRequest* req = it->second.get();
@@ -473,74 +431,66 @@ static JSValue js_fetch_stream_read(JSContext* ctx, JSValueConst, int argc, JSVa
         auto chunk = std::move(req->chunks.front());
         req->chunks.erase(req->chunks.begin());
 
-        JSValue obj = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, obj, "done", JS_FALSE);
-        JSValue u8 = JS_NewUint8ArrayCopy(ctx, chunk.data(), chunk.size());
-        JS_SetPropertyStr(ctx, obj, "value", u8);
-        return obj;
+        ObjectBuilder obj;
+        obj.set("done", false);
+        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(chunk.data(), chunk.size()));
+        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(chunk.size()));
+        obj.set("value", u8);
+        return obj.build();
     }
 
     if (req->bodyComplete) {
-        JSValue obj = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, obj, "done", JS_TRUE);
-        JS_SetPropertyStr(ctx, obj, "value", JS_UNDEFINED);
+        ObjectBuilder obj;
+        obj.set("done", true);
+        obj.set("value", ev::undefined());
         if (req->headersResolved && !req->easy) {
-            // Fully done and curl cleaned up — drop ownership; unique_ptr frees it.
-            s->streams.erase(it);
+            s.streams.erase(it);
         }
-        return obj;
+        return obj.build();
     }
 
-    return JS_NULL;
+    return ev::null();
 }
 
-// __brokit_fetch_stream_wait(streamId, callback) — register callback for when data arrives
-static JSValue js_fetch_stream_wait(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// __brokit_fetch_stream_wait(streamId, callback)
+static bronze::Value js_fetch_stream_wait(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 2) return JS_UNDEFINED;
-    int streamId = 0;
-    JS_ToInt32(ctx, &streamId, argv[0]);
+    if (args.size() < 2) return ev::undefined();
+    ArgReader reader(args);
+    int streamId = reader.getInt(0, 0);
+    bronze::Value cb = reader.get(1);
 
-    CtxState* s = findState(ctx);
-    if (!s) return JS_UNDEFINED;
-
-    auto it = s->streams.find(streamId);
-    if (it == s->streams.end()) return JS_UNDEFINED;
+    auto& s = g_fetchState;
+    auto it = s.streams.find(streamId);
+    if (it == s.streams.end()) return ev::undefined();
 
     FetchRequest* req = it->second.get();
-    if (JS_IsFunction(ctx, req->waitCallback)) {
-        JS_FreeValue(ctx, req->waitCallback);
-    }
-    req->waitCallback = JS_DupValue(ctx, argv[1]);
-    return JS_UNDEFINED;
+    req->waitCallback.set(cb);
+    return ev::undefined();
 }
 
 // ---------------------------------------------------------------------------
 // AbortSignal support
 // ---------------------------------------------------------------------------
-static JSValue makeAbortError(JSContext* ctx)
+static bronze::Value makeAbortError()
 {
-    JSValue err = JS_NewError(ctx);
-    JS_SetPropertyStr(ctx, err, "message",
-                      JS_NewString(ctx, "The operation was aborted."));
-    JS_SetPropertyStr(ctx, err, "name", JS_NewString(ctx, "AbortError"));
+    auto res = ev::construct(ev::getGlobal("Error"),
+        std::array<bronze::Value, 1>{ev::fromUtf8("The operation was aborted.")});
+    bronze::Value err = res.value;
+    ev::setProperty(err, "name", ev::fromUtf8("AbortError"));
     return err;
 }
 
-// Cancel an in-flight request: detach it from curl, reject its pending
-// promise with an AbortError, and wake any stream reader so it observes the
-// end of the body. Safe to call for a streamId that already completed.
-static void abortRequest(JSContext* ctx, int streamId)
+static void abortRequest(int streamId)
 {
-    CtxState* s = findState(ctx);
-    if (!s) return;
-    auto it = s->streams.find(streamId);
-    if (it == s->streams.end() || !it->second) return;
+    auto& s = g_fetchState;
+    auto it = s.streams.find(streamId);
+    if (it == s.streams.end() || !it->second) return;
     FetchRequest* req = it->second.get();
 
     if (req->easy) {
-        removePending(*s, req);
-        if (s->multi) curl_multi_remove_handle(s->multi, req->easy);
+        removePending(s, req);
+        if (s.multi) curl_multi_remove_handle(s.multi, req->easy);
         curl_easy_cleanup(req->easy);
         req->easy = nullptr;
     }
@@ -549,90 +499,59 @@ static void abortRequest(JSContext* ctx, int streamId)
 
     const bool hadPromise = !req->headersResolved;
     if (hadPromise) {
-        JSValue err = makeAbortError(ctx);
-        JSValue ret = JS_Call(ctx, req->resolving[1], JS_UNDEFINED, 1, &err);
-        JS_FreeValue(ctx, ret);
-        JS_FreeValue(ctx, err);
-        JS_FreeValue(ctx, req->resolving[0]);
-        JS_FreeValue(ctx, req->resolving[1]);
-        req->resolving[0] = JS_UNDEFINED;
-        req->resolving[1] = JS_UNDEFINED;
+        if (req->promise.valid()) {
+            bronze::Value err = makeAbortError();
+            ev::rejectPromise(req->promise.get(), err);
+            req->promise.reset();
+        }
         req->headersResolved = true;
     }
-    if (JS_IsFunction(ctx, req->waitCallback)) {
-        JSValue cb = req->waitCallback;
-        req->waitCallback = JS_UNDEFINED;
-        JSValue ret = JS_Call(ctx, cb, JS_UNDEFINED, 0, nullptr);
-        JS_FreeValue(ctx, ret);
-        JS_FreeValue(ctx, cb);
+    if (req->waitCallback.valid()) {
+        PersistentSlot cb = std::move(req->waitCallback);
+        req->waitCallback.reset();
+        ev::call(cb.get(), ev::undefined(), {});
     }
-    // No streaming Response was handed out, so no reader can exist — free
-    // now. Otherwise stream_read sees bodyComplete + !easy and cleans up.
-    if (hadPromise) s->streams.erase(it);
-}
-
-// 'abort' listener registered on the request's AbortSignal; func_data[0]
-// holds the streamId.
-static JSValue js_fetch_abort_handler(JSContext* ctx, JSValueConst, int,
-                                      JSValueConst*, int, JSValue* func_data)
-{
-    int streamId = 0;
-    JS_ToInt32(ctx, &streamId, func_data[0]);
-    abortRequest(ctx, streamId);
-    return JS_UNDEFINED;
+    if (hadPromise) s.streams.erase(it);
 }
 
 // ---------------------------------------------------------------------------
 // Tick: pump curl_multi, resolve streaming responses, notify waiting readers
 // ---------------------------------------------------------------------------
-static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static bronze::Value js_fetch_tick(bronze::Value, std::span<const bronze::Value>)
 {
-    CtxState* s = findState(ctx);
-    if (!s || !s->multi || s->pending.empty()) return JS_NewInt32(ctx, 0);
+    auto& s = g_fetchState;
+    if (!s.multi || s.pending.empty()) return ev::fromDouble(0);
 
-    // Poll socket readiness for a small real-time window. curl_multi_perform
-    // alone does not check FD signal state — without this, a non-blocking
-    // connect that fails (e.g. connection refused) is never observed and the
-    // request hangs forever. A 0ms poll is not enough either: the kernel
-    // needs wall-clock time to detect TCP failure and update the socket
-    // state. 50ms returns early on any activity, so the cost is only paid
-    // when truly idle.
-    curl_multi_poll(s->multi, nullptr, 0, 50, nullptr);
+    curl_multi_poll(s.multi, nullptr, 0, 50, nullptr);
 
     int running = 0;
-    curl_multi_perform(s->multi, &running);
+    curl_multi_perform(s.multi, &running);
 
     // Phase 1: resolve streaming responses that have received data.
-    for (FetchRequest* req : s->pending) {
+    for (FetchRequest* req : s.pending) {
         if (!req->headersResolved && req->hasReceivedData) {
             curl_easy_getinfo(req->easy, CURLINFO_RESPONSE_CODE, &req->statusCode);
             char* effectiveUrl = nullptr;
             curl_easy_getinfo(req->easy, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
             if (effectiveUrl) req->url = effectiveUrl;
 
-            JSValue response = buildStreamingResponse(ctx, req);
-            JSValue ret = JS_Call(ctx, req->resolving[0], JS_UNDEFINED, 1, &response);
-            JS_FreeValue(ctx, ret);
-            JS_FreeValue(ctx, response);
-            JS_FreeValue(ctx, req->resolving[0]);
-            JS_FreeValue(ctx, req->resolving[1]);
-            req->resolving[0] = JS_UNDEFINED;
-            req->resolving[1] = JS_UNDEFINED;
+            bronze::Value response = buildStreamingResponse(req);
+            if (req->promise.valid()) {
+                ev::resolvePromise(req->promise.get(), response);
+                req->promise.reset();
+            }
             req->headersResolved = true;
         }
     }
 
     // Phase 2: notify waiting stream readers.
-    for (auto& [id, reqOwn] : s->streams) {
+    for (auto& [id, reqOwn] : s.streams) {
         FetchRequest* req = reqOwn.get();
         if (!req) continue;
-        if ((!req->chunks.empty() || req->bodyComplete) &&
-            JS_IsFunction(ctx, req->waitCallback)) {
-            JSValue cb = req->waitCallback;
-            req->waitCallback = JS_UNDEFINED;
-            JSValue ret = JS_Call(ctx, cb, JS_UNDEFINED, 0, nullptr);
-            JS_FreeValue(ctx, ret);
-            JS_FreeValue(ctx, cb);
+        if ((!req->chunks.empty() || req->bodyComplete) && req->waitCallback.valid()) {
+            PersistentSlot cb = std::move(req->waitCallback);
+            req->waitCallback.reset();
+            ev::call(cb.get(), ev::undefined(), {});
         }
     }
 
@@ -641,23 +560,20 @@ static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
     // Phase 3: handle completed requests.
     CURLMsg* msg;
     int msgs_in_queue;
-    while ((msg = curl_multi_info_read(s->multi, &msgs_in_queue))) {
+    while ((msg = curl_multi_info_read(s.multi, &msgs_in_queue))) {
         if (msg->msg != CURLMSG_DONE) continue;
 
         CURL* easy = msg->easy_handle;
         FetchRequest* req = nullptr;
-        for (FetchRequest* p : s->pending) {
+        for (FetchRequest* p : s.pending) {
             if (p->easy == easy) { req = p; break; }
         }
         if (!req) continue;
-        removePending(*s, req);
+        removePending(s, req);
 
-        curl_multi_remove_handle(s->multi, easy);
+        curl_multi_remove_handle(s.multi, easy);
         req->bodyComplete = true;
 
-        // If a streaming Response was already handed to JS, JS owns body
-        // draining via stream_read — we must keep the streams entry alive.
-        // Otherwise everything finalizes here.
         bool wasStreaming = req->headersResolved;
         if (!req->headersResolved) {
             if (msg->data.result == CURLE_OK) {
@@ -666,124 +582,89 @@ static JSValue js_fetch_tick(JSContext* ctx, JSValueConst, int, JSValueConst*)
                 curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
                 if (effectiveUrl) req->url = effectiveUrl;
 
-                JSValue response = buildCompleteResponse(ctx, req);
-                JSValue ret = JS_Call(ctx, req->resolving[0], JS_UNDEFINED, 1, &response);
-                JS_FreeValue(ctx, ret);
-                JS_FreeValue(ctx, response);
+                bronze::Value response = buildCompleteResponse(req);
+                if (req->promise.valid()) {
+                    ev::resolvePromise(req->promise.get(), response);
+                    req->promise.reset();
+                }
             } else {
                 const char* errMsg = curl_easy_strerror(msg->data.result);
-                JSValue err = JS_NewError(ctx);
-                JS_SetPropertyStr(ctx, err, "message",
-                                  JS_NewString(ctx, errMsg ? errMsg : "fetch failed"));
-                JSValue ret = JS_Call(ctx, req->resolving[1], JS_UNDEFINED, 1, &err);
-                JS_FreeValue(ctx, ret);
-                JS_FreeValue(ctx, err);
+                auto errRes = ev::construct(ev::getGlobal("Error"),
+                    std::array<bronze::Value, 1>{ev::fromUtf8(errMsg ? errMsg : "fetch failed")});
+                if (req->promise.valid()) {
+                    ev::rejectPromise(req->promise.get(), errRes.value);
+                    req->promise.reset();
+                }
             }
-            JS_FreeValue(ctx, req->resolving[0]);
-            JS_FreeValue(ctx, req->resolving[1]);
-            req->resolving[0] = JS_UNDEFINED;
-            req->resolving[1] = JS_UNDEFINED;
             req->headersResolved = true;
         }
 
-        if (JS_IsFunction(ctx, req->waitCallback)) {
-            JSValue cb = req->waitCallback;
-            req->waitCallback = JS_UNDEFINED;
-            JSValue ret = JS_Call(ctx, cb, JS_UNDEFINED, 0, nullptr);
-            JS_FreeValue(ctx, ret);
-            JS_FreeValue(ctx, cb);
+        if (req->waitCallback.valid()) {
+            PersistentSlot cb = std::move(req->waitCallback);
+            req->waitCallback.reset();
+            ev::call(cb.get(), ev::undefined(), {});
         }
 
         curl_easy_cleanup(easy);
         req->easy = nullptr;
 
-        // Drop the streams entry unless a streaming Response is still being
-        // drained by JS via stream_read. In the non-streaming success case
-        // the body lives in JS as `__body`; in the error case no Response
-        // was produced. Either way the FetchRequest is safe to free now.
         if (!wasStreaming) {
-            s->streams.erase(req->streamId);
+            s.streams.erase(req->streamId);
         }
 
         completed++;
     }
 
-    return JS_NewInt32(ctx, completed);
+    return ev::fromDouble(completed);
 }
 
 // ---------------------------------------------------------------------------
 // fetch(url, options?) — returns Promise
 // ---------------------------------------------------------------------------
-static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "fetch: URL required");
+    if (args.empty()) return ev::throwTypeError("fetch: URL required");
 
-    const char* urlStr = JS_ToCString(ctx, argv[0]);
-    if (!urlStr) return JS_EXCEPTION;
-    std::string url(urlStr);
-    JS_FreeCString(ctx, urlStr);
+    ArgReader reader(args);
+    std::string url = reader.getString(0, "");
 
     if (!isHttpUrl(url)) {
-        JSValue response;
+        bronze::Value response;
         if (isDataUrl(url)) {
-            response = buildDataUrlResponse(ctx, url);
+            response = buildDataUrlResponse(url);
         } else {
-            std::string resolved = resolveLocalPath(ctx, url);
-            response = buildFileResponse(ctx, url, resolved);
+            std::string resolved = resolveLocalPath(url);
+            response = buildFileResponse(url, resolved);
         }
-        JSValue resolving[2];
-        JSValue promise = JS_NewPromiseCapability(ctx, resolving);
-        if (JS_IsException(promise)) {
-            JS_FreeValue(ctx, response);
-            return promise;
-        }
-        JSValue ret = JS_Call(ctx, resolving[0], JS_UNDEFINED, 1, &response);
-        JS_FreeValue(ctx, ret);
-        JS_FreeValue(ctx, response);
-        JS_FreeValue(ctx, resolving[0]);
-        JS_FreeValue(ctx, resolving[1]);
-        return promise;
+        bronze::Value p = ev::createPromise();
+        ev::resolvePromise(p, response);
+        return p;
     }
 
-    CtxState& s = stateOf(ctx);
+    auto& s = g_fetchState;
 
-    // AbortSignal: an already-aborted signal rejects before any work; a live
-    // one gets a native 'abort' listener that cancels the transfer.
-    JSValue signal = JS_UNDEFINED;
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        signal = JS_GetPropertyStr(ctx, argv[1], "signal");
-        if (JS_IsObject(signal)) {
-            JSValue abortedVal = JS_GetPropertyStr(ctx, signal, "aborted");
-            const bool aborted = JS_ToBool(ctx, abortedVal);
-            JS_FreeValue(ctx, abortedVal);
+    bronze::Value signal = ev::undefined();
+    if (args.size() >= 2 && ev::isObject(args[1])) {
+        bronze::Value sig = ev::getProperty(args[1], "signal");
+        if (ev::isObject(sig)) {
+            bronze::Value abortedVal = ev::getProperty(sig, "aborted");
+            bool aborted = ev::isBool(abortedVal) && ev::toBool(abortedVal);
             if (aborted) {
-                JS_FreeValue(ctx, signal);
-                JSValue resolving[2];
-                JSValue promise = JS_NewPromiseCapability(ctx, resolving);
-                if (JS_IsException(promise)) return promise;
-                JSValue err = makeAbortError(ctx);
-                JSValue ret = JS_Call(ctx, resolving[1], JS_UNDEFINED, 1, &err);
-                JS_FreeValue(ctx, ret);
-                JS_FreeValue(ctx, err);
-                JS_FreeValue(ctx, resolving[0]);
-                JS_FreeValue(ctx, resolving[1]);
-                return promise;
+                bronze::Value p = ev::createPromise();
+                ev::rejectPromise(p, makeAbortError());
+                return p;
             }
-        } else {
-            JS_FreeValue(ctx, signal);
-            signal = JS_UNDEFINED;
+            signal = sig;
         }
     }
 
     auto req = std::make_unique<FetchRequest>();
-    req->ctx = ctx;
     req->url = url;
     req->streamId = s.nextStreamId++;
 
     req->easy = curl_easy_init();
     if (!req->easy) {
-        JS_FreeValue(ctx, signal);
-        return JS_ThrowInternalError(ctx, "fetch: curl_easy_init failed");
+        return ev::throwError("fetch: curl_easy_init failed");
     }
 
     curl_easy_setopt(req->easy, CURLOPT_URL, req->url.c_str());
@@ -793,83 +674,53 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     curl_easy_setopt(req->easy, CURLOPT_HEADERDATA, req.get());
     curl_easy_setopt(req->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(req->easy, CURLOPT_MAXREDIRS, 10L);
-    // Connect-phase timeout only. A hard total timeout breaks legitimate
-    // long transfers (non-streaming LLM completions, SSE, large downloads) —
-    // standard fetch semantics is no transfer deadline; callers cancel via
-    // AbortSignal (or AbortSignal.timeout).
     curl_easy_setopt(req->easy, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(req->easy, CURLOPT_USERAGENT, "brokit/0.3");
+    curl_easy_setopt(req->easy, CURLOPT_USERAGENT, "brokit/0.5");
     curl_easy_setopt(req->easy, CURLOPT_ACCEPT_ENCODING, "");
 
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        JSValue methodVal = JS_GetPropertyStr(ctx, argv[1], "method");
-        if (JS_IsString(methodVal)) {
-            const char* method = JS_ToCString(ctx, methodVal);
-            if (method) {
-                curl_easy_setopt(req->easy, CURLOPT_CUSTOMREQUEST, method);
-                if (strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0 ||
-                    strcmp(method, "PATCH") == 0) {
-                    curl_easy_setopt(req->easy, CURLOPT_POST, 1L);
-                }
-                JS_FreeCString(ctx, method);
+    if (args.size() >= 2 && ev::isObject(args[1])) {
+        bronze::Value opt = args[1];
+        bronze::Value methodVal = ev::getProperty(opt, "method");
+        if (ev::isString(methodVal)) {
+            std::string method = ev::toUtf8(methodVal);
+            curl_easy_setopt(req->easy, CURLOPT_CUSTOMREQUEST, method.c_str());
+            if (method == "POST" || method == "PUT" || method == "PATCH") {
+                curl_easy_setopt(req->easy, CURLOPT_POST, 1L);
             }
         }
-        JS_FreeValue(ctx, methodVal);
 
-        JSValue headersVal = JS_GetPropertyStr(ctx, argv[1], "headers");
-        if (JS_IsObject(headersVal)) {
-            JSPropertyEnum* props;
-            uint32_t propCount;
-            if (JS_GetOwnPropertyNames(ctx, &props, &propCount, headersVal,
-                                        JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
-                for (uint32_t i = 0; i < propCount; i++) {
-                    const char* key = JS_AtomToCString(ctx, props[i].atom);
-                    JSValue val = JS_GetProperty(ctx, headersVal, props[i].atom);
-                    const char* valStr = JS_ToCString(ctx, val);
-                    if (key && valStr) {
-                        std::string header = std::string(key) + ": " + valStr;
-                        req->requestHeaders = curl_slist_append(req->requestHeaders, header.c_str());
+        bronze::Value headersVal = ev::getProperty(opt, "headers");
+        if (ev::isObject(headersVal)) {
+            bronze::Value objCtor = ev::getGlobal("Object");
+            bronze::Value keysFn = ev::getProperty(objCtor, "keys");
+            auto keysRes = ev::call(keysFn, ev::undefined(), std::array<bronze::Value, 1>{headersVal});
+            if (!keysRes.thrown) {
+                bronze::Value keysArr = keysRes.value;
+                bronze::Value lenVal = ev::getProperty(keysArr, "length");
+                int len = ev::isDouble(lenVal) ? static_cast<int>(ev::toDouble(lenVal)) : 0;
+                for (int i = 0; i < len; ++i) {
+                    bronze::Value k = ev::getElement(keysArr, i);
+                    if (ev::isString(k)) {
+                        std::string key = ev::toUtf8(k);
+                        bronze::Value val = ev::getProperty(headersVal, key);
+                        if (ev::isString(val)) {
+                            std::string line = key + ": " + ev::toUtf8(val);
+                            req->requestHeaders = curl_slist_append(req->requestHeaders, line.c_str());
+                        }
                     }
-                    if (valStr) JS_FreeCString(ctx, valStr);
-                    if (key) JS_FreeCString(ctx, key);
-                    JS_FreeValue(ctx, val);
-                    JS_FreeAtom(ctx, props[i].atom);
                 }
-                js_free(ctx, props);
             }
         }
-        JS_FreeValue(ctx, headersVal);
 
-        JSValue bodyVal = JS_GetPropertyStr(ctx, argv[1], "body");
-        if (JS_IsString(bodyVal)) {
-            const char* body = JS_ToCString(ctx, bodyVal);
-            if (body) {
-                size_t len = strlen(body);
-                req->requestBody.assign(
-                    reinterpret_cast<const uint8_t*>(body),
-                    reinterpret_cast<const uint8_t*>(body) + len);
-                JS_FreeCString(ctx, body);
-            }
-        } else if (!JS_IsUndefined(bodyVal) && !JS_IsNull(bodyVal)) {
-            size_t byte_offset = 0, byte_len = 0, bpe = 0;
-            JSValue buf = JS_GetTypedArrayBuffer(ctx, bodyVal, &byte_offset, &byte_len, &bpe);
-            if (!JS_IsException(buf)) {
-                size_t abLen = 0;
-                uint8_t* ptr = JS_GetArrayBuffer(ctx, &abLen, buf);
-                if (ptr) {
-                    req->requestBody.assign(ptr + byte_offset, ptr + byte_offset + byte_len);
-                }
-                JS_FreeValue(ctx, buf);
-            } else {
-                JS_FreeValue(ctx, JS_GetException(ctx));
-                size_t abLen = 0;
-                uint8_t* ptr = JS_GetArrayBuffer(ctx, &abLen, bodyVal);
-                if (ptr) {
-                    req->requestBody.assign(ptr, ptr + abLen);
-                }
-            }
+        bronze::Value bodyVal = ev::getProperty(opt, "body");
+        if (ev::isString(bodyVal)) {
+            std::string body = ev::toUtf8(bodyVal);
+            req->requestBody.assign(body.begin(), body.end());
+        } else if (auto info = ev::typedArrayInfo(bodyVal)) {
+            req->requestBody.assign(info.data, info.data + info.byteLength);
+        } else if (auto info = ev::arrayBufferInfo(bodyVal)) {
+            req->requestBody.assign(info.data, info.data + info.byteLength);
         }
-        JS_FreeValue(ctx, bodyVal);
 
         if (req->requestHeaders) {
             curl_easy_setopt(req->easy, CURLOPT_HTTPHEADER, req->requestHeaders);
@@ -882,13 +733,7 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
         }
     }
 
-    JSValue promise = JS_NewPromiseCapability(ctx, req->resolving);
-    if (JS_IsException(promise)) {
-        JS_FreeValue(ctx, signal);
-        curl_easy_cleanup(req->easy);
-        req->easy = nullptr;
-        return promise;
-    }
+    req->promise.set(ev::createPromise());
 
     if (!s.multi) {
         s.multi = curl_multi_init();
@@ -897,42 +742,39 @@ static JSValue js_fetch(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
 
     int streamId = req->streamId;
     FetchRequest* raw = req.get();
+    bronze::Value retPromise = req->promise.get();
+
     s.streams.emplace(streamId, std::move(req));
     s.pending.push_back(raw);
 
-    if (JS_IsObject(signal)) {
-        JSValue idVal = JS_NewInt32(ctx, streamId);
-        JSValue handler =
-            JS_NewCFunctionData(ctx, js_fetch_abort_handler, 0, 0, 1, &idVal);
-        JS_FreeValue(ctx, idVal); // NewCFunctionData dups func_data
-        JSValue addFn = JS_GetPropertyStr(ctx, signal, "addEventListener");
-        if (JS_IsFunction(ctx, addFn)) {
-            JSValue typeStr = JS_NewString(ctx, "abort");
-            JSValue args[2] = { typeStr, handler };
-            JSValue ret = JS_Call(ctx, addFn, signal, 2, args);
-            JS_FreeValue(ctx, ret);
-            JS_FreeValue(ctx, typeStr);
+    if (ev::isObject(signal)) {
+        bronze::Value handler = ev::makeFunction([streamId](bronze::Value, std::span<const bronze::Value>) -> bronze::Value {
+            abortRequest(streamId);
+            return ev::undefined();
+        }, 0, "abortHandler");
+
+        bronze::Value addFn = ev::getProperty(signal, "addEventListener");
+        if (ev::isFunction(addFn)) {
+            bronze::Value abortStr = ev::fromUtf8("abort");
+            std::array<bronze::Value, 2> lArgs = { abortStr, handler };
+            ev::call(addFn, signal, lArgs);
         }
-        JS_FreeValue(ctx, addFn);
-        JS_FreeValue(ctx, handler);
-        JS_FreeValue(ctx, signal);
     }
 
-    return promise;
+    return retPromise;
 }
 
-static JSValue js_fetch_has_pending(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static bronze::Value js_fetch_has_pending(bronze::Value, std::span<const bronze::Value>)
 {
-    CtxState* s = findState(ctx);
-    if (!s) return JS_NewBool(ctx, false);
-    if (!s->pending.empty()) return JS_NewBool(ctx, true);
-    for (auto& [id, req] : s->streams) {
-        if (req && JS_IsFunction(ctx, req->waitCallback)) return JS_NewBool(ctx, true);
+    auto& s = g_fetchState;
+    if (!s.pending.empty()) return ev::fromBool(true);
+    for (auto& [id, req] : s.streams) {
+        if (req && req->waitCallback.valid()) return ev::fromBool(true);
     }
-    return JS_NewBool(ctx, false);
+    return ev::fromBool(false);
 }
 
-void installFetch(JSContext* ctx)
+void installFetch()
 {
     static bool curlInited = false;
     if (!curlInited) {
@@ -940,47 +782,19 @@ void installFetch(JSContext* ctx)
         curlInited = true;
     }
 
-    // Touch the per-context state so it exists before any fetch() call.
-    (void)stateOf(ctx);
+    ev::registerFunction("fetch", js_fetch);
+    ev::registerFunction("__brokit_fetch_tick", js_fetch_tick);
+    ev::registerFunction("__brokit_fetch_has_pending", js_fetch_has_pending);
+    ev::registerFunction("__brokit_fetch_stream_read", js_fetch_stream_read);
+    ev::registerFunction("__brokit_fetch_stream_wait", js_fetch_stream_wait);
 
-    JSValue global = JS_GetGlobalObject(ctx);
-
-    JS_SetPropertyStr(ctx, global, kFetchBasePathsKey, JS_NewArray(ctx));
-
-    JS_SetPropertyStr(ctx, global, "fetch",
-                      JS_NewCFunction(ctx, js_fetch, "fetch", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_fetch_tick",
-                      JS_NewCFunction(ctx, js_fetch_tick, "__brokit_fetch_tick", 0));
-    JS_SetPropertyStr(ctx, global, "__brokit_fetch_has_pending",
-                      JS_NewCFunction(ctx, js_fetch_has_pending, "__brokit_fetch_has_pending", 0));
-    JS_SetPropertyStr(ctx, global, "__brokit_fetch_stream_read",
-                      JS_NewCFunction(ctx, js_fetch_stream_read, "__brokit_fetch_stream_read", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_fetch_stream_wait",
-                      JS_NewCFunction(ctx, js_fetch_stream_wait, "__brokit_fetch_stream_wait", 2));
-
-    JS_FreeValue(ctx, global);
-
-    // Install the JS helpers — they expose globalThis.__brokit_fetch_internals
-    // which callInternal() looks up on demand. Caching the JSValue in CtxState
-    // would outlive JS_FreeContext and trip QuickJS's GC assertion.
-    JSValue r = JS_Eval(ctx, js_fetch_helpers, strlen(js_fetch_helpers),
-                        "<fetch_helpers>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    } else {
-        JS_FreeValue(ctx, r);
-    }
+    bronze::embed::runEntry(bronze_fetch_helpers_main);
 }
 
-void uninstallFetch(JSContext* ctx)
+void uninstallFetch()
 {
-    auto it = g_state.find(ctx);
-    if (it == g_state.end()) return;
-    CtxState& s = it->second;
+    auto& s = g_fetchState;
 
-    // Tear down curl handles still in flight, then free the JSValues we own
-    // (promise resolvers, wait callbacks). After this loop, the unique_ptr
-    // destruction below frees the FetchRequest objects themselves.
     for (auto& [id, reqOwn] : s.streams) {
         FetchRequest* req = reqOwn.get();
         if (!req) continue;
@@ -989,39 +803,16 @@ void uninstallFetch(JSContext* ctx)
             curl_easy_cleanup(req->easy);
             req->easy = nullptr;
         }
-        if (!JS_IsUndefined(req->resolving[0])) JS_FreeValue(ctx, req->resolving[0]);
-        if (!JS_IsUndefined(req->resolving[1])) JS_FreeValue(ctx, req->resolving[1]);
-        if (JS_IsFunction(ctx, req->waitCallback)) JS_FreeValue(ctx, req->waitCallback);
-        req->resolving[0] = JS_UNDEFINED;
-        req->resolving[1] = JS_UNDEFINED;
-        req->waitCallback = JS_UNDEFINED;
+        req->promise.reset();
+        req->waitCallback.reset();
     }
     s.pending.clear();
+    s.streams.clear();
 
     if (s.multi) {
         curl_multi_cleanup(s.multi);
         s.multi = nullptr;
     }
-
-    g_state.erase(it);
-}
-
-void addFetchBasePath(JSContext* ctx, const std::string& path)
-{
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue arr = JS_GetPropertyStr(ctx, global, kFetchBasePathsKey);
-    if (!JS_IsArray(arr)) {
-        JS_FreeValue(ctx, arr);
-        arr = JS_NewArray(ctx);
-        JS_SetPropertyStr(ctx, global, kFetchBasePathsKey, JS_DupValue(ctx, arr));
-    }
-    JSValue lenVal = JS_GetPropertyStr(ctx, arr, "length");
-    int32_t len = 0;
-    JS_ToInt32(ctx, &len, lenVal);
-    JS_FreeValue(ctx, lenVal);
-    JS_SetPropertyUint32(ctx, arr, len, JS_NewString(ctx, path.c_str()));
-    JS_FreeValue(ctx, arr);
-    JS_FreeValue(ctx, global);
 }
 
 } // namespace brokit::api

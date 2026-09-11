@@ -1,19 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "event_target.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_event_target_main();
 
 namespace brokit::api {
 
-void installEventTarget(JSContext* ctx)
+void installEventTarget()
 {
-    JSValue r = JS_Eval(ctx, js_event_target, strlen(js_event_target),
-                        "<event-target>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_event_target_main);
 }
 
 } // namespace brokit::api

@@ -1,19 +1,13 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "formdata.js.h"
+#include "embed/embed.h"
 
-#include <cstring>
+extern "C" void bronze_formdata_main();
 
 namespace brokit::api {
 
-void installFormData(JSContext* ctx)
+void installFormData()
 {
-    JSValue r = JS_Eval(ctx, js_formdata, strlen(js_formdata),
-                        "<FormData>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_formdata_main);
 }
 
 } // namespace brokit::api

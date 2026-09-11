@@ -65,7 +65,7 @@
                     this._emit('error', e);
                 } else {
                     // Last-resort: don't swallow silently.
-                    if (typeof console !== 'undefined' && console.error) {
+                    if (typeof console !== 'undefined' && globalThis.console.error) {
                         console.error('FSWatcher listener threw:', e && e.message || e);
                     }
                 }

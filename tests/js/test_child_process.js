@@ -93,10 +93,11 @@ if (isWin) {
 
 // ── spawnSync ─────────────────────────────────────────────────────────────
 
+var spResult;
 if (isWin) {
-    var spResult = cp.spawnSync('cmd', ['/c', 'echo', 'spawn_test']);
+    spResult = cp.spawnSync('cmd', ['/c', 'echo', 'spawn_test']);
 } else {
-    var spResult = cp.spawnSync('echo', ['spawn_test']);
+    spResult = cp.spawnSync('echo', ['spawn_test']);
 }
 assert(typeof spResult === 'object', 'spawnSync returns object');
 assertEqual(spResult.status, 0, 'spawnSync status 0');
@@ -105,29 +106,32 @@ assert(typeof spResult.stderr === 'string', 'spawnSync stderr is string');
 assertEqual(spResult.signal, null, 'spawnSync no signal');
 
 // spawnSync with non-zero exit
+var spFail;
 if (isWin) {
-    var spFail = cp.spawnSync('cmd', ['/c', 'exit', '7']);
+    spFail = cp.spawnSync('cmd', ['/c', 'exit', '7']);
 } else {
-    var spFail = cp.spawnSync('sh', ['-c', 'exit 7']);
+    spFail = cp.spawnSync('sh', ['-c', 'exit 7']);
 }
 assertEqual(spFail.status, 7, 'spawnSync non-zero status');
 
 // spawnSync with input
+var spInput;
 if (isWin) {
-    var spInput = cp.spawnSync('findstr', ['.'], { input: 'hello from stdin' });
+    spInput = cp.spawnSync('findstr', ['.'], { input: 'hello from stdin' });
     assert(spInput.stdout.indexOf('hello from stdin') !== -1, 'spawnSync with input');
 } else {
-    var spInput = cp.spawnSync('cat', [], { input: 'hello from stdin' });
+    spInput = cp.spawnSync('cat', [], { input: 'hello from stdin' });
     assert(spInput.stdout.indexOf('hello from stdin') !== -1, 'spawnSync with input');
 }
 
 // ── cwd option ────────────────────────────────────────────────────────────
 
 var tmpDir = globalThis.__brokit_os.tmpdir();
+var cwdResult;
 if (isWin) {
-    var cwdResult = cp.execSync('cd', { cwd: tmpDir });
+    cwdResult = cp.execSync('cd', { cwd: tmpDir });
 } else {
-    var cwdResult = cp.execSync('pwd', { cwd: tmpDir });
+    cwdResult = cp.execSync('pwd', { cwd: tmpDir });
 }
 assert(cwdResult.trim().length > 0, 'execSync cwd option works');
 
@@ -139,10 +143,11 @@ fs.mkdirSync(testDir);
 
 // Write a file, then read it with a command
 fs.writeFileSync(testDir + '/test.txt', 'hello from fs');
+var catResult;
 if (isWin) {
-    var catResult = cp.execSync('type "' + testDir + '\\test.txt"');
+    catResult = cp.execSync('type "' + testDir + '\\test.txt"');
 } else {
-    var catResult = cp.execSync('cat "' + testDir + '/test.txt"');
+    catResult = cp.execSync('cat "' + testDir + '/test.txt"');
 }
 assert(catResult.indexOf('hello from fs') !== -1, 'fs + child_process integration');
 

@@ -2,9 +2,9 @@
 
 ## What This Project Is
 
-brokit is a standalone C++20 library providing a JavaScript runtime with web-standard and system APIs, built on QuickJS. It is consumed by other projects (like `bro`) as a dependency. It does NOT own a DOM, render anything, or manage windows.
+brokit is a standalone C++20 library providing a JavaScript runtime with web-standard and system APIs, built on Bronze (AOT compiler and runtime) and Brass. It is consumed by other projects in the `bro` ecosystem as a dependency. It does NOT own a DOM, render anything, or manage windows.
 
-The API surface borrows from WinterCG (web-standard APIs) and Node.js (system APIs). Each API is independently installable.
+The API surface borrows from WinterCG (web-standard APIs) and Node.js (system APIs). Each API is independently installable into Bronze's embed runtime.
 
 ## Build Commands
 
@@ -34,14 +34,15 @@ Linux:
 ## Project Structure
 
 ```
-src/runtime/   — QuickJS runtime wrapper (Runtime class)
+src/runtime/   — Bronze runtime wrapper (Runtime class: AOT compilation, dlopen module loading)
 src/api/       — Web/system API implementations (console, timers, URL, crypto + crypto.subtle,
                  encoding, fetch, streams, storage, IndexedDB, fs, fs.watch, child_process,
                  WebSocket, EventSource, noise, image, etc.)
-src/api/js/    — JS polyfills embedded into C++ at build time (cmake/embed_js.cmake)
+src/api/js/    — JS polyfills compiled AOT into object files via bronze_compile_js
 tests/         — C++ test harness (tests/main.cpp)
-tests/js/      — JavaScript test files (one per API)
-third_party/   — QuickJS, libcurl, SQLite, FastNoise2 (bundled); broimage links from ../broimage
+tests/js/      — JavaScript test files (one per API, 56 suites)
+third_party/   — libcurl, SQLite, FastNoise2 (bundled); bronze (at ../bronze), brass (at ../brass),
+                 broimage links from ../broimage
 ```
 
 Optional, both default ON: `BROKIT_ENABLE_NOISE` (FastNoise2 → `BROKIT_HAS_NOISE`) and
@@ -51,35 +52,30 @@ installers are guarded by those `BROKIT_HAS_*` defines in `api.h` and `installAl
 ## Namespace
 
 - `brokit` — Runtime class
-- `brokit::api` — API installer functions
+- `brokit::api` — API installer functions, `HostClass`, `HostProxy`, `ObjectBuilder`
 
 ## Key Design Points
 
 - **Consumer provides the DOM** — brokit has no DOM. APIs like TreeWalker operate on JS node objects via standard properties (childNodes, parentNode, nodeType).
-- **Pick-and-choose APIs** — consumers can call `installAll(ctx)` or individual `installConsole(ctx)`, `installTimers(ctx)`, etc.
-- **No global state** — all state is per-JSContext.
+- **Pick-and-choose APIs** — consumers can call `installAll()` or individual `installConsole()`, `installTimers()`, etc.
+- **Bronze AOT Compilation** — all JS polyfills (32 files) are compiled ahead of time with Bronze into native object files and linked directly into `libbrokit_api.a`. Dynamic JS is compiled to shared libraries and loaded via `bronze::embed::runEntry`.
+- **Host Binding Infrastructure** — uses `bronze::embed` primitives with `HostClass` (prototype/constructor registration, native handle management), `HostProxy` (dynamic traps), and `ObjectBuilder`.
 - **No rendering, no windowing** — purely JS runtime + platform APIs.
-- **JS polyfills backed by native C++** — complex logic (URL parsing, TreeWalker traversal) is in JS for readability and debuggability. Performance-critical operations (crypto, encoding, image kernels) are native C++.
-- **Node-style `require()`** — a synchronous resolver mapping `fs`/`path`/`os`/`child_process` (and `node:` prefixes) to their `__brokit_*` globals. Installed *last* by `installAll()`, after the modules it maps to.
+- **Node-style `require()`** — a synchronous resolver mapping registered modules and filesystem paths (`./...`, `../...`, `/...`). Hierarchical directory tracking via `RequireDirGuard`.
 
 ## Adding New APIs
 
-1. Create `src/api/myapi.cpp` implementing `void installMyApi(JSContext* ctx)`
+1. Create `src/api/myapi.cpp` implementing `void installMyApi()`
 2. Add the declaration to `src/api/api.h`
 3. Call it from `installAll()` in `src/api/api.cpp`
 4. Add the .cpp to `src/api/CMakeLists.txt`
-5. Write `tests/js/test_myapi.js` using the `assert()` and `assertEqual()` test helpers (the harness auto-discovers files in `tests/js/`)
-6. Build and run tests
-
-For an optional API that depends on a heavy library, gate it behind a `BROKIT_ENABLE_*`
-CMake option that defines a `BROKIT_HAS_*` macro, wrap the installer declaration/call in
-`#ifdef BROKIT_HAS_*` (see `installNoise` / `installImage`), and append the `.cpp`
-conditionally in `src/api/CMakeLists.txt`. If the API should be reachable via `require()`,
-add the name mapping in `installRequire()` in `src/api/api.cpp`.
+5. If the API has a JS layer, add `src/api/js/myapi.js` and list it in `src/api/CMakeLists.txt` under `BROKIT_JS_POLYFILLS`
+6. Write `tests/js/test_myapi.js` using the `assert()` and `assertEqual()` test helpers
+7. Build and run tests
 
 ## Integration with bro
 
-bro's `third_party/CMakeLists.txt` should add brokit similar to htmlayout:
+bro's `third_party/CMakeLists.txt` adds brokit:
 
 ```cmake
 set(BROKIT_DIR "${CMAKE_SOURCE_DIR}/../brokit" CACHE PATH "Path to standalone brokit repo")
@@ -88,4 +84,4 @@ if(EXISTS "${BROKIT_DIR}/CMakeLists.txt")
 endif()
 ```
 
-Then link with `target_link_libraries(bro_js PUBLIC brokit)` and call `brokit::api::installAll(ctx)` during engine initialization.
+Then link with `target_link_libraries(bro_js PUBLIC brokit)` and call `brokit::api::installAll()` during engine initialization.

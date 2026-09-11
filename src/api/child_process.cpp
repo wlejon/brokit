@@ -1,6 +1,8 @@
 #include "api/api.h"
-#include "runtime/runtime.h"
-#include "child_process.js.h"
+#include "api/arg_reader.h"
+#include "api/object_builder.h"
+
+extern "C" void bronze_child_process_main();
 
 #include <algorithm>
 #include <cstring>
@@ -671,238 +673,169 @@ struct ExecOptions {
     int highWaterMark = 8 * 1024 * 1024; // spawn only: per-stream backpressure threshold
 };
 
-static ExecOptions parseOptions(JSContext* ctx, int argc, JSValueConst* argv, int optIdx)
+static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
 {
     ExecOptions opts;
-    if (optIdx >= argc || !JS_IsObject(argv[optIdx])) return opts;
+    if (optIdx >= a.size() || !ev::isObject(a[optIdx])) return opts;
 
-    JSValue val;
+    bronze::Value val = a[optIdx];
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "cwd");
-    if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) { opts.cwd = s; JS_FreeCString(ctx, s); }
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value cwdV = ev::getProperty(val, "cwd");
+    if (ev::isString(cwdV)) opts.cwd = ev::toUtf8(cwdV);
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "encoding");
-    if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) { opts.encoding = s; JS_FreeCString(ctx, s); }
-    } else if (JS_IsNull(val)) {
-        opts.encoding = "buffer";
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value encV = ev::getProperty(val, "encoding");
+    if (ev::isString(encV)) opts.encoding = ev::toUtf8(encV);
+    else if (ev::isNull(encV)) opts.encoding = "buffer";
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "timeout");
-    if (JS_IsNumber(val)) {
-        JS_ToInt32(ctx, &opts.timeout, val);
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value toV = ev::getProperty(val, "timeout");
+    if (ev::isDouble(toV)) opts.timeout = static_cast<int>(ev::toDouble(toV));
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "shell");
-    if (!JS_IsUndefined(val)) opts.shell = JS_ToBool(ctx, val) == 1;
-    JS_FreeValue(ctx, val);
+    bronze::Value shV = ev::getProperty(val, "shell");
+    if (ev::isBool(shV)) opts.shell = ev::toBool(shV);
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "maxBuffer");
-    if (JS_IsNumber(val)) {
-        JS_ToInt32(ctx, &opts.maxBuffer, val);
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value mbV = ev::getProperty(val, "maxBuffer");
+    if (ev::isDouble(mbV)) opts.maxBuffer = static_cast<int>(ev::toDouble(mbV));
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "input");
-    if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) { opts.input = s; JS_FreeCString(ctx, s); }
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value inV = ev::getProperty(val, "input");
+    if (ev::isString(inV)) opts.input = ev::toUtf8(inV);
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "env");
-    if (JS_IsObject(val)) {
+    bronze::Value envV = ev::getProperty(val, "env");
+    if (ev::isObject(envV)) {
         opts.hasEnv = true;
-        JSPropertyEnum* props = nullptr;
-        uint32_t count = 0;
-        if (JS_GetOwnPropertyNames(ctx, &props, &count, val,
-                                   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
-            for (uint32_t i = 0; i < count; i++) {
-                const char* key = JS_AtomToCString(ctx, props[i].atom);
-                if (!key) continue;
-                JSValue pv = JS_GetProperty(ctx, val, props[i].atom);
-                if (!JS_IsUndefined(pv) && !JS_IsNull(pv)) {
-                    const char* pvs = JS_ToCString(ctx, pv);
-                    if (pvs) {
-                        opts.env.emplace_back(key, pvs);
-                        JS_FreeCString(ctx, pvs);
+        bronze::Value objCtor = ev::getGlobal("Object");
+        bronze::Value keysFn = ev::getProperty(objCtor, "keys");
+        auto r = ev::call(keysFn, objCtor, std::array<bronze::Value, 1>{envV});
+        if (!r.thrown && ev::isObject(r.value)) {
+            bronze::Value lenV = ev::getProperty(r.value, "length");
+            if (ev::isDouble(lenV)) {
+                uint32_t count = static_cast<uint32_t>(ev::toDouble(lenV));
+                for (uint32_t i = 0; i < count; ++i) {
+                    bronze::Value k = ev::getElement(r.value, i);
+                    if (ev::isString(k)) {
+                        std::string kStr = ev::toUtf8(k);
+                        bronze::Value v = ev::getProperty(envV, kStr);
+                        if (!ev::isUndefined(v) && !ev::isNull(v)) {
+                            opts.env.emplace_back(kStr, ev::toUtf8(v));
+                        }
                     }
                 }
-                JS_FreeValue(ctx, pv);
-                JS_FreeCString(ctx, key);
             }
-            for (uint32_t i = 0; i < count; i++) JS_FreeAtom(ctx, props[i].atom);
-            js_free(ctx, props);
         }
     }
-    JS_FreeValue(ctx, val);
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "stdoutFile");
-    if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) { opts.stdoutFile = s; JS_FreeCString(ctx, s); }
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value soV = ev::getProperty(val, "stdoutFile");
+    if (ev::isString(soV)) opts.stdoutFile = ev::toUtf8(soV);
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "stderrFile");
-    if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) { opts.stderrFile = s; JS_FreeCString(ctx, s); }
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value seV = ev::getProperty(val, "stderrFile");
+    if (ev::isString(seV)) opts.stderrFile = ev::toUtf8(seV);
 
-    // stdio: 'pipe' opts spawn into streaming mode. Anything else (including
-    // the default) keeps the historical behaviour — no pipes at all — so an
-    // existing caller that never reads can't start silently buffering.
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "stdio");
-    if (JS_IsString(val)) {
-        const char* s = JS_ToCString(ctx, val);
-        if (s) { opts.pipeStdio = (strcmp(s, "pipe") == 0); JS_FreeCString(ctx, s); }
-    }
-    JS_FreeValue(ctx, val);
+    bronze::Value stdioV = ev::getProperty(val, "stdio");
+    if (ev::isString(stdioV)) opts.pipeStdio = (ev::toUtf8(stdioV) == "pipe");
 
-    val = JS_GetPropertyStr(ctx, argv[optIdx], "highWaterMark");
-    if (JS_IsNumber(val)) {
-        JS_ToInt32(ctx, &opts.highWaterMark, val);
+    bronze::Value hwmV = ev::getProperty(val, "highWaterMark");
+    if (ev::isDouble(hwmV)) {
+        opts.highWaterMark = static_cast<int>(ev::toDouble(hwmV));
         if (opts.highWaterMark < 4096) opts.highWaterMark = 4096;
     }
-    JS_FreeValue(ctx, val);
 
     return opts;
 }
 
-// Helper: convert string to JSValue based on encoding
-static JSValue stringToOutput(JSContext* ctx, const std::string& data, const std::string& encoding)
+static bronze::Value stringToOutput(const std::string& data, const std::string& encoding)
 {
     if (encoding == "buffer") {
-        return JS_NewUint8ArrayCopy(ctx,
-            reinterpret_cast<const uint8_t*>(data.data()), data.size());
+        bronze::Value v = ev::createTypedArray(elements::Uint8, static_cast<uint32_t>(data.size()));
+        ev::fillTypedArray(v, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+        return v;
     }
-    return JS_NewStringLen(ctx, data.data(), data.size());
+    return ev::fromUtf8(data);
 }
 
-// ---------------------------------------------------------------------------
-// execSync(command[, options]) — blocking, returns stdout
-// ---------------------------------------------------------------------------
-static JSValue js_execSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// execSync(command[, options])
+static bronze::Value js_execSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "execSync: command required");
+    if (a.empty()) return ev::throwTypeError("execSync: command required");
 
-    const char* cmd = JS_ToCString(ctx, argv[0]);
-    if (!cmd) return JS_EXCEPTION;
-
-    std::string command(cmd);
-    JS_FreeCString(ctx, cmd);
-
-    auto opts = parseOptions(ctx, argc, argv, 1);
+    std::string command = ev::toUtf8(a[0]);
+    auto opts = parseOptions(a, 1);
 
     ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
                                 opts.hasEnv ? &opts.env : nullptr);
 
     if (!res.error.empty()) {
-        return JS_ThrowInternalError(ctx, "execSync: %s", res.error.c_str());
+        return ev::throwTypeError(("execSync: " + res.error).c_str());
     }
 
     if (res.timedOut) {
-        JSValue err = JS_NewError(ctx);
-        JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, "Command timed out"));
-        JS_SetPropertyStr(ctx, err, "code", JS_NewString(ctx, "ETIMEDOUT"));
-        JS_SetPropertyStr(ctx, err, "killed", JS_TRUE);
-        JS_SetPropertyStr(ctx, err, "stdout", stringToOutput(ctx, res.stdoutData, opts.encoding));
-        JS_SetPropertyStr(ctx, err, "stderr", stringToOutput(ctx, res.stderrData, opts.encoding));
-        return JS_Throw(ctx, err);
+        ObjectBuilder err;
+        err.set("message", ev::fromUtf8("Command timed out"));
+        err.set("code", ev::fromUtf8("ETIMEDOUT"));
+        err.set("killed", ev::fromBool(true));
+        err.set("stdout", stringToOutput(res.stdoutData, opts.encoding));
+        err.set("stderr", stringToOutput(res.stderrData, opts.encoding));
+        return ev::throwValue(err.get());
     }
 
     if (res.exitCode != 0) {
-        JSValue err = JS_NewError(ctx);
+        ObjectBuilder err;
         std::string msg = "Command failed: " + command;
-        JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, msg.c_str()));
-        JS_SetPropertyStr(ctx, err, "status", JS_NewInt32(ctx, res.exitCode));
-        JS_SetPropertyStr(ctx, err, "stdout", stringToOutput(ctx, res.stdoutData, opts.encoding));
-        JS_SetPropertyStr(ctx, err, "stderr", stringToOutput(ctx, res.stderrData, opts.encoding));
-        JS_SetPropertyStr(ctx, err, "code", JS_NewString(ctx, "ERR_CHILD_PROCESS"));
-        return JS_Throw(ctx, err);
+        err.set("message", ev::fromUtf8(msg));
+        err.set("status", ev::fromDouble(res.exitCode));
+        err.set("stdout", stringToOutput(res.stdoutData, opts.encoding));
+        err.set("stderr", stringToOutput(res.stderrData, opts.encoding));
+        err.set("code", ev::fromUtf8("ERR_CHILD_PROCESS"));
+        return ev::throwValue(err.get());
     }
 
-    return stringToOutput(ctx, res.stdoutData, opts.encoding);
+    return stringToOutput(res.stdoutData, opts.encoding);
 }
 
-// ---------------------------------------------------------------------------
-// __brokit_cp_exec(command, options) — blocking (used by JS layer to wrap in Promise)
-// Returns { stdout, stderr, exitCode, error?, timedOut? }
-// ---------------------------------------------------------------------------
-static JSValue js_cp_exec(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// __brokit_cp_exec(command, options)
+static bronze::Value js_cp_exec(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "exec: command required");
+    if (a.empty()) return ev::throwTypeError("exec: command required");
 
-    const char* cmd = JS_ToCString(ctx, argv[0]);
-    if (!cmd) return JS_EXCEPTION;
-
-    std::string command(cmd);
-    JS_FreeCString(ctx, cmd);
-
-    auto opts = parseOptions(ctx, argc, argv, 1);
+    std::string command = ev::toUtf8(a[0]);
+    auto opts = parseOptions(a, 1);
 
     ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
                                 opts.hasEnv ? &opts.env : nullptr);
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "stdout", stringToOutput(ctx, res.stdoutData, opts.encoding));
-    JS_SetPropertyStr(ctx, obj, "stderr", stringToOutput(ctx, res.stderrData, opts.encoding));
-    JS_SetPropertyStr(ctx, obj, "exitCode", JS_NewInt32(ctx, res.exitCode));
+    ObjectBuilder obj;
+    obj.set("stdout", stringToOutput(res.stdoutData, opts.encoding));
+    obj.set("stderr", stringToOutput(res.stderrData, opts.encoding));
+    obj.set("exitCode", ev::fromDouble(res.exitCode));
     if (!res.error.empty())
-        JS_SetPropertyStr(ctx, obj, "error", JS_NewString(ctx, res.error.c_str()));
-    JS_SetPropertyStr(ctx, obj, "timedOut", JS_NewBool(ctx, res.timedOut));
+        obj.set("error", ev::fromUtf8(res.error));
+    obj.set("timedOut", ev::fromBool(res.timedOut));
 
-    return obj;
+    return obj.get();
 }
 
-// ---------------------------------------------------------------------------
-// spawnSync(command, args[, options]) — blocking, returns {stdout, stderr, status, signal, error}
-// ---------------------------------------------------------------------------
-static JSValue js_spawnSync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+// spawnSync(command, args[, options])
+static bronze::Value js_spawnSync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "spawnSync: command required");
+    if (a.empty()) return ev::throwTypeError("spawnSync: command required");
 
-    const char* cmd = JS_ToCString(ctx, argv[0]);
-    if (!cmd) return JS_EXCEPTION;
+    std::string command = ev::toUtf8(a[0]);
 
-    std::string command(cmd);
-    JS_FreeCString(ctx, cmd);
-
-    // argv[0] is the executable; the rest are literal arguments. No shell is
-    // involved unless the caller asks for one, so an argument containing &, |,
-    // ( ) or a quote is passed through as data rather than parsed as syntax.
     std::vector<std::string> childArgv{ command };
-    if (argc >= 2 && JS_IsArray(argv[1])) {
-        uint32_t len = 0;
-        JSValue lenVal = JS_GetPropertyStr(ctx, argv[1], "length");
-        JS_ToUint32(ctx, &len, lenVal);
-        JS_FreeValue(ctx, lenVal);
-
-        for (uint32_t i = 0; i < len; i++) {
-            JSValue elem = JS_GetPropertyUint32(ctx, argv[1], i);
-            const char* arg = JS_ToCString(ctx, elem);
-            if (arg) {
-                childArgv.emplace_back(arg);
-                JS_FreeCString(ctx, arg);
+    if (a.size() >= 2 && ev::isObject(a[1])) {
+        bronze::Value lenVal = ev::getProperty(a[1], "length");
+        if (ev::isDouble(lenVal)) {
+            uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+            for (uint32_t i = 0; i < len; i++) {
+                bronze::Value elem = ev::getElement(a[1], i);
+                if (ev::isString(elem)) {
+                    childArgv.push_back(ev::toUtf8(elem));
+                }
             }
-            JS_FreeValue(ctx, elem);
         }
     }
 
-    int optIdx = (argc >= 2 && JS_IsArray(argv[1])) ? 2 : 1;
-    auto opts = parseOptions(ctx, argc, argv, optIdx);
+    size_t optIdx = (a.size() >= 2 && ev::isObject(a[1]) && ev::isDouble(ev::getProperty(a[1], "length"))) ? 2 : 1;
+    auto opts = parseOptions(a, optIdx);
 
-    // options.shell opts back into a shell line for callers that really want
-    // one (builtins, redirects) out of spawnSync.
     if (opts.shell) {
         for (size_t i = 1; i < childArgv.size(); i++) {
             command += " ";
@@ -916,66 +849,53 @@ static JSValue js_spawnSync(JSContext* ctx, JSValueConst, int argc, JSValueConst
                                 opts.hasEnv ? &opts.env : nullptr,
                                 opts.shell ? nullptr : &childArgv);
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "stdout", stringToOutput(ctx, res.stdoutData, opts.encoding));
-    JS_SetPropertyStr(ctx, obj, "stderr", stringToOutput(ctx, res.stderrData, opts.encoding));
-    JS_SetPropertyStr(ctx, obj, "status", res.exitCode >= 0 ? JS_NewInt32(ctx, res.exitCode) : JS_NULL);
-    JS_SetPropertyStr(ctx, obj, "signal", res.timedOut ? JS_NewString(ctx, "SIGKILL") : JS_NULL);
+    ObjectBuilder obj;
+    obj.set("stdout", stringToOutput(res.stdoutData, opts.encoding));
+    obj.set("stderr", stringToOutput(res.stderrData, opts.encoding));
+    obj.set("status", res.exitCode >= 0 ? ev::fromDouble(res.exitCode) : ev::null());
+    obj.set("signal", res.timedOut ? ev::fromUtf8("SIGKILL") : ev::null());
 
     if (!res.error.empty()) {
-        JSValue err = JS_NewError(ctx);
-        JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, res.error.c_str()));
-        JS_SetPropertyStr(ctx, obj, "error", err);
+        obj.set("error", ev::throwTypeError(res.error.c_str()));
     }
 
-    return obj;
+    return obj.get();
 }
 
-// ---------------------------------------------------------------------------
 // __brokit_cp_spawnAsync(file, args, options)
-//
-// Non-blocking spawn: starts a detached child process and returns
-// { id, pid } immediately. Caller polls __brokit_cp_childPoll(id) to detect
-// exit. Child inherits no stdio pipes (keeps its own terminal/window).
-// ---------------------------------------------------------------------------
-static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "spawnAsync: file required");
+    if (a.empty()) return ev::throwTypeError("spawnAsync: file required");
 
-    const char* fileC = JS_ToCString(ctx, argv[0]);
-    if (!fileC) return JS_EXCEPTION;
-    std::string file(fileC);
-    JS_FreeCString(ctx, fileC);
+    std::string file = ev::toUtf8(a[0]);
 
     std::vector<std::string> args;
-    if (argc >= 2 && JS_IsArray(argv[1])) {
-        uint32_t len = 0;
-        JSValue lenVal = JS_GetPropertyStr(ctx, argv[1], "length");
-        JS_ToUint32(ctx, &len, lenVal);
-        JS_FreeValue(ctx, lenVal);
-        for (uint32_t i = 0; i < len; i++) {
-            JSValue elem = JS_GetPropertyUint32(ctx, argv[1], i);
-            const char* a = JS_ToCString(ctx, elem);
-            if (a) { args.emplace_back(a); JS_FreeCString(ctx, a); }
-            JS_FreeValue(ctx, elem);
+    if (a.size() >= 2 && ev::isObject(a[1])) {
+        bronze::Value lenVal = ev::getProperty(a[1], "length");
+        if (ev::isDouble(lenVal)) {
+            uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+            for (uint32_t i = 0; i < len; i++) {
+                bronze::Value elem = ev::getElement(a[1], i);
+                if (ev::isString(elem)) {
+                    args.push_back(ev::toUtf8(elem));
+                }
+            }
         }
     }
 
-    int optIdx = (argc >= 2 && JS_IsArray(argv[1])) ? 2 : 1;
-    auto opts = parseOptions(ctx, argc, argv, optIdx);
+    size_t optIdx = (a.size() >= 2 && ev::isObject(a[1]) && ev::isDouble(ev::getProperty(a[1], "length"))) ? 2 : 1;
+    auto opts = parseOptions(a, optIdx);
 
     auto handle = std::make_unique<ChildHandle>();
 
 #ifdef _WIN32
-    // Build quoted command line. With shell:true the pieces are joined into a
-    // shell line instead — the caller has asked for cmd to parse it.
     std::string cmdLine;
     if (opts.shell) {
         cmdLine = "cmd /c " + file;
-        for (auto& a : args) { cmdLine += " "; cmdLine += a; }
+        for (auto& arg : args) { cmdLine += " "; cmdLine += arg; }
     } else {
         cmdLine = quoteArg(file);
-        for (auto& a : args) { cmdLine += " "; cmdLine += quoteArg(a); }
+        for (auto& arg : args) { cmdLine += " "; cmdLine += quoteArg(arg); }
     }
 
     std::string envBlock;
@@ -985,146 +905,88 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     six.StartupInfo.cb = sizeof(six);
     PROCESS_INFORMATION pi = {};
 
-    // hOut/hErr/hIn are the CHILD ends — inheritable, and closed in the parent
-    // right after CreateProcess in every path below.
     HANDLE hOut = nullptr, hErr = nullptr, hIn = nullptr;
     BOOL inheritHandles = FALSE;
     std::vector<uint8_t> attrBuf;
     bool haveAttrList = false;
     if (opts.pipeStdio) {
         SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-        // Parent ends go straight into `handle` so its destructor closes them
-        // on any early-return below. The explicit buffer size matters: with the
-        // default the child blocks in write() after a few KB and the reader
-        // wakes constantly for tiny reads, which is what held a rawvideo feed
-        // to a fraction of the rate it needs.
-        if (!CreatePipe(&handle->outRead, &hOut, &sa, kPipeBufferBytes))
-            return JS_ThrowInternalError(ctx, "spawn: cannot create stdout pipe");
+        DWORD pipeBufSize = static_cast<DWORD>(kPipeBufferBytes);
+        if (!CreatePipe(&handle->outRead, &hOut, &sa, pipeBufSize) ||
+            !CreatePipe(&handle->errRead, &hErr, &sa, pipeBufSize) ||
+            !CreatePipe(&hIn, &handle->inWrite, &sa, pipeBufSize)) {
+            if (hOut) CloseHandle(hOut);
+            if (hErr) CloseHandle(hErr);
+            if (hIn) CloseHandle(hIn);
+            return ev::throwTypeError("spawn: cannot create stdio pipes");
+        }
         SetHandleInformation(handle->outRead, HANDLE_FLAG_INHERIT, 0);
-        if (!CreatePipe(&handle->errRead, &hErr, &sa, kPipeBufferBytes)) {
-            CloseHandle(hOut);
-            return JS_ThrowInternalError(ctx, "spawn: cannot create stderr pipe");
-        }
         SetHandleInformation(handle->errRead, HANDLE_FLAG_INHERIT, 0);
-        if (!CreatePipe(&hIn, &handle->inWrite, &sa, kPipeBufferBytes)) {
-            CloseHandle(hOut);
-            CloseHandle(hErr);
-            return JS_ThrowInternalError(ctx, "spawn: cannot create stdin pipe");
-        }
         SetHandleInformation(handle->inWrite, HANDLE_FLAG_INHERIT, 0);
 
-        six.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
         six.StartupInfo.hStdOutput = hOut;
-        six.StartupInfo.hStdError  = hErr;
-        six.StartupInfo.hStdInput  = hIn;
-        inheritHandles = TRUE;
-
-        // Same cross-spawn hazard as runCommand: bInheritHandles=TRUE alone
-        // leaks every inheritable handle in the process into the child, so a
-        // concurrent spawn inherits this child's write ends and its pipe never
-        // sees EOF.
-        HANDLE inheritList[3] = { hOut, hErr, hIn };
-        haveAttrList = buildHandleList(attrBuf, inheritList, 3);
-        if (haveAttrList)
-            six.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
-    } else if (!opts.stdoutFile.empty() || !opts.stderrFile.empty()) {
-        SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-        if (!opts.stdoutFile.empty()) {
-            hOut = CreateFileA(opts.stdoutFile.c_str(), GENERIC_WRITE,
-                               FILE_SHARE_READ, &sa, CREATE_ALWAYS,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hOut == INVALID_HANDLE_VALUE)
-                return JS_ThrowInternalError(ctx, "spawn: cannot open stdoutFile '%s'",
-                                             opts.stdoutFile.c_str());
-        }
-        if (!opts.stderrFile.empty()) {
-            if (opts.stderrFile == opts.stdoutFile) {
-                hErr = hOut;
-            } else {
-                hErr = CreateFileA(opts.stderrFile.c_str(), GENERIC_WRITE,
-                                   FILE_SHARE_READ, &sa, CREATE_ALWAYS,
-                                   FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (hErr == INVALID_HANDLE_VALUE) {
-                    if (hOut) CloseHandle(hOut);
-                    return JS_ThrowInternalError(ctx, "spawn: cannot open stderrFile '%s'",
-                                                 opts.stderrFile.c_str());
-                }
-            }
-        }
-        hIn = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                          &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        six.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-        six.StartupInfo.hStdOutput = hOut ? hOut : GetStdHandle(STD_OUTPUT_HANDLE);
-        six.StartupInfo.hStdError = hErr ? hErr : GetStdHandle(STD_ERROR_HANDLE);
+        six.StartupInfo.hStdError = hErr;
         six.StartupInfo.hStdInput = hIn;
+        six.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
         inheritHandles = TRUE;
 
-        // Restrict inheritance to this child's own std handles — same
-        // cross-spawn hazard as runCommand: without a handle list a child
-        // spawned here also inherits every concurrently live pipe end.
-        // Only when all three std handles are ones we created: a GetStdHandle
-        // fallback handle may not be inheritable, and putting it in the list
-        // (or omitting it) would break the child's stdio.
-        if (hOut && hErr) {
-            HANDLE inheritList[3];
-            size_t n = 0;
-            inheritList[n++] = hOut;
-            if (hErr != hOut) inheritList[n++] = hErr;
-            if (hIn && hIn != INVALID_HANDLE_VALUE) inheritList[n++] = hIn;
-            haveAttrList = buildHandleList(attrBuf, inheritList, n);
-            if (haveAttrList)
-                six.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+        HANDLE handlesToInherit[3] = { hOut, hErr, hIn };
+        SIZE_T attrSize = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+        attrBuf.resize(attrSize);
+        six.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
+        if (InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &attrSize) &&
+            UpdateProcThreadAttribute(six.lpAttributeList, 0,
+                                      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                      handlesToInherit, sizeof(handlesToInherit),
+                                      nullptr, nullptr)) {
+            haveAttrList = true;
         }
     }
 
+    DWORD creationFlags = CREATE_NO_WINDOW;
+    if (opts.hasEnv) creationFlags |= CREATE_UNICODE_ENVIRONMENT;
+    if (haveAttrList) creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
+
+    std::vector<char> cmdBuf(cmdLine.begin(), cmdLine.end());
+    cmdBuf.push_back('\0');
+
     BOOL ok = CreateProcessA(
-        nullptr,
-        cmdLine.data(),
-        nullptr, nullptr,
-        inheritHandles,
-        // No CREATE_NO_WINDOW by default — let GUI children show their window.
-        // A piped child is by definition being driven programmatically, so
-        // suppress the console window that would otherwise flash up.
-        (opts.pipeStdio ? CREATE_NO_WINDOW : 0) |
-        (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0),
+        nullptr, cmdBuf.data(),
+        nullptr, nullptr, inheritHandles,
+        creationFlags,
         opts.hasEnv ? const_cast<char*>(envBlock.data()) : nullptr,
         opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
-        &six.StartupInfo, &pi);
+        haveAttrList ? reinterpret_cast<STARTUPINFOA*>(&six) : &six.StartupInfo,
+        &pi);
 
     DWORD createErr = ok ? 0 : GetLastError();
-    if (haveAttrList)
-        DeleteProcThreadAttributeList(
-            reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data()));
-    if (hOut) CloseHandle(hOut);
-    if (hErr && hErr != hOut) CloseHandle(hErr);
+    if (haveAttrList) DeleteProcThreadAttributeList(six.lpAttributeList);
+    if (hOut && hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
+    if (hErr && hErr != INVALID_HANDLE_VALUE) CloseHandle(hErr);
     if (hIn && hIn != INVALID_HANDLE_VALUE) CloseHandle(hIn);
 
     if (!ok) {
-        return JS_ThrowInternalError(ctx, "spawn failed: CreateProcess error %lu", createErr);
+        char errBuf[256];
+        snprintf(errBuf, sizeof(errBuf), "spawn failed: CreateProcess error %lu", createErr);
+        return ev::throwTypeError(errBuf);
     }
     CloseHandle(pi.hThread);
     handle->process = pi.hProcess;
     handle->pid = pi.dwProcessId;
 #else
-    // stdio:'pipe' — create the three stdio pipes before forking. The child
-    // dups its ends over 0/1/2; the parent keeps outRead/errRead/inWrite (in
-    // `handle`, so its destructor closes them on any early return below).
     int outPipe[2] = {-1, -1}, errPipe[2] = {-1, -1}, inPipe[2] = {-1, -1};
     if (opts.pipeStdio) {
         if (pipe(outPipe) != 0 || pipe(errPipe) != 0 || pipe(inPipe) != 0) {
             for (int fd : { outPipe[0], outPipe[1], errPipe[0], errPipe[1],
                             inPipe[0], inPipe[1] })
                 if (fd >= 0) ::close(fd);
-            return JS_ThrowInternalError(ctx, "spawn: cannot create stdio pipes");
+            return ev::throwTypeError("spawn: cannot create stdio pipes");
         }
         handle->outRead = outPipe[0];
         handle->errRead = errPipe[0];
         handle->inWrite = inPipe[1];
 #ifdef __linux__
-        // Linux pipes default to 64 KB. Widening them keeps a high-rate
-        // producer from blocking in write() between reader wakeups. Best
-        // effort: F_SETPIPE_SZ fails without privilege past
-        // /proc/sys/fs/pipe-max-size, and the default still works.
         fcntl(outPipe[0], F_SETPIPE_SZ, static_cast<int>(kPipeBufferBytes));
         fcntl(errPipe[0], F_SETPIPE_SZ, static_cast<int>(kPipeBufferBytes));
         fcntl(inPipe[1],  F_SETPIPE_SZ, static_cast<int>(kPipeBufferBytes));
@@ -1137,14 +999,10 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         if (inPipe[0]  >= 0) { ::close(inPipe[0]);  inPipe[0]  = -1; }
     };
 
-    // Self-pipe so an execvp failure in the child (e.g. a missing binary)
-    // surfaces synchronously here, matching Windows' CreateProcess failure. The
-    // write end is close-on-exec: a successful exec closes it (parent reads EOF);
-    // a failed exec writes errno through it before _exit.
     int execPipe[2] = {-1, -1};
     if (pipe(execPipe) != 0) {
         closeChildEnds();
-        return JS_ThrowInternalError(ctx, "spawn failed: pipe");
+        return ev::throwTypeError("spawn failed: pipe");
     }
     fcntl(execPipe[1], F_SETFD, fcntl(execPipe[1], F_GETFD) | FD_CLOEXEC);
 
@@ -1153,13 +1011,11 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         close(execPipe[0]);
         close(execPipe[1]);
         closeChildEnds();
-        return JS_ThrowInternalError(ctx, "spawn failed: fork");
+        return ev::throwTypeError("spawn failed: fork");
     }
     if (pid == 0) {
-        // Child
         close(execPipe[0]);
         if (opts.pipeStdio) {
-            // Drop the parent ends, then move our ends onto 0/1/2.
             ::close(outPipe[0]);
             ::close(errPipe[0]);
             ::close(inPipe[1]);
@@ -1186,36 +1042,29 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
             dup2(fd, STDERR_FILENO);
             close(fd);
         }
-        // shell:true joins the pieces into one /bin/sh -c line; otherwise the
-        // entries are literal argv and nothing re-parses them.
         std::string shellLine;
-        std::vector<char*> argv;
+        std::vector<char*> cArgv;
         if (opts.shell) {
             shellLine = file;
-            for (auto& a : args) { shellLine += " "; shellLine += a; }
-            argv.push_back(const_cast<char*>("sh"));
-            argv.push_back(const_cast<char*>("-c"));
-            argv.push_back(const_cast<char*>(shellLine.c_str()));
+            for (auto& aItem : args) { shellLine += " "; shellLine += aItem; }
+            cArgv.push_back(const_cast<char*>("sh"));
+            cArgv.push_back(const_cast<char*>("-c"));
+            cArgv.push_back(const_cast<char*>(shellLine.c_str()));
         } else {
-            argv.push_back(const_cast<char*>(file.c_str()));
-            for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+            cArgv.push_back(const_cast<char*>(file.c_str()));
+            for (auto& aItem : args) cArgv.push_back(const_cast<char*>(aItem.c_str()));
         }
-        argv.push_back(nullptr);
-        // Both vectors must outlive the execvp below: `environ` points into
-        // envp, so letting them die at the end of an if-block would leave the
-        // exec reading freed memory.
+        cArgv.push_back(nullptr);
         std::vector<std::string> envStrs;
         std::vector<char*> envp;
         if (opts.hasEnv) {
             envStrs = buildEnvStrings(opts.env);
             for (auto& s : envStrs) envp.push_back(const_cast<char*>(s.c_str()));
             envp.push_back(nullptr);
-            environ = envp.data();   // pre-exec in the forked child; execvp keeps PATH search
+            environ = envp.data();
         }
-        execvp(opts.shell ? "/bin/sh" : file.c_str(), argv.data());
+        execvp(opts.shell ? "/bin/sh" : file.c_str(), cArgv.data());
         int execErrno = errno;
-        // Report the exec failure to the parent, then exit. Loop guards against
-        // a short write; the parent only inspects the first int.
         const char* p = reinterpret_cast<const char*>(&execErrno);
         size_t left = sizeof(execErrno);
         while (left > 0) {
@@ -1228,26 +1077,19 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
     }
     handle->pid = pid;
 
-    // Parent: drop the child's pipe ends, or stdout/stderr never reach EOF.
     closeChildEnds();
 
-    // Parent: wait for the child to either exec (EOF) or report an errno.
     close(execPipe[1]);
     int childErrno = 0;
     ssize_t got = read(execPipe[0], &childErrno, sizeof(childErrno));
     close(execPipe[0]);
     if (got == static_cast<ssize_t>(sizeof(childErrno)) && childErrno != 0) {
-        // exec failed in the child — reap the transient process and throw.
         int status = 0;
         waitpid(pid, &status, 0);
-        return JS_ThrowInternalError(ctx, "spawn failed: %s: %s",
-                                     file.c_str(), strerror(childErrno));
+        return ev::throwTypeError(("spawn failed: " + file + ": " + strerror(childErrno)).c_str());
     }
 #endif
 
-    // Start draining before the handle goes into the registry. The threads hold
-    // raw pointers into *handle, which is stable — the unique_ptr moves, the
-    // pointee does not.
     if (opts.pipeStdio) {
         handle->piped = true;
         handle->out.highWater = static_cast<size_t>(opts.highWaterMark);
@@ -1265,45 +1107,35 @@ static JSValue js_spawnAsync(JSContext* ctx, JSValueConst, int argc, JSValueCons
         g_children[id] = std::move(handle);
     }
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "id", JS_NewInt32(ctx, id));
-    JS_SetPropertyStr(ctx, obj, "pid", JS_NewInt32(ctx, pidVal));
-    JS_SetPropertyStr(ctx, obj, "piped", JS_NewBool(ctx, piped));
-    return obj;
+    ObjectBuilder obj;
+    obj.set("id", ev::fromDouble(id));
+    obj.set("pid", ev::fromDouble(pidVal));
+    obj.set("piped", ev::fromBool(piped));
+    return obj.get();
 }
 
-// ---------------------------------------------------------------------------
 // __brokit_cp_childPoll(id)
-//
-// Returns null if the child is still running, or { exitCode, signal } if it
-// has exited. After a non-null return the handle is released from the
-// registry — subsequent polls throw.
-// ---------------------------------------------------------------------------
-static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_childPoll(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "childPoll: id required");
-    int id = 0;
-    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    if (a.empty()) return ev::throwTypeError("childPoll: id required");
+    int id = i32At(a, 0);
 
     ChildHandle* h = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_childMutex);
         auto it = g_children.find(id);
         if (it == g_children.end()) {
-            return JS_ThrowRangeError(ctx, "childPoll: unknown child id %d", id);
+            return ev::throwRangeError(("childPoll: unknown child id " + std::to_string(id)).c_str());
         }
         h = it->second.get();
     }
 
-    // A piped child outlives its own exit: the reader threads may still hold
-    // buffered output, so the handle stays registered and this reports the
-    // cached result until JS calls childRelease.
     auto exitInfo = [&](int code, const std::string& sig) {
-        JSValue obj = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, obj, "exitCode", JS_NewInt32(ctx, code));
-        if (sig.empty()) JS_SetPropertyStr(ctx, obj, "signal", JS_NULL);
-        else             JS_SetPropertyStr(ctx, obj, "signal", JS_NewString(ctx, sig.c_str()));
-        return obj;
+        ObjectBuilder obj;
+        obj.set("exitCode", ev::fromDouble(code));
+        if (sig.empty()) obj.set("signal", ev::null());
+        else             obj.set("signal", ev::fromUtf8(sig));
+        return obj.get();
     };
 
     if (h->exitReported) return exitInfo(h->exitCode, h->signal);
@@ -1311,18 +1143,18 @@ static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst
 #ifdef _WIN32
     DWORD status = WaitForSingleObject(h->process, 0);
     if (status == WAIT_TIMEOUT) {
-        return JS_NULL;
+        return ev::null();
     }
     DWORD code = 0;
     GetExitCodeProcess(h->process, &code);
     CloseHandle(h->process);
-    h->process = nullptr;   // the destructor must not double-close
+    h->process = nullptr;
     int exitCode = (int)code;
     std::string sig;
 #else
     int status = 0;
     pid_t r = waitpid(h->pid, &status, WNOHANG);
-    if (r == 0) return JS_NULL;
+    if (r == 0) return ev::null();
     int exitCode = -1;
     std::string sig;
     if (r > 0) {
@@ -1335,7 +1167,7 @@ static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst
     h->signal = sig;
     h->exitReported = true;
 
-    JSValue obj = exitInfo(exitCode, sig);
+    bronze::Value obj = exitInfo(exitCode, sig);
 
     if (!h->piped) {
         std::lock_guard<std::mutex> lock(g_childMutex);
@@ -1344,120 +1176,86 @@ static JSValue js_childPoll(JSContext* ctx, JSValueConst, int argc, JSValueConst
     return obj;
 }
 
-// ---------------------------------------------------------------------------
 // __brokit_cp_childRead(id)
-//
-// Drains whatever the reader threads have buffered. Returns
-// { stdout, stderr, stdoutEof, stderrEof } where each stream is a Uint8Array
-// (binary — rawvideo and text both survive) or null when nothing was pending.
-// Draining is what releases backpressure, so a caller that stops reading
-// stalls the child rather than growing the parent's heap.
-// ---------------------------------------------------------------------------
-static JSValue js_childRead(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_childRead(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "childRead: id required");
-    int id = 0;
-    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    if (a.empty()) return ev::throwTypeError("childRead: id required");
+    int id = i32At(a, 0);
 
     ChildHandle* h = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_childMutex);
         auto it = g_children.find(id);
         if (it == g_children.end())
-            return JS_ThrowRangeError(ctx, "childRead: unknown child id %d", id);
+            return ev::throwRangeError(("childRead: unknown child id " + std::to_string(id)).c_str());
         h = it->second.get();
     }
     if (!h->piped)
-        return JS_ThrowTypeError(ctx, "childRead: child %d was not spawned with stdio:'pipe'", id);
+        return ev::throwTypeError(("childRead: child " + std::to_string(id) + " was not spawned with stdio:'pipe'").c_str());
 
-    auto take = [&](PipeBuf& buf, JSValue& outVal, bool& eofOut) {
+    auto take = [&](PipeBuf& buf, bronze::Value& outVal, bool& eofOut) {
         std::vector<uint8_t> drained;
         {
             std::lock_guard<std::mutex> lock(buf.m);
             drained.swap(buf.data);
             eofOut = buf.eof;
         }
-        // Notify outside the lock: the reader wakes straight into its wait
-        // predicate instead of blocking on a mutex we still hold.
         if (!drained.empty()) buf.cv.notify_all();
         outVal = drained.empty()
-            ? JS_NULL
-            : JS_NewUint8ArrayCopy(ctx, drained.data(), drained.size());
+            ? ev::null()
+            : stringToOutput(std::string(reinterpret_cast<const char*>(drained.data()), drained.size()), "buffer");
     };
 
-    JSValue outVal = JS_NULL, errVal = JS_NULL;
+    bronze::Value outVal = ev::null(), errVal = ev::null();
     bool outEof = false, errEof = false;
     take(h->out, outVal, outEof);
     take(h->err, errVal, errEof);
 
-    JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "stdout", outVal);
-    JS_SetPropertyStr(ctx, obj, "stderr", errVal);
-    JS_SetPropertyStr(ctx, obj, "stdoutEof", JS_NewBool(ctx, outEof));
-    JS_SetPropertyStr(ctx, obj, "stderrEof", JS_NewBool(ctx, errEof));
-    return obj;
+    ObjectBuilder obj;
+    obj.set("stdout", outVal);
+    obj.set("stderr", errVal);
+    obj.set("stdoutEof", ev::fromBool(outEof));
+    obj.set("stderrEof", ev::fromBool(errEof));
+    return obj.get();
 }
 
-// ---------------------------------------------------------------------------
 // __brokit_cp_childWrite(id, data)
-//
-// Writes to the child's stdin. `data` is a string (UTF-8) or TypedArray/
-// ArrayBuffer. Returns the byte count written, or -1 if stdin is already
-// closed. Blocking: a child that never reads will stall the JS thread once
-// the pipe buffer fills, so callers streaming large input should chunk it.
-// ---------------------------------------------------------------------------
-static JSValue js_childWrite(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_childWrite(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 2) return JS_ThrowTypeError(ctx, "childWrite: id and data required");
-    int id = 0;
-    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    if (a.size() < 2) return ev::throwTypeError("childWrite: id and data required");
+    int id = i32At(a, 0);
 
     ChildHandle* h = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_childMutex);
         auto it = g_children.find(id);
         if (it == g_children.end())
-            return JS_ThrowRangeError(ctx, "childWrite: unknown child id %d", id);
+            return ev::throwRangeError(("childWrite: unknown child id " + std::to_string(id)).c_str());
         h = it->second.get();
     }
     if (!h->piped)
-        return JS_ThrowTypeError(ctx, "childWrite: child %d was not spawned with stdio:'pipe'", id);
+        return ev::throwTypeError(("childWrite: child " + std::to_string(id) + " was not spawned with stdio:'pipe'").c_str());
 
     const uint8_t* bytes = nullptr;
     size_t len = 0;
     std::string tmp;
-    size_t byteOffset = 0, byteLen = 0, bytesPerElem = 0;
-    JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[1], &byteOffset, &byteLen, &bytesPerElem);
-    if (!JS_IsException(ab)) {
-        size_t abLen = 0;
-        uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, ab);
-        if (abPtr) { bytes = abPtr + byteOffset; len = byteLen; }
-        JS_FreeValue(ctx, ab);
+    if (auto info = ev::typedArrayInfo(a[1])) {
+        bytes = info.data;
+        len = info.byteLength;
+    } else if (auto infoAb = ev::arrayBufferInfo(a[1])) {
+        bytes = infoAb.data;
+        len = infoAb.byteLength;
     } else {
-        // Not a TypedArray. Clear the probe's exception before trying the next
-        // shape — both of these throw on a miss, and a leftover pending
-        // exception would surface spuriously at an unrelated call site.
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        size_t abLen = 0;
-        uint8_t* abPtr = JS_GetArrayBuffer(ctx, &abLen, argv[1]);
-        if (abPtr) {
-            bytes = abPtr;
-            len = abLen;
-        } else {
-            JS_FreeValue(ctx, JS_GetException(ctx));
-            const char* s = JS_ToCStringLen(ctx, &len, argv[1]);
-            if (!s) return JS_EXCEPTION;
-            tmp.assign(s, len);
-            JS_FreeCString(ctx, s);
-            bytes = reinterpret_cast<const uint8_t*>(tmp.data());
-        }
+        tmp = ev::toUtf8(a[1]);
+        bytes = reinterpret_cast<const uint8_t*>(tmp.data());
+        len = tmp.size();
     }
-    if (!bytes) return JS_NewInt32(ctx, 0);
+    if (!bytes) return ev::fromDouble(0);
 
     std::lock_guard<std::mutex> lock(h->stdinMutex);
     size_t written = 0;
 #ifdef _WIN32
-    if (!h->inWrite) return JS_NewInt32(ctx, -1);
+    if (!h->inWrite) return ev::fromDouble(-1);
     while (written < len) {
         DWORD n = 0;
         if (!WriteFile(h->inWrite, bytes + written,
@@ -1466,7 +1264,7 @@ static JSValue js_childWrite(JSContext* ctx, JSValueConst, int argc, JSValueCons
         written += n;
     }
 #else
-    if (h->inWrite < 0) return JS_NewInt32(ctx, -1);
+    if (h->inWrite < 0) return ev::fromDouble(-1);
     while (written < len) {
         ssize_t n = ::write(h->inWrite, bytes + written, len - written);
         if (n < 0) {
@@ -1477,124 +1275,77 @@ static JSValue js_childWrite(JSContext* ctx, JSValueConst, int argc, JSValueCons
         written += static_cast<size_t>(n);
     }
 #endif
-    return JS_NewInt32(ctx, static_cast<int>(written));
+    return ev::fromDouble(static_cast<double>(written));
 }
 
-// ---------------------------------------------------------------------------
 // __brokit_cp_childCloseStdin(id)
-//
-// Sends EOF on the child's stdin. Tools that read a stream to completion
-// (ffmpeg with `-i pipe:0`) never finish without it.
-// ---------------------------------------------------------------------------
-static JSValue js_childCloseStdin(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_childCloseStdin(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "childCloseStdin: id required");
-    int id = 0;
-    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    if (a.empty()) return ev::throwTypeError("childCloseStdin: id required");
+    int id = i32At(a, 0);
 
     std::lock_guard<std::mutex> lock(g_childMutex);
     auto it = g_children.find(id);
-    if (it == g_children.end()) return JS_FALSE;
+    if (it == g_children.end()) return ev::fromBool(false);
     it->second->closeStdin();
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
-// ---------------------------------------------------------------------------
 // __brokit_cp_childRelease(id)
-//
-// Drops a piped child's handle: stops the reader threads and closes the pipes.
-// Non-piped children are released automatically by childPoll on exit; piped
-// ones are kept so post-exit output can still be drained, so JS must call this
-// once it has seen EOF on both streams. Idempotent.
-// ---------------------------------------------------------------------------
-static JSValue js_childRelease(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_childRelease(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "childRelease: id required");
-    int id = 0;
-    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    if (a.empty()) return ev::throwTypeError("childRelease: id required");
+    int id = i32At(a, 0);
 
-    // Move the handle out under the lock and destroy it after releasing, so a
-    // reader thread's final buffer append can't deadlock against g_childMutex.
     std::unique_ptr<ChildHandle> doomed;
     {
         std::lock_guard<std::mutex> lock(g_childMutex);
         auto it = g_children.find(id);
-        if (it == g_children.end()) return JS_FALSE;
+        if (it == g_children.end()) return ev::fromBool(false);
         doomed = std::move(it->second);
         g_children.erase(it);
     }
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
-// ---------------------------------------------------------------------------
 // __brokit_cp_childKill(id, signal?)
-// Returns true if a kill was issued. After kill the child still needs a
-// subsequent poll to observe exit.
-// ---------------------------------------------------------------------------
-static JSValue js_childKill(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+static bronze::Value js_childKill(bronze::Value, std::span<const bronze::Value> a)
 {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "childKill: id required");
-    int id = 0;
-    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    if (a.empty()) return ev::throwTypeError("childKill: id required");
+    int id = i32At(a, 0);
 
     std::lock_guard<std::mutex> lock(g_childMutex);
     auto it = g_children.find(id);
-    if (it == g_children.end()) return JS_FALSE;
+    if (it == g_children.end()) return ev::fromBool(false);
     ChildHandle* h = it->second.get();
 #ifdef _WIN32
     TerminateProcess(h->process, 1);
 #else
     int sig = SIGTERM;
-    if (argc >= 2 && JS_IsString(argv[1])) {
-        const char* s = JS_ToCString(ctx, argv[1]);
-        if (s) {
-            if (strcmp(s, "SIGKILL") == 0) sig = SIGKILL;
-            else if (strcmp(s, "SIGINT") == 0) sig = SIGINT;
-            JS_FreeCString(ctx, s);
-        }
+    if (a.size() >= 2 && ev::isString(a[1])) {
+        std::string s = ev::toUtf8(a[1]);
+        if (s == "SIGKILL") sig = SIGKILL;
+        else if (s == "SIGINT") sig = SIGINT;
     }
     ::kill(h->pid, sig);
 #endif
-    return JS_TRUE;
+    return ev::fromBool(true);
 }
 
-// ---------------------------------------------------------------------------
-// Install
-// ---------------------------------------------------------------------------
-void installChildProcess(JSContext* ctx)
+void installChildProcess()
 {
-    JSValue global = JS_GetGlobalObject(ctx);
+    ev::setGlobalFunction("__brokit_cp_execSync", 2, js_execSync);
+    ev::setGlobalFunction("__brokit_cp_exec", 2, js_cp_exec);
+    ev::setGlobalFunction("__brokit_cp_spawnSync", 3, js_spawnSync);
+    ev::setGlobalFunction("__brokit_cp_spawnAsync", 3, js_spawnAsync);
+    ev::setGlobalFunction("__brokit_cp_childPoll", 1, js_childPoll);
+    ev::setGlobalFunction("__brokit_cp_childKill", 2, js_childKill);
+    ev::setGlobalFunction("__brokit_cp_childRead", 1, js_childRead);
+    ev::setGlobalFunction("__brokit_cp_childWrite", 2, js_childWrite);
+    ev::setGlobalFunction("__brokit_cp_childCloseStdin", 1, js_childCloseStdin);
+    ev::setGlobalFunction("__brokit_cp_childRelease", 1, js_childRelease);
 
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_execSync",
-                      JS_NewCFunction(ctx, js_execSync, "execSync", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_exec",
-                      JS_NewCFunction(ctx, js_cp_exec, "__brokit_cp_exec", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_spawnSync",
-                      JS_NewCFunction(ctx, js_spawnSync, "spawnSync", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_spawnAsync",
-                      JS_NewCFunction(ctx, js_spawnAsync, "__brokit_cp_spawnAsync", 3));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_childPoll",
-                      JS_NewCFunction(ctx, js_childPoll, "__brokit_cp_childPoll", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_childKill",
-                      JS_NewCFunction(ctx, js_childKill, "__brokit_cp_childKill", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_childRead",
-                      JS_NewCFunction(ctx, js_childRead, "__brokit_cp_childRead", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_childWrite",
-                      JS_NewCFunction(ctx, js_childWrite, "__brokit_cp_childWrite", 2));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_childCloseStdin",
-                      JS_NewCFunction(ctx, js_childCloseStdin, "__brokit_cp_childCloseStdin", 1));
-    JS_SetPropertyStr(ctx, global, "__brokit_cp_childRelease",
-                      JS_NewCFunction(ctx, js_childRelease, "__brokit_cp_childRelease", 1));
-
-    JS_FreeValue(ctx, global);
-
-    // Install JS polyfill
-    JSValue r = JS_Eval(ctx, js_child_process, strlen(js_child_process),
-                        "<child_process>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        Runtime::checkException(ctx, r);
-    }
-    JS_FreeValue(ctx, r);
+    bronze::embed::runEntry(bronze_child_process_main);
 }
 
 } // namespace brokit::api

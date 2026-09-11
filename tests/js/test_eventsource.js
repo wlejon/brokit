@@ -104,7 +104,7 @@ assertEqual(received[0].data, 'key: value: more', 'full value with colons');
 
 // Id with null character — should be ignored per spec
 es._lastEventId = 'prev';
-es._processEvent('id: bad\0id\ndata: null-id');
+es._processEvent('id: bad' + String.fromCharCode(0) + 'id\ndata: null-id');
 assertEqual(es._lastEventId, 'prev', 'id with null ignored');
 
 // ── addEventListener / removeEventListener ───────────────────────────────
