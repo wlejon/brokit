@@ -12,11 +12,11 @@ concurrency:
   group: codeql-${{ github.ref }}
   cancel-in-progress: true
 
-# brokit is a JS runtime embedding QuickJS: it marshals untrusted script values
-# across the native boundary (typed arrays, fetch/URL parsing, SQLite binds) and
-# does a lot of pointer + length arithmetic in the C++ glue. That marshalling
-# layer is where a bounds slip or type-confusion hides, so that is what the
-# analysis targets — the bundled engines are excluded.
+# brokit is a JS runtime embedding Bronze: it marshals host objects and
+# untrusted script values across the native boundary (typed arrays, fetch/URL
+# parsing, SQLite binds) and does pointer + length arithmetic in the C++ glue.
+# That marshalling layer is where a bounds slip or type-confusion hides, so that
+# is what the analysis targets — the bundled engines and compiler are excluded.
 jobs:
   analyze:
     name: Analyze C++
@@ -35,7 +35,26 @@ jobs:
         shell: bash
         run: |
           git -C brokit submodule update --init --recursive \
-            third_party/quickjs third_party/curl third_party/FastNoise2
+            third_party/curl third_party/FastNoise2
+
+      - name: Checkout brass
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/brass
+          path: brass
+
+      - name: Build brass
+        shell: bash
+        run: |
+          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release
+          cmake --build brass/build --config Release
+          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
+
+      - name: Checkout bronze
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/bronze
+          path: bronze
 
       - uses: actions/checkout@v7
         with:
@@ -56,13 +75,13 @@ jobs:
       # `init`. For a compiled language CodeQL only extracts what it observes the
       # compiler build while tracing, so anything already built when `init` runs
       # is never analysed. That is the exclusion mechanism — paths-ignore does not
-      # filter compiled sources — and it keeps quickjs / curl / FastNoise2 /
-      # sqlite / broimage out of brokit's Security tab, where they do not belong
+      # filter compiled sources — and it keeps curl / FastNoise2 / sqlite /
+      # broimage / bronze out of brokit's Security tab, where they do not belong
       # (each is upstream with its own maintainers). bromath is header-only.
       - name: Pre-build the bundled engines and broimage (outside the traced build)
         run: |
           cmake --build build --parallel 4 --target \
-            qjs libcurl_static FastNoise sqlite3 broimage
+            libcurl_static FastNoise sqlite3 broimage
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4

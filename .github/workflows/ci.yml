@@ -10,21 +10,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# brokit bundles quickjs, curl and FastNoise2 as submodules and builds them from
+# brokit bundles curl and FastNoise2 as submodules and builds them from
 # source, vendors a SQLite amalgamation, and delegates its bro.image kernels to
 # the broimage sibling (which itself needs the header-only bromath). broimage's
 # brotensor adapter is switched off (BROIMAGE_WITH_TENSOR=OFF) — brokit's image
 # glue only uses the host-pointer kernels — so the heavy tensor stack is not
-# pulled in.
+# pulled in. Bronze AOT JavaScript compiler and Brass codegen are checked out
+# as siblings.
 #
 #   $GITHUB_WORKSPACE/
-#     brokit/     <- this repo; quickjs/curl/FastNoise2 submodules initialised
+#     brokit/     <- this repo; curl/FastNoise2 submodules initialised
+#     bronze/     <- sibling, AOT compiler
+#     brass/      <- sibling, codegen backend
 #     broimage/   <- sibling, image kernels
 #     bromath/    <- sibling, header-only
 #
 # The broimage submodule is pinned to an ssh:// URL for push access, so it is
 # NOT initialised here (it would need a deploy key); brokit prefers the sibling
-# checkout at ../broimage anyway. Only the three https submodules are fetched.
+# checkout at ../broimage anyway. Only the https submodules are fetched.
 jobs:
   test:
     name: ${{ matrix.name }}
@@ -46,7 +49,30 @@ jobs:
         shell: bash
         run: |
           git -C brokit submodule update --init --recursive \
-            third_party/quickjs third_party/curl third_party/FastNoise2
+            third_party/curl third_party/FastNoise2
+
+      - name: Checkout brass
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/brass
+          path: brass
+
+      - name: Build brass
+        shell: bash
+        run: |
+          EXTRA_BRASS=""
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            EXTRA_BRASS="-DCMAKE_OSX_ARCHITECTURES=x86_64"
+          fi
+          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release $EXTRA_BRASS
+          cmake --build brass/build --config Release
+          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
+
+      - name: Checkout bronze
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/bronze
+          path: bronze
 
       - uses: actions/checkout@v7
         with:
@@ -74,7 +100,7 @@ jobs:
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
   # Debug + --coverage on Linux. --filter scopes the numbers to brokit's own
-  # code (src/); quickjs / curl / FastNoise2 / sqlite / broimage / bromath are
+  # code (src/); bronze / brass / curl / FastNoise2 / sqlite / broimage / bromath are
   # excluded.
   coverage:
     name: Coverage
@@ -88,7 +114,26 @@ jobs:
         shell: bash
         run: |
           git -C brokit submodule update --init --recursive \
-            third_party/quickjs third_party/curl third_party/FastNoise2
+            third_party/curl third_party/FastNoise2
+
+      - name: Checkout brass
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/brass
+          path: brass
+
+      - name: Build brass
+        shell: bash
+        run: |
+          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release
+          cmake --build brass/build --config Release
+          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
+
+      - name: Checkout bronze
+        uses: actions/checkout@v7
+        with:
+          repository: wlejon/bronze
+          path: bronze
 
       - uses: actions/checkout@v7
         with:
@@ -139,7 +184,7 @@ jobs:
           {
             echo '## Coverage — `src/`'
             echo
-            echo 'The bundled quickjs/curl/FastNoise2/sqlite and the siblings are filtered out.'
+            echo 'The bundled curl/FastNoise2/sqlite and siblings are filtered out.'
             echo
             echo '```'
             cat coverage-summary.txt

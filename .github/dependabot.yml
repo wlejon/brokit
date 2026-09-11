@@ -1,7 +1,7 @@
 version: 2
 
 # Two things carry pinned versions: the actions in .github/workflows/ and the
-# git submodules (quickjs, curl, FastNoise2, broimage). The SQLite amalgamation
+# git submodules (curl, FastNoise2, broimage). The SQLite amalgamation
 # is a vendored source drop with no manifest.
 updates:
   - package-ecosystem: github-actions
