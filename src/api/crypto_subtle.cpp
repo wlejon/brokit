@@ -20,6 +20,29 @@
 
 namespace brokit::api {
 
+// Fill buffer with cryptographically secure random bytes.
+// Windows: BCryptGenRandom. Linux/macOS: /dev/urandom.
+static bool fillRandom(uint8_t* buf, size_t len)
+{
+    if (len == 0) return true;
+#ifdef _WIN32
+    NTSTATUS status = BCryptGenRandom(nullptr, buf, static_cast<ULONG>(len),
+                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return BCRYPT_SUCCESS(status);
+#else
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return false;
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = read(fd, buf + total, len - total);
+        if (n <= 0) { close(fd); return false; }
+        total += static_cast<size_t>(n);
+    }
+    close(fd);
+    return true;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // CryptoKey opaque class
 // ---------------------------------------------------------------------------
@@ -411,11 +434,9 @@ static bronze::Value subtleGenerateKey(bronze::Value, std::span<const bronze::Va
     }
 
     std::vector<uint8_t> randomBytes(keyLenBytes);
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return rejectPromise("generateKey: OS RNG failed");
-    ssize_t n = read(fd, randomBytes.data(), keyLenBytes);
-    close(fd);
-    if (n < keyLenBytes) return rejectPromise("generateKey: OS RNG read failed");
+    if (!fillRandom(randomBytes.data(), keyLenBytes)) {
+        return rejectPromise("generateKey: OS RNG failed");
+    }
 
     auto* key = new CryptoKeyData();
     key->rawKey = std::move(randomBytes);
