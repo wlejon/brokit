@@ -62,80 +62,96 @@ openReq.onsuccess = function(event) {
         store.put({ name: 'Bob', age: 25 }, 'bob');
         store.put({ name: 'Carol', age: 35 }, 'carol');
 
-        // get
-        var getReq = store.get('alice');
-        getReq.onsuccess = function() {
-            var user = getReq.result;
-            assertEqual(user.name, 'Alice', 'get returns correct name');
-            assertEqual(user.age, 30, 'get returns correct age');
-
-            // get nonexistent
-            var getReq2 = store.get('nonexistent');
-            getReq2.onsuccess = function() {
-                assertEqual(getReq2.result, undefined, 'get nonexistent returns undefined');
-
-                // ── count ────────────────────────────────────────────────
-                var countReq = store.count();
-                countReq.onsuccess = function() {
-                    assertEqual(countReq.result, 3, 'count is 3');
-
-                    // ── getAll ───────────────────────────────────────────
-                    var allReq = store.getAll();
-                    allReq.onsuccess = function() {
-                        assertEqual(allReq.result.length, 3, 'getAll returns 3');
-                        // Results are sorted by key
-                        assertEqual(allReq.result[0].name, 'Alice', 'getAll[0] is Alice');
-                        assertEqual(allReq.result[1].name, 'Bob', 'getAll[1] is Bob');
-                        assertEqual(allReq.result[2].name, 'Carol', 'getAll[2] is Carol');
-
-                        // getAll with count limit
-                        var allReq2 = store.getAll(null, 2);
-                        allReq2.onsuccess = function() {
-                            assertEqual(allReq2.result.length, 2, 'getAll(2) returns 2');
-
-                            // ── getAllKeys ────────────────────────────────
-                            var keysReq = store.getAllKeys();
-                            keysReq.onsuccess = function() {
-                                assertEqual(keysReq.result.length, 3, 'getAllKeys returns 3');
-                                assertEqual(keysReq.result[0], 'alice', 'key 0');
-                                assertEqual(keysReq.result[1], 'bob', 'key 1');
-                                assertEqual(keysReq.result[2], 'carol', 'key 2');
-
-                                // ── delete ───────────────────────────────
-                                var delReq = store.delete('bob');
-                                delReq.onsuccess = function() {
-                                    var countReq2 = store.count();
-                                    countReq2.onsuccess = function() {
-                                        assertEqual(countReq2.result, 2, 'count after delete');
-
-                                        // ── put overwrites ──────────────
-                                        store.put({ name: 'Alice Updated', age: 31 }, 'alice');
-                                        var getReq3 = store.get('alice');
-                                        getReq3.onsuccess = function() {
-                                            assertEqual(getReq3.result.name, 'Alice Updated', 'put overwrites');
-
-                                            // ── clear ───────────────────
-                                            var clearReq = store.clear();
-                                            clearReq.onsuccess = function() {
-                                                var countReq3 = store.count();
-                                                countReq3.onsuccess = function() {
-                                                    assertEqual(countReq3.result, 0, 'count after clear');
-
-                                                    // ── Multiple stores ─
-                                                    testMultipleStores(db);
-                                                };
-                                            };
-                                        };
-                                    };
-                                };
-                            };
-                        };
-                    };
-                };
-            };
-        };
+        stepGet(db, store);
     };
 };
+
+function stepGet(db, store) {
+    var getReq = store.get('alice');
+    getReq.onsuccess = function() {
+        var user = getReq.result;
+        assertEqual(user.name, 'Alice', 'get returns correct name');
+        assertEqual(user.age, 30, 'get returns correct age');
+        stepGetNonexistent(db, store);
+    };
+}
+
+function stepGetNonexistent(db, store) {
+    var getReq2 = store.get('nonexistent');
+    getReq2.onsuccess = function() {
+        assertEqual(getReq2.result, undefined, 'get nonexistent returns undefined');
+        stepCount(db, store);
+    };
+}
+
+function stepCount(db, store) {
+    var countReq = store.count();
+    countReq.onsuccess = function() {
+        assertEqual(countReq.result, 3, 'count is 3');
+        stepGetAll(db, store);
+    };
+}
+
+function stepGetAll(db, store) {
+    var allReq = store.getAll();
+    allReq.onsuccess = function() {
+        assertEqual(allReq.result.length, 3, 'getAll returns 3');
+        assertEqual(allReq.result[0].name, 'Alice', 'getAll[0] is Alice');
+        assertEqual(allReq.result[1].name, 'Bob', 'getAll[1] is Bob');
+        assertEqual(allReq.result[2].name, 'Carol', 'getAll[2] is Carol');
+        stepGetAllLimit(db, store);
+    };
+}
+
+function stepGetAllLimit(db, store) {
+    var allReq2 = store.getAll(null, 2);
+    allReq2.onsuccess = function() {
+        assertEqual(allReq2.result.length, 2, 'getAll(2) returns 2');
+        stepGetAllKeys(db, store);
+    };
+}
+
+function stepGetAllKeys(db, store) {
+    var keysReq = store.getAllKeys();
+    keysReq.onsuccess = function() {
+        assertEqual(keysReq.result.length, 3, 'getAllKeys returns 3');
+        assertEqual(keysReq.result[0], 'alice', 'key 0');
+        assertEqual(keysReq.result[1], 'bob', 'key 1');
+        assertEqual(keysReq.result[2], 'carol', 'key 2');
+        stepDelete(db, store);
+    };
+}
+
+function stepDelete(db, store) {
+    var delReq = store.delete('bob');
+    delReq.onsuccess = function() {
+        var countReq2 = store.count();
+        countReq2.onsuccess = function() {
+            assertEqual(countReq2.result, 2, 'count after delete');
+            stepPutOverwrites(db, store);
+        };
+    };
+}
+
+function stepPutOverwrites(db, store) {
+    store.put({ name: 'Alice Updated', age: 31 }, 'alice');
+    var getReq3 = store.get('alice');
+    getReq3.onsuccess = function() {
+        assertEqual(getReq3.result.name, 'Alice Updated', 'put overwrites');
+        stepClear(db, store);
+    };
+}
+
+function stepClear(db, store) {
+    var clearReq = store.clear();
+    clearReq.onsuccess = function() {
+        var countReq3 = store.count();
+        countReq3.onsuccess = function() {
+            assertEqual(countReq3.result, 0, 'count after clear');
+            testMultipleStores(db);
+        };
+    };
+}
 
 function testMultipleStores(db) {
     var tx = db.transaction(['settings'], 'readwrite');

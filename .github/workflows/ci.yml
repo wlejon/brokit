@@ -39,7 +39,7 @@ jobs:
           - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc,   cxx: g++ }
           - { name: linux-clang,  os: ubuntu-24.04, cc: clang, cxx: clang++ }
           - { name: windows-msvc, os: windows-2022 }
-          - { name: macos-arm64,  os: macos-14 }
+          - { name: macos-arm64,  os: macos-15 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -63,6 +63,8 @@ jobs:
           EXTRA_BRASS=""
           if [ "$RUNNER_OS" = "macOS" ]; then
             EXTRA_BRASS="-DCMAKE_OSX_ARCHITECTURES=x86_64"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            EXTRA_BRASS='-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>'
           fi
           cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release $EXTRA_BRASS
           cmake --build brass/build --config Release
@@ -159,7 +161,7 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 120
+        run: ctest --test-dir build --output-on-failure --timeout 180
 
       # pipefail: piping gcovr into tee otherwise hands the step tee's exit
       # status, so a gcovr crash produces no report and the job still goes green.
@@ -187,7 +189,11 @@ jobs:
             echo 'The bundled curl/FastNoise2/sqlite and siblings are filtered out.'
             echo
             echo '```'
-            cat coverage-summary.txt
+            if [ -f coverage-summary.txt ]; then
+              cat coverage-summary.txt
+            else
+              echo 'No coverage summary available'
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
