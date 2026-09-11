@@ -5,3 +5,7 @@ add_subdirectory(api)
 add_library(brokit INTERFACE)
 target_link_libraries(brokit INTERFACE brokit_runtime brokit_api)
 target_include_directories(brokit INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
+if(MSVC)
+    target_link_options(brokit INTERFACE "/FORCE:MULTIPLE")
+endif()
