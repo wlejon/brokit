@@ -67,7 +67,7 @@ jobs:
             EXTRA_BRASS='-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>'
           fi
           cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release $EXTRA_BRASS
-          cmake --build brass/build --config Release
+          cmake --build brass/build --config Release --target brass --parallel 4
           echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
 
       - name: Checkout bronze
@@ -128,7 +128,7 @@ jobs:
         shell: bash
         run: |
           cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release
-          cmake --build brass/build --config Release
+          cmake --build brass/build --config Release --target brass --parallel 4
           echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
 
       - name: Checkout bronze

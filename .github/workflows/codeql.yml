@@ -47,7 +47,7 @@ jobs:
         shell: bash
         run: |
           cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release
-          cmake --build brass/build --config Release
+          cmake --build brass/build --config Release --target brass --parallel 4
           echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
 
       - name: Checkout bronze
