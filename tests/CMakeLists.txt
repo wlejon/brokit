@@ -4,6 +4,17 @@ if(MSVC)
     target_link_options(brokit_test PRIVATE "/FORCE:MULTIPLE")
 endif()
 
+if(WIN32)
+    add_custom_command(TARGET brokit_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:bronze_runtime_shared>
+            $<TARGET_FILE_DIR:brokit_test>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_LINKER_FILE:bronze_runtime_shared>
+            $<TARGET_FILE_DIR:brokit_test>
+    )
+endif()
+
 # Register one ctest per JS file so `ctest` drives the suite uniformly across
 # platforms (brokit_test <file.js> runs a single file and returns non-zero on
 # failure). Each test runs in the build tree so any scratch files (e.g. the
@@ -22,4 +33,8 @@ foreach(js ${BROKIT_JS_TESTS})
     add_test(NAME ${name} COMMAND brokit_test "${js}")
     set_tests_properties(${name} PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    if(WIN32)
+        set_tests_properties(${name} PROPERTIES
+            ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brokit_test>;$ENV{PATH}")
+    endif()
 endforeach()
