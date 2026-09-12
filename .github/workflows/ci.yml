@@ -45,6 +45,12 @@ jobs:
         with:
           path: brokit
 
+      - name: MSVC dev environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Initialise the https submodules (skip the ssh broimage submodule)
         shell: bash
         run: |

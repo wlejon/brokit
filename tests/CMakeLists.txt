@@ -33,8 +33,4 @@ foreach(js ${BROKIT_JS_TESTS})
     add_test(NAME ${name} COMMAND brokit_test "${js}")
     set_tests_properties(${name} PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-    if(WIN32)
-        set_tests_properties(${name} PROPERTIES
-            ENVIRONMENT "PATH=$<TARGET_FILE_DIR:bronze_runtime_shared>;$<TARGET_FILE_DIR:brokit_test>;$ENV{PATH}")
-    endif()
 endforeach()
