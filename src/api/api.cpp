@@ -186,7 +186,7 @@ static bronze::Value js_require(bronze::Value, std::span<const bronze::Value> ar
     return ev::throwError("Cannot find module '" + mod + "'");
 }
 
-static void installModuleRegistry()
+void installModuleRegistry()
 {
     bronze::Value existing = ev::getGlobal("__brokit_modules");
     if (!ev::isObject(existing)) {
@@ -194,7 +194,7 @@ static void installModuleRegistry()
     }
 }
 
-static void installRequire()
+void installRequire()
 {
     ev::registerFunction("require", js_require);
 }

@@ -74,6 +74,11 @@ struct RequireDirGuard {
 void installAll();
 
 // Individual API installers — consumers can pick and choose.
+/// The `globalThis.__brokit_modules` registry that `require()` consults.
+/// Idempotent; run it before any installer that registers a module.
+void installModuleRegistry();
+/// `require()` itself. Run it last, after every module it should find.
+void installRequire();
 void installConsole();
 void installTimers();
 void installURL();
