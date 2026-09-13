@@ -313,17 +313,27 @@ static bronze::Value js_openSync(bronze::Value, std::span<const bronze::Value> a
     return ev::fromDouble(fd);
 }
 
+static std::optional<bronze::embed::TypedArrayInfo> getBufferOrTypedArrayInfo(bronze::Value val)
+{
+    if (auto info = ev::typedArrayInfo(val)) return info;
+    if (ev::isObject(val)) {
+        bronze::Value u8 = ev::getProperty(val, "_u8");
+        if (auto info = ev::typedArrayInfo(u8)) return info;
+    }
+    return std::nullopt;
+}
+
 // readSync(fd, buffer, offset, length[, position]) -> bytes read
 static bronze::Value js_readSync(bronze::Value, std::span<const bronze::Value> a)
 {
     if (a.size() < 2) return ev::throwTypeError("readSync: fd and buffer required");
 
     int32_t fd = i32At(a, 0);
-    auto info = ev::typedArrayInfo(a[1]);
+    auto info = getBufferOrTypedArrayInfo(a[1]);
     if (!info) return ev::throwTypeError("readSync: buffer must be a typed array");
 
-    uint8_t* base = info.data;
-    size_t byteLength = info.byteLength;
+    uint8_t* base = info->data;
+    size_t byteLength = info->byteLength;
 
     int64_t offset = 0, length = static_cast<int64_t>(byteLength);
     if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
@@ -366,11 +376,11 @@ static bronze::Value js_writeSync(bronze::Value, std::span<const bronze::Value> 
     if (a.size() < 2) return ev::throwTypeError("writeSync: fd and buffer required");
 
     int32_t fd = i32At(a, 0);
-    auto info = ev::typedArrayInfo(a[1]);
+    auto info = getBufferOrTypedArrayInfo(a[1]);
     if (!info) return ev::throwTypeError("writeSync: buffer must be a typed array");
 
-    uint8_t* base = info.data;
-    size_t byteLength = info.byteLength;
+    uint8_t* base = info->data;
+    size_t byteLength = info->byteLength;
 
     int64_t offset = 0, length = static_cast<int64_t>(byteLength);
     if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
@@ -461,8 +471,8 @@ static bronze::Value js_writeFileSync(bronze::Value, std::span<const bronze::Val
     std::string data;
     if (ev::isString(a[1])) {
         data = ev::toUtf8(a[1]);
-    } else if (auto info = ev::typedArrayInfo(a[1])) {
-        data.assign(reinterpret_cast<const char*>(info.data), info.byteLength);
+    } else if (auto info = getBufferOrTypedArrayInfo(a[1])) {
+        data.assign(reinterpret_cast<const char*>(info->data), info->byteLength);
     } else if (auto infoAb = ev::arrayBufferInfo(a[1])) {
         data.assign(reinterpret_cast<const char*>(infoAb.data), infoAb.byteLength);
     } else {
@@ -495,8 +505,10 @@ static bronze::Value js_appendFileSync(bronze::Value, std::span<const bronze::Va
     std::string data;
     if (ev::isString(a[1])) {
         data = ev::toUtf8(a[1]);
-    } else if (auto info = ev::typedArrayInfo(a[1])) {
-        data.assign(reinterpret_cast<const char*>(info.data), info.byteLength);
+    } else if (auto info = getBufferOrTypedArrayInfo(a[1])) {
+        data.assign(reinterpret_cast<const char*>(info->data), info->byteLength);
+    } else if (auto infoAb = ev::arrayBufferInfo(a[1])) {
+        data.assign(reinterpret_cast<const char*>(infoAb.data), infoAb.byteLength);
     } else {
         data = ev::toUtf8(a[1]);
     }

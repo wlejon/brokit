@@ -37,10 +37,12 @@
     }
 
     function writeFileSync(path, data, encoding) {
+        if (data && data._u8) data = data._u8;
         return globalThis.__brokit_fs_writeFileSync(path, data, encoding);
     }
 
     function appendFileSync(path, data, encoding) {
+        if (data && data._u8) data = data._u8;
         return globalThis.__brokit_fs_appendFileSync(path, data, encoding);
     }
 
