@@ -1,60 +1,66 @@
 ## ── Compile JS polyfills with bronze AOT at build time ───────────────────
 # Each .js file in js/ is compiled directly to an object file (.o) with its
 # unique entry symbol and linked into brokit_api.
+# On Apple Silicon (arm64), Bronze/Brass generates x86_64 machine code, so native
+# arm64 stubs are linked instead to prevent Mach-O cputype mismatch.
 
-set(GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-file(MAKE_DIRECTORY "${GEN_DIR}")
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")))
+    set(BROKIT_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_arm64.cpp")
+else()
+    set(GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    file(MAKE_DIRECTORY "${GEN_DIR}")
 
-set(BROKIT_GLOBALS "${CMAKE_CURRENT_SOURCE_DIR}/brokit.globals")
-set(BROKIT_COMPILED_JS_OBJECTS "")
+    set(BROKIT_GLOBALS "${CMAKE_CURRENT_SOURCE_DIR}/brokit.globals")
+    set(BROKIT_COMPILED_JS_OBJECTS "")
 
-function(bronze_compile_js JS_FILE ENTRY_SYMBOL)
-    set(INPUT  "${CMAKE_CURRENT_SOURCE_DIR}/js/${JS_FILE}.js")
-    set(OUTPUT "${GEN_DIR}/${JS_FILE}.o")
-    add_custom_command(
-        OUTPUT  "${OUTPUT}"
-        COMMAND $<TARGET_FILE:bronze> build "${INPUT}" --emit-obj --host-globals "${BROKIT_GLOBALS}" --entry-symbol=${ENTRY_SYMBOL} -o "${OUTPUT}"
-        DEPENDS bronze "${INPUT}" "${BROKIT_GLOBALS}"
-        COMMENT "bronze compile js/${JS_FILE}.js -> ${JS_FILE}.o (${ENTRY_SYMBOL})"
-        VERBATIM
-    )
-    set_source_files_properties("${OUTPUT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-    list(APPEND BROKIT_COMPILED_JS_OBJECTS "${OUTPUT}")
-    set(BROKIT_COMPILED_JS_OBJECTS "${BROKIT_COMPILED_JS_OBJECTS}" PARENT_SCOPE)
-endfunction()
+    function(bronze_compile_js JS_FILE ENTRY_SYMBOL)
+        set(INPUT  "${CMAKE_CURRENT_SOURCE_DIR}/js/${JS_FILE}.js")
+        set(OUTPUT "${GEN_DIR}/${JS_FILE}.o")
+        add_custom_command(
+            OUTPUT  "${OUTPUT}"
+            COMMAND $<TARGET_FILE:bronze> build "${INPUT}" --emit-obj --host-globals "${BROKIT_GLOBALS}" --entry-symbol=${ENTRY_SYMBOL} -o "${OUTPUT}"
+            DEPENDS bronze "${INPUT}" "${BROKIT_GLOBALS}"
+            COMMENT "bronze compile js/${JS_FILE}.js -> ${JS_FILE}.o (${ENTRY_SYMBOL})"
+            VERBATIM
+        )
+        set_source_files_properties("${OUTPUT}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+        list(APPEND BROKIT_COMPILED_JS_OBJECTS "${OUTPUT}")
+        set(BROKIT_COMPILED_JS_OBJECTS "${BROKIT_COMPILED_JS_OBJECTS}" PARENT_SCOPE)
+    endfunction()
 
-bronze_compile_js(abort              bronze_abort_main)
-bronze_compile_js(structuredclone    bronze_structuredclone_main)
-bronze_compile_js(timers             bronze_timers_main)
-bronze_compile_js(console_time       bronze_console_time_main)
-bronze_compile_js(url                bronze_url_main)
-bronze_compile_js(encoding           bronze_encoding_main)
-bronze_compile_js(treewalker         bronze_treewalker_main)
-bronze_compile_js(url_object         bronze_url_object_main)
-bronze_compile_js(path               bronze_path_main)
-bronze_compile_js(readable_stream    bronze_readable_stream_main)
-bronze_compile_js(fs                 bronze_fs_main)
-bronze_compile_js(child_process      bronze_child_process_main)
-bronze_compile_js(indexeddb          bronze_indexeddb_main)
-bronze_compile_js(writable_stream    bronze_writable_stream_main)
-bronze_compile_js(websocket          bronze_websocket_main)
-bronze_compile_js(eventsource        bronze_eventsource_main)
-bronze_compile_js(formdata           bronze_formdata_main)
-bronze_compile_js(fetch_classes      bronze_fetch_classes_main)
-bronze_compile_js(base64             bronze_base64_main)
-bronze_compile_js(navigator          bronze_navigator_main)
-bronze_compile_js(event_target       bronze_event_target_main)
-bronze_compile_js(message_channel    bronze_message_channel_main)
-bronze_compile_js(fs_watch           bronze_fs_watch_main)
-bronze_compile_js(fetch_helpers      bronze_fetch_helpers_main)
-bronze_compile_js(process            bronze_process_main)
-bronze_compile_js(buffer             bronze_buffer_main)
-bronze_compile_js(events             bronze_events_main)
-bronze_compile_js(util               bronze_util_main)
-bronze_compile_js(compression        bronze_compression_main)
-bronze_compile_js(net                bronze_net_main)
-bronze_compile_js(dgram              bronze_dgram_main)
-bronze_compile_js(websocket_server   bronze_websocket_server_main)
+    bronze_compile_js(abort              bronze_abort_main)
+    bronze_compile_js(structuredclone    bronze_structuredclone_main)
+    bronze_compile_js(timers             bronze_timers_main)
+    bronze_compile_js(console_time       bronze_console_time_main)
+    bronze_compile_js(url                bronze_url_main)
+    bronze_compile_js(encoding           bronze_encoding_main)
+    bronze_compile_js(treewalker         bronze_treewalker_main)
+    bronze_compile_js(url_object         bronze_url_object_main)
+    bronze_compile_js(path               bronze_path_main)
+    bronze_compile_js(readable_stream    bronze_readable_stream_main)
+    bronze_compile_js(fs                 bronze_fs_main)
+    bronze_compile_js(child_process      bronze_child_process_main)
+    bronze_compile_js(indexeddb          bronze_indexeddb_main)
+    bronze_compile_js(writable_stream    bronze_writable_stream_main)
+    bronze_compile_js(websocket          bronze_websocket_main)
+    bronze_compile_js(eventsource        bronze_eventsource_main)
+    bronze_compile_js(formdata           bronze_formdata_main)
+    bronze_compile_js(fetch_classes      bronze_fetch_classes_main)
+    bronze_compile_js(base64             bronze_base64_main)
+    bronze_compile_js(navigator          bronze_navigator_main)
+    bronze_compile_js(event_target       bronze_event_target_main)
+    bronze_compile_js(message_channel    bronze_message_channel_main)
+    bronze_compile_js(fs_watch           bronze_fs_watch_main)
+    bronze_compile_js(fetch_helpers      bronze_fetch_helpers_main)
+    bronze_compile_js(process            bronze_process_main)
+    bronze_compile_js(buffer             bronze_buffer_main)
+    bronze_compile_js(events             bronze_events_main)
+    bronze_compile_js(util               bronze_util_main)
+    bronze_compile_js(compression        bronze_compression_main)
+    bronze_compile_js(net                bronze_net_main)
+    bronze_compile_js(dgram              bronze_dgram_main)
+    bronze_compile_js(websocket_server   bronze_websocket_server_main)
+endif()
 
 ## ── Library ──────────────────────────────────────────────────────────────────
 
