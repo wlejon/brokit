@@ -292,6 +292,24 @@
     URL.prototype.toString = function() { return this.href; };
     URL.prototype.toJSON = function() { return this.href; };
 
+    // URL.parse(input, base?): the constructor's result, or null where the
+    // constructor would throw. URL.canParse(input, base?): the boolean form.
+    URL.parse = function(url, base) {
+        try {
+            return new URL(url, base);
+        } catch (e) {
+            return null;
+        }
+    };
+    URL.canParse = function(url, base) {
+        try {
+            new URL(url, base);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    };
+
     globalThis.URL = URL;
     globalThis.URLSearchParams = URLSearchParams;
 

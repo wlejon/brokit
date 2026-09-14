@@ -18,6 +18,9 @@ fetch
 Headers
 Request
 Response
+XMLHttpRequest
+XMLHttpRequestUpload
+XMLHttpRequestEventTarget
 FormData
 Blob
 File

@@ -122,6 +122,11 @@ void installWebSocketServerJS();
 void installEventSource();
 void installFormData();
 void installFetchClasses();
+/// `XMLHttpRequest` in JS over the wrapped `fetch`. Requires installFetch,
+/// installFetchClasses and installAbortController to have run first; the
+/// events it fires are `Event` instances, so installEventTarget (or a host
+/// `Event`) must be present before the first request is sent.
+void installXMLHttpRequest();
 void installBase64();
 void installNavigator();
 void installEventTarget();
@@ -164,5 +169,15 @@ std::string resolveAssetPath(const std::string& path);
 /// Returns false if `val` is not a Blob or File.
 bool blobBytes(bronze::Value val, const uint8_t** data,
                size_t* len, std::string* type = nullptr);
+
+/// Set the `webkitRelativePath` of a File value — what a host fills in when it
+/// builds the File for an entry of a dropped directory. Returns false if
+/// `file` is not a File.
+bool setFileWebkitRelativePath(bronze::Value file, std::string_view path);
+
+/// The Blob behind a `blob:` URL minted by `URL.createObjectURL`, from the
+/// same registry `fetch('blob:...')` serves. Returns false for a URL that was
+/// never minted or has been revoked. Call after installURLObject().
+bool blobByObjectURL(const std::string& url, bronze::Value* outBlob);
 
 } // namespace brokit::api

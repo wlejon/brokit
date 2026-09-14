@@ -232,6 +232,7 @@ void installAll()
     installEventSource();
     installFormData();
     installFetchClasses();
+    installXMLHttpRequest();
     installCompression();
     installBase64();
     installNavigator();

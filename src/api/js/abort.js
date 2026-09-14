@@ -11,52 +11,98 @@
     }
 
     // --- AbortSignal ---
+    //
+    // `aborted` and `reason` are read-only accessors over private state, as on
+    // the web: the only writer is an abort, so a host that reads `aborted`
+    // (fetch.cpp does) reads the truth. Listeners are kept here rather than
+    // inherited from EventTarget because this installs before event_target.js
+    // does; the event dispatched is still the platform `Event`, looked up when
+    // the abort happens, so `event.target === signal` in every listener.
     function AbortSignal() {
-        this.aborted = false;
-        this.reason = undefined;
+        this._aborted = false;
+        this._reason = undefined;
         this._listeners = [];
+        this._onabort = null;
     }
 
-    Object.defineProperty(AbortSignal.prototype, 'onabort', {
-        get: function() { return this._onabort || null; },
-        set: function(fn) { this._onabort = fn; }
+    Object.defineProperties(AbortSignal.prototype, {
+        aborted: { get: function() { return this._aborted; }, enumerable: true, configurable: true },
+        reason:  { get: function() { return this._reason; }, enumerable: true, configurable: true },
+        onabort: {
+            get: function() { return this._onabort; },
+            set: function(fn) { this._onabort = (typeof fn === 'function') ? fn : null; },
+            enumerable: true, configurable: true
+        }
     });
 
-    AbortSignal.prototype.addEventListener = function(type, fn) {
-        if (type === 'abort' && typeof fn === 'function') {
-            this._listeners.push(fn);
+    AbortSignal.prototype.addEventListener = function(type, listener, options) {
+        if (type !== 'abort') return;
+        var callable = typeof listener === 'function' ||
+            (listener && typeof listener.handleEvent === 'function');
+        if (!callable) return;
+        var once = !!(options && typeof options === 'object' && options.once);
+        for (var i = 0; i < this._listeners.length; i++) {
+            if (this._listeners[i].listener === listener) return;
         }
+        this._listeners.push({ listener: listener, once: once });
     };
 
-    AbortSignal.prototype.removeEventListener = function(type, fn) {
-        if (type === 'abort') {
-            this._listeners = this._listeners.filter(function(f) { return f !== fn; });
+    AbortSignal.prototype.removeEventListener = function(type, listener) {
+        if (type !== 'abort') return;
+        for (var i = 0; i < this._listeners.length; i++) {
+            if (this._listeners[i].listener === listener) {
+                this._listeners.splice(i, 1);
+                return;
+            }
         }
     };
 
     AbortSignal.prototype.dispatchEvent = function(event) {
+        event.target = this;
+        event.currentTarget = this;
         if (event.type === 'abort') {
             if (typeof this._onabort === 'function') {
                 this._onabort.call(this, event);
             }
-            for (var i = 0; i < this._listeners.length; i++) {
-                this._listeners[i].call(this, event);
+            var handlers = this._listeners.slice();
+            for (var i = 0; i < handlers.length; i++) {
+                if (event._stopImmediate) break;
+                var entry = handlers[i];
+                if (entry.once) this.removeEventListener('abort', entry.listener);
+                if (typeof entry.listener === 'function') {
+                    entry.listener.call(this, event);
+                } else {
+                    entry.listener.handleEvent(event);
+                }
             }
         }
-        return true;
+        return !event.defaultPrevented;
     };
 
     AbortSignal.prototype.throwIfAborted = function() {
-        if (this.aborted) {
-            throw this.reason;
+        if (this._aborted) {
+            throw this._reason;
         }
     };
 
-    // Static factory: AbortSignal.abort(reason?)
+    // Abort `signal` once: the first reason sticks, a second abort fires
+    // nothing. The event is the platform Event so listeners see a target.
+    function abortSignal(signal, reason) {
+        if (signal._aborted) return;
+        signal._aborted = true;
+        signal._reason = (reason !== undefined)
+            ? reason
+            : new globalThis.DOMException('The operation was aborted.', 'AbortError');
+        signal.dispatchEvent(new globalThis.Event('abort'));
+    }
+
+    // Static factory: AbortSignal.abort(reason?) — born aborted, no event.
     AbortSignal.abort = function(reason) {
         var signal = new AbortSignal();
-        signal.aborted = true;
-        signal.reason = (reason !== undefined) ? reason : new globalThis.DOMException('The operation was aborted.', 'AbortError');
+        signal._aborted = true;
+        signal._reason = (reason !== undefined)
+            ? reason
+            : new globalThis.DOMException('The operation was aborted.', 'AbortError');
         return signal;
     };
 
@@ -64,11 +110,7 @@
     AbortSignal.timeout = function(ms) {
         var signal = new AbortSignal();
         setTimeout(function() {
-            if (!signal.aborted) {
-                signal.aborted = true;
-                signal.reason = new globalThis.DOMException('The operation timed out.', 'TimeoutError');
-                signal.dispatchEvent({ type: 'abort' });
-            }
+            abortSignal(signal, new globalThis.DOMException('The operation timed out.', 'TimeoutError'));
         }, ms);
         return signal;
     };
@@ -78,17 +120,13 @@
         var signal = new AbortSignal();
         for (var i = 0; i < signals.length; i++) {
             if (signals[i].aborted) {
-                signal.aborted = true;
-                signal.reason = signals[i].reason;
+                signal._aborted = true;
+                signal._reason = signals[i].reason;
                 return signal;
             }
         }
         function onAbort() {
-            if (!signal.aborted) {
-                signal.aborted = true;
-                signal.reason = this.reason;
-                signal.dispatchEvent({ type: 'abort' });
-            }
+            abortSignal(signal, this.reason);
         }
         for (var i = 0; i < signals.length; i++) {
             signals[i].addEventListener('abort', onAbort);
@@ -102,11 +140,7 @@
     }
 
     AbortController.prototype.abort = function(reason) {
-        if (!this.signal.aborted) {
-            this.signal.aborted = true;
-            this.signal.reason = (reason !== undefined) ? reason : new globalThis.DOMException('The operation was aborted.', 'AbortError');
-            this.signal.dispatchEvent({ type: 'abort' });
-        }
+        abortSignal(this.signal, reason);
     };
 
     globalThis.AbortController = AbortController;

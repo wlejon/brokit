@@ -447,25 +447,27 @@
             }).then(wrapResponse);
         }
 
-        // Handle Blob body
+        // Handle Blob body: the bytes go to the native fetch as bytes. Going
+        // through text() would re-encode every byte >= 0x80 as UTF-8 and
+        // corrupt a binary upload.
         if (body instanceof Blob) {
             if (!options.headers) options.headers = {};
             if (!options.headers['content-type'] && !options.headers['Content-Type'] && body.type) {
                 options.headers['content-type'] = body.type;
             }
-            return body.text().then(function(text) {
-                options.body = text;
+            return body.arrayBuffer().then(function(buffer) {
+                options.body = new Uint8Array(buffer);
                 if (!options.method) options.method = 'POST';
                 return nativeFetch(url, options);
             }).then(wrapResponse);
         }
 
-        // Handle ArrayBuffer / TypedArray body
+        // Handle ArrayBuffer / TypedArray body: handed to the native fetch as
+        // a byte view, which it reads directly.
         if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-            var bytes = body instanceof ArrayBuffer ? new Uint8Array(body) : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-            var str = '';
-            for (var i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
-            options.body = str;
+            options.body = body instanceof ArrayBuffer
+                ? new Uint8Array(body)
+                : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
             if (!options.method) options.method = 'POST';
         }
 

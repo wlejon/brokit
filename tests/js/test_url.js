@@ -92,6 +92,31 @@ var threw = false;
 try { new URL('not-a-url'); } catch(e) { threw = true; }
 assert(threw, 'invalid URL throws TypeError');
 
+// URL.parse: a URL, or null where the constructor throws
+assert(typeof URL.parse === 'function', 'URL.parse exists');
+var p1 = URL.parse('https://example.com:8080/a/b/../c.json?x=1&y=two#frag');
+assert(p1 instanceof URL, 'URL.parse returns a URL');
+assertEqual(p1.hostname, 'example.com', 'URL.parse hostname');
+assertEqual(p1.port, '8080', 'URL.parse port');
+assertEqual(p1.pathname, '/a/c.json', 'URL.parse resolves ..');
+assertEqual(p1.searchParams.get('y'), 'two', 'URL.parse searchParams');
+assertEqual(p1.hash, '#frag', 'URL.parse hash');
+assertEqual(URL.parse('not-a-url'), null, 'URL.parse returns null for an invalid URL');
+assertEqual(URL.parse('textures/wood.png', 'https://example.com/models/scene/').href,
+            'https://example.com/models/scene/textures/wood.png', 'URL.parse with base');
+assertEqual(URL.parse('../shared/a.bin', 'https://example.com/models/scene/x.gltf').href,
+            'https://example.com/models/shared/a.bin', 'URL.parse with base resolves ..');
+assertEqual(URL.parse('/root.txt', 'https://example.com/deep/path/').href,
+            'https://example.com/root.txt', 'URL.parse with base and absolute path');
+assertEqual(URL.parse('relative/only'), null, 'URL.parse relative without base is null');
+
+// URL.canParse: the boolean form
+assert(typeof URL.canParse === 'function', 'URL.canParse exists');
+assertEqual(URL.canParse('https://example.com/'), true, 'canParse absolute');
+assertEqual(URL.canParse('not-a-url'), false, 'canParse invalid');
+assertEqual(URL.canParse('relative/only'), false, 'canParse relative without base');
+assertEqual(URL.canParse('relative/only', 'https://example.com/'), true, 'canParse relative with base');
+
 // userinfo
 var u8 = new URL('https://user:pass@example.com/');
 assertEqual(u8.username, 'user', 'username');

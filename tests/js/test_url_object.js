@@ -32,3 +32,43 @@ URL.revokeObjectURL(u2);
 
 // Revoking non-existent URL is a no-op
 URL.revokeObjectURL('blob:nonexistent');
+
+// --- fetch('blob:...') serves the registry: bytes and type round-trip ---
+var rtBytes = new Uint8Array([0, 127, 128, 255]);
+var rtBlob = new Blob([rtBytes], { type: 'application/x-round-trip' });
+var rtUrl = URL.createObjectURL(rtBlob);
+fetch(rtUrl).then(function (r) {
+    assertEqual(r.status, 200, 'blob: fetch status 200');
+    assert(r.ok, 'blob: fetch ok');
+    assertEqual(r.url, rtUrl, 'blob: fetch response url');
+    assertEqual(r.headers.get('content-type'), 'application/x-round-trip', 'blob: fetch content-type is the blob type');
+    assertEqual(r.headers.get('content-length'), '4', 'blob: fetch content-length');
+    return r.arrayBuffer();
+}).then(function (ab) {
+    var v = new Uint8Array(ab);
+    assertEqual(v.length, 4, 'blob: fetch byte length');
+    assertEqual(v[2], 128, 'blob: fetch byte 2 intact');
+    assertEqual(v[3], 255, 'blob: fetch byte 3 intact');
+    return fetch(rtUrl).then(function (r) { return r.blob(); });
+}).then(function (b) {
+    assert(b instanceof Blob, 'blob: fetch .blob() is a Blob');
+    assertEqual(b.type, 'application/x-round-trip', 'blob: fetch .blob() keeps the type');
+    assertEqual(b.size, 4, 'blob: fetch .blob() size');
+    URL.revokeObjectURL(rtUrl);
+    // Revoked: a network error, not a 404 Response.
+    return fetch(rtUrl).then(
+        function () { assert(false, 'revoked blob: URL must reject'); },
+        function (e) { assert(e instanceof TypeError, 'revoked blob: URL rejects with TypeError'); });
+}, function (e) {
+    assert(false, 'blob: fetch failed: ' + (e && e.message));
+});
+
+// A blob with no type gets no content-type header.
+var untypedUrl = URL.createObjectURL(new Blob(['plain']));
+fetch(untypedUrl).then(function (r) {
+    assertEqual(r.headers.get('content-type'), null, 'untyped blob: fetch has no content-type');
+    return r.text();
+}).then(function (t) {
+    assertEqual(t, 'plain', 'untyped blob: fetch text');
+    URL.revokeObjectURL(untypedUrl);
+});

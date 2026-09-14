@@ -83,6 +83,14 @@ var f3 = new File([new Uint8Array([0xFF, 0xD8])], 'photo.jpg', { type: 'image/jp
 assertEqual(f3.size, 2, 'binary File size');
 assertEqual(f3.type, 'image/jpeg', 'binary File type');
 
+// webkitRelativePath: empty unless the constructor options set it
+assertEqual(f.webkitRelativePath, '', 'File webkitRelativePath defaults to empty');
+assertEqual(f2.webkitRelativePath, '', 'File webkitRelativePath empty when options omit it');
+var f4 = new File(['x'], 'a.txt', { webkitRelativePath: 'dropped/dir/a.txt' });
+assertEqual(f4.webkitRelativePath, 'dropped/dir/a.txt', 'File webkitRelativePath from options');
+var rpDesc = Object.getOwnPropertyDescriptor(File.prototype, 'webkitRelativePath');
+assert(rpDesc && typeof rpDesc.get === 'function', 'webkitRelativePath is a prototype accessor');
+
 // File requires 2 args
 var threwOnFile = false;
 try { new File(['data']); } catch(e) { threwOnFile = true; }

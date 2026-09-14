@@ -30,6 +30,9 @@ struct FileData {
     BlobData blob;
     std::string name;
     double lastModified = 0;
+    // Path relative to the directory the file was picked or dropped from;
+    // empty for a File built any other way.
+    std::string webkitRelativePath;
 };
 
 struct ReaderData {
@@ -146,6 +149,13 @@ bool blobBytes(Value val, const uint8_t** data, size_t* len, std::string* type) 
     return true;
 }
 
+bool setFileWebkitRelativePath(Value file, std::string_view path) {
+    FileData* f = getFileData(file);
+    if (!f) return false;
+    f->webkitRelativePath.assign(path.begin(), path.end());
+    return true;
+}
+
 void installBlob() {
     g_blobClass.install("Blob", 0,
         [](Value, std::span<const Value> a) {
@@ -200,6 +210,8 @@ void installBlob() {
                 }
                 Value lm = ev::getProperty(a[2], "lastModified");
                 if (ev::isNumber(lm)) f->lastModified = ev::toDouble(lm);
+                Value rp = ev::getProperty(a[2], "webkitRelativePath");
+                if (ev::isString(rp)) f->webkitRelativePath = ev::toUtf8(rp);
             }
             return g_fileClass.make(f, fileDtor);
         },
@@ -211,6 +223,10 @@ void installBlob() {
             proto.accessor("lastModified", [](Value thisVal, std::span<const Value>) {
                 FileData* f = getFileData(thisVal);
                 return ev::fromDouble(f ? f->lastModified : 0.0);
+            });
+            proto.accessor("webkitRelativePath", [](Value thisVal, std::span<const Value>) {
+                FileData* f = getFileData(thisVal);
+                return ev::fromUtf8(f ? f->webkitRelativePath : "");
             });
         }
     );

@@ -46,6 +46,7 @@ else()
     bronze_compile_js(eventsource        bronze_eventsource_main)
     bronze_compile_js(formdata           bronze_formdata_main)
     bronze_compile_js(fetch_classes      bronze_fetch_classes_main)
+    bronze_compile_js(xhr                bronze_xhr_main)
     bronze_compile_js(base64             bronze_base64_main)
     bronze_compile_js(navigator          bronze_navigator_main)
     bronze_compile_js(event_target       bronze_event_target_main)
@@ -99,6 +100,7 @@ set(BROKIT_API_SOURCES
     eventsource.cpp
     formdata.cpp
     fetch_classes.cpp
+    xhr.cpp
     base64.cpp
     navigator.cpp
     event_target.cpp

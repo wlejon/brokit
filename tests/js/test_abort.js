@@ -30,12 +30,51 @@ var ac2 = new AbortController();
 ac2.abort('custom');
 assertEqual(ac2.signal.reason, 'custom', 'custom reason preserved');
 
+// --- aborted / reason are read-only accessors on the prototype ---
+var abortedDesc = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted');
+assert(abortedDesc && typeof abortedDesc.get === 'function' && abortedDesc.set === undefined, 'aborted is a getter-only accessor');
+var reasonDesc = Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'reason');
+assert(reasonDesc && typeof reasonDesc.get === 'function' && reasonDesc.set === undefined, 'reason is a getter-only accessor');
+
 // --- addEventListener ---
 var ac3 = new AbortController();
 var called = false;
 ac3.signal.addEventListener('abort', function() { called = true; });
 ac3.abort();
 assertEqual(called, true, 'abort listener called');
+
+// --- the abort event is a real Event whose target is the signal ---
+var acEv = new AbortController();
+var seen = [];
+acEv.signal.onabort = function(e) {
+    seen.push('onabort');
+    assert(e instanceof Event, 'onabort receives an Event');
+    assertEqual(e.type, 'abort', 'event type is abort');
+    assert(e.target === acEv.signal, 'event.target is the signal in onabort');
+    assert(e.currentTarget === acEv.signal, 'event.currentTarget is the signal in onabort');
+    assert(this === acEv.signal, 'onabort this is the signal');
+};
+acEv.signal.addEventListener('abort', function(e) {
+    seen.push('listener');
+    assert(e.target === acEv.signal, 'event.target is the signal in a listener');
+    assert(this === acEv.signal, 'listener this is the signal');
+});
+acEv.signal.addEventListener('abort', function() { seen.push('once'); }, { once: true });
+acEv.abort();
+assertEqual(seen.join(','), 'onabort,listener,once', 'onabort runs first, then listeners in order');
+acEv.abort();
+assertEqual(seen.length, 3, 'second abort fires nothing');
+acEv.signal.addEventListener('abort', function() { seen.push('late'); });
+assertEqual(seen.length, 3, 'a listener added after the abort never runs');
+
+// AbortSignal.any's composite also dispatches a real event.
+var anyA = new AbortController();
+var anyTarget = null;
+var anySig = AbortSignal.any([anyA.signal]);
+anySig.addEventListener('abort', function(e) { anyTarget = e.target; });
+anyA.abort('why');
+assert(anyTarget === anySig, 'any() composite event target is the composite');
+assertEqual(anySig.reason, 'why', 'any() composite reason');
 
 // --- removeEventListener ---
 var ac4 = new AbortController();

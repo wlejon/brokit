@@ -21,6 +21,7 @@ void bronze_websocket_main() {}
 void bronze_eventsource_main() {}
 void bronze_formdata_main() {}
 void bronze_fetch_classes_main() {}
+void bronze_xhr_main() {}
 void bronze_base64_main() {}
 void bronze_navigator_main() {}
 void bronze_event_target_main() {}

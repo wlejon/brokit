@@ -42,6 +42,11 @@ struct FetchRequest {
     std::vector<std::vector<uint8_t>> chunks;
     PersistentSlot waitCallback;
 
+    // A file:, data: or blob: response, already built, waiting for the next
+    // tick to settle the promise. Held here rather than resolved in fetch()
+    // itself so an abort that lands between the call and the tick still wins.
+    PersistentSlot localResponse;
+
     ~FetchRequest() {
         if (requestHeaders) curl_slist_free_all(requestHeaders);
     }
@@ -56,6 +61,7 @@ struct FetchState {
     CURLM* multi = nullptr;
     std::unordered_map<int, std::unique_ptr<FetchRequest>> streams;
     std::vector<FetchRequest*> pending; // non-owning view into streams
+    std::vector<int> localPending;      // stream ids with a localResponse to settle
     int nextStreamId = 1;
 };
 
@@ -64,6 +70,12 @@ static thread_local FetchState g_fetchState;
 void removePending(FetchState& s, FetchRequest* req) {
     for (auto it = s.pending.begin(); it != s.pending.end(); ++it) {
         if (*it == req) { s.pending.erase(it); return; }
+    }
+}
+
+void removeLocalPending(FetchState& s, int streamId) {
+    for (auto it = s.localPending.begin(); it != s.localPending.end(); ++it) {
+        if (*it == streamId) { s.localPending.erase(it); return; }
     }
 }
 
@@ -105,6 +117,11 @@ static bool isHttpUrl(const std::string& url)
 static bool isDataUrl(const std::string& url)
 {
     return url.size() >= 5 && url.compare(0, 5, "data:") == 0;
+}
+
+static bool isBlobUrl(const std::string& url)
+{
+    return url.size() >= 5 && url.compare(0, 5, "blob:") == 0;
 }
 
 static std::string detectMimeType(const std::string& path)
@@ -298,6 +315,41 @@ static bronze::Value buildDataUrlResponse(const std::string& url)
     return respVal;
 }
 
+// Build a Response for a blob: URL from the URL.createObjectURL registry.
+// `found` is false for a URL that was never minted or has been revoked.
+static bronze::Value buildBlobUrlResponse(const std::string& url, bool* found)
+{
+    bronze::Value blob = ev::undefined();
+    if (!blobByObjectURL(url, &blob)) {
+        *found = false;
+        return ev::undefined();
+    }
+    *found = true;
+
+    // The bytes live in the Blob's own C++ storage, which no collection moves,
+    // so the span stays valid across the allocations below.
+    const uint8_t* data = nullptr;
+    size_t len = 0;
+    std::string type;
+    blobBytes(blob, &data, &len, &type);
+
+    std::vector<std::string> headerLines;
+    if (!type.empty()) headerLines.push_back("content-type: " + type);
+    headerLines.push_back("content-length: " + std::to_string(len));
+
+    ObjectBuilder resp;
+    resp.set("status", 200.0);
+    resp.set("statusText", "OK");
+    resp.set("ok", true);
+    resp.set("url", url);
+    resp.set("headers", buildHeaders(headerLines));
+    resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(data, len)));
+
+    bronze::Value respVal = resp.build();
+    callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
+    return respVal;
+}
+
 // Build a Response for a local file read
 static bronze::Value buildFileResponse(const std::string& url, const std::string& resolvedPath)
 {
@@ -481,6 +533,12 @@ static bronze::Value makeAbortError()
     return err;
 }
 
+static bool signalIsAborted(bronze::Value signal)
+{
+    bronze::Value abortedVal = ev::getProperty(signal, "aborted");
+    return ev::isBool(abortedVal) && ev::toBool(abortedVal);
+}
+
 static void abortRequest(int streamId)
 {
     auto& s = g_fetchState;
@@ -494,6 +552,8 @@ static void abortRequest(int streamId)
         curl_easy_cleanup(req->easy);
         req->easy = nullptr;
     }
+    removeLocalPending(s, streamId);
+    req->localResponse.reset();
     req->bodyComplete = true;
     req->chunks.clear();
 
@@ -514,13 +574,80 @@ static void abortRequest(int streamId)
     if (hadPromise) s.streams.erase(it);
 }
 
+// Subscribe `abortRequest(streamId)` to the signal's abort event.
+static void attachAbortListener(bronze::Value signal, int streamId)
+{
+    if (!ev::isObject(signal)) return;
+    ev::Persistent signalRoot(signal);
+    ev::Persistent handler(ev::makeFunction([streamId](bronze::Value, std::span<const bronze::Value>) -> bronze::Value {
+        abortRequest(streamId);
+        return ev::undefined();
+    }, 0, "abortHandler"));
+
+    bronze::Value addFn = ev::getProperty(signalRoot.get(), "addEventListener");
+    if (ev::isFunction(addFn)) {
+        std::array<bronze::Value, 2> lArgs = { ev::fromUtf8("abort"), handler.get() };
+        ev::call(addFn, signalRoot.get(), lArgs);
+    }
+}
+
+// Park an already-built local response until the next tick, where it settles
+// the promise unless an abort got there first.
+static bronze::Value queueLocalResponse(FetchState& s, const std::string& url,
+                                        bronze::Value response, bronze::Value signal)
+{
+    ev::Persistent responseRoot(response);
+    ev::Persistent signalRoot(signal);
+
+    auto req = std::make_unique<FetchRequest>();
+    req->url = url;
+    req->streamId = s.nextStreamId++;
+    req->bodyComplete = true;
+    req->localResponse.set(responseRoot.get());
+    req->promise.set(ev::createPromise());
+
+    int streamId = req->streamId;
+    FetchRequest* raw = req.get();
+    s.streams.emplace(streamId, std::move(req));
+    s.localPending.push_back(streamId);
+
+    attachAbortListener(signalRoot.get(), streamId);
+    return raw->promise.get();
+}
+
+// Settle every parked local response. Runs no JS itself (settling only queues
+// reaction jobs), so the id list can be walked without re-entrancy concerns.
+static int settleLocalResponses(FetchState& s)
+{
+    if (s.localPending.empty()) return 0;
+    std::vector<int> ids;
+    ids.swap(s.localPending);
+
+    int completed = 0;
+    for (int id : ids) {
+        auto it = s.streams.find(id);
+        if (it == s.streams.end() || !it->second) continue;
+        FetchRequest* req = it->second.get();
+        if (req->promise.valid()) {
+            ev::resolvePromise(req->promise.get(), req->localResponse.get());
+            req->promise.reset();
+        }
+        req->localResponse.reset();
+        req->headersResolved = true;
+        s.streams.erase(it);
+        completed++;
+    }
+    return completed;
+}
+
 // ---------------------------------------------------------------------------
 // Tick: pump curl_multi, resolve streaming responses, notify waiting readers
 // ---------------------------------------------------------------------------
 static bronze::Value js_fetch_tick(bronze::Value, std::span<const bronze::Value>)
 {
     auto& s = g_fetchState;
-    if (!s.multi || s.pending.empty()) return ev::fromDouble(0);
+    int completed = settleLocalResponses(s);
+    if (!s.multi || s.pending.empty()) return ev::fromDouble(completed);
 
     curl_multi_poll(s.multi, nullptr, 0, 50, nullptr);
 
@@ -554,8 +681,6 @@ static bronze::Value js_fetch_tick(bronze::Value, std::span<const bronze::Value>
             ev::call(cb.get(), ev::undefined(), {});
         }
     }
-
-    int completed = 0;
 
     // Phase 3: handle completed requests.
     CURLMsg* msg;
@@ -628,34 +753,44 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
     ArgReader reader(args);
     std::string url = reader.getString(0, "");
 
-    if (!isHttpUrl(url)) {
-        bronze::Value response;
-        if (isDataUrl(url)) {
-            response = buildDataUrlResponse(url);
-        } else {
-            std::string resolved = resolveLocalPath(url);
-            response = buildFileResponse(url, resolved);
-        }
-        bronze::Value p = ev::createPromise();
-        ev::resolvePromise(p, response);
-        return p;
-    }
-
     auto& s = g_fetchState;
 
-    bronze::Value signal = ev::undefined();
+    // The signal comes first, for every scheme: a signal that is already
+    // aborted rejects before any I/O, and a live one is subscribed to below.
+    ev::Persistent signal;
     if (args.size() >= 2 && ev::isObject(args[1])) {
         bronze::Value sig = ev::getProperty(args[1], "signal");
         if (ev::isObject(sig)) {
-            bronze::Value abortedVal = ev::getProperty(sig, "aborted");
-            bool aborted = ev::isBool(abortedVal) && ev::toBool(abortedVal);
-            if (aborted) {
+            if (signalIsAborted(sig)) {
                 bronze::Value p = ev::createPromise();
                 ev::rejectPromise(p, makeAbortError());
                 return p;
             }
-            signal = sig;
+            signal.set(sig);
         }
+    }
+
+    if (!isHttpUrl(url)) {
+        bronze::Value response;
+        if (isDataUrl(url)) {
+            response = buildDataUrlResponse(url);
+        } else if (isBlobUrl(url)) {
+            bool found = false;
+            response = buildBlobUrlResponse(url, &found);
+            if (!found) {
+                // A URL that was never minted, or has been revoked, is a
+                // network error: the TypeError fetch rejects with on the web.
+                auto err = ev::construct(ev::getGlobal("TypeError"),
+                    std::array<bronze::Value, 1>{ev::fromUtf8("fetch: unknown blob URL " + url)});
+                bronze::Value p = ev::createPromise();
+                ev::rejectPromise(p, err.value);
+                return p;
+            }
+        } else {
+            std::string resolved = resolveLocalPath(url);
+            response = buildFileResponse(url, resolved);
+        }
+        return queueLocalResponse(s, url, response, signal.get());
     }
 
     auto req = std::make_unique<FetchRequest>();
@@ -742,32 +877,19 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
 
     int streamId = req->streamId;
     FetchRequest* raw = req.get();
-    bronze::Value retPromise = req->promise.get();
 
     s.streams.emplace(streamId, std::move(req));
     s.pending.push_back(raw);
 
-    if (ev::isObject(signal)) {
-        bronze::Value handler = ev::makeFunction([streamId](bronze::Value, std::span<const bronze::Value>) -> bronze::Value {
-            abortRequest(streamId);
-            return ev::undefined();
-        }, 0, "abortHandler");
+    attachAbortListener(signal.get(), streamId);
 
-        bronze::Value addFn = ev::getProperty(signal, "addEventListener");
-        if (ev::isFunction(addFn)) {
-            bronze::Value abortStr = ev::fromUtf8("abort");
-            std::array<bronze::Value, 2> lArgs = { abortStr, handler };
-            ev::call(addFn, signal, lArgs);
-        }
-    }
-
-    return retPromise;
+    return raw->promise.get();
 }
 
 static bronze::Value js_fetch_has_pending(bronze::Value, std::span<const bronze::Value>)
 {
     auto& s = g_fetchState;
-    if (!s.pending.empty()) return ev::fromBool(true);
+    if (!s.pending.empty() || !s.localPending.empty()) return ev::fromBool(true);
     for (auto& [id, req] : s.streams) {
         if (req && req->waitCallback.valid()) return ev::fromBool(true);
     }
@@ -805,8 +927,10 @@ void uninstallFetch()
         }
         req->promise.reset();
         req->waitCallback.reset();
+        req->localResponse.reset();
     }
     s.pending.clear();
+    s.localPending.clear();
     s.streams.clear();
 
     if (s.multi) {
