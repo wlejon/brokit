@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <span>
 #include <array>
+#include <thread>
+#include <chrono>
 
 #include <curl/curl.h>
 
@@ -120,6 +122,27 @@ static bronze::Value js_ws_connect(bronze::Value, std::span<const bronze::Value>
     return result.build();
 }
 
+static CURLcode ws_send_all(CURL* easy, const void* buffer, size_t buflen, unsigned int flags)
+{
+    const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
+    size_t offset = 0;
+    CURLcode rc = CURLE_OK;
+
+    for (int retry = 0; retry < 50; retry++) {
+        size_t sent = 0;
+        rc = curl_ws_send(easy, ptr + offset, buflen - offset, &sent, 0, flags);
+        offset += sent;
+        if (rc == CURLE_OK) {
+            if (offset >= buflen) return CURLE_OK;
+        } else if (rc == CURLE_AGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        } else {
+            return rc;
+        }
+    }
+    return rc;
+}
+
 // ---------------------------------------------------------------------------
 // __brokit_ws_send(id, data, binary) → bool
 // ---------------------------------------------------------------------------
@@ -130,27 +153,25 @@ static bronze::Value js_ws_send(bronze::Value, std::span<const bronze::Value> ar
 
     int id = reader.getInt(0, 0);
     auto it = g_ws_conns.find(id);
-    if (it == g_ws_conns.end() || it->second->state != 1)
-        return ev::fromBool(false);
+    if (it == g_ws_conns.end() || it->second->state != 1) return ev::fromBool(false);
 
     WSConnection* conn = it->second;
     bool binary = reader.getBool(2, false);
     bronze::Value dataVal = reader.get(1);
 
-    size_t sent = 0;
     CURLcode rc = CURLE_OK;
 
     if (binary) {
         if (auto info = ev::typedArrayInfo(dataVal)) {
-            rc = curl_ws_send(conn->easy, info.data, info.byteLength, &sent, 0, CURLWS_BINARY);
+            rc = ws_send_all(conn->easy, info.data, info.byteLength, CURLWS_BINARY);
         } else if (auto info = ev::arrayBufferInfo(dataVal)) {
-            rc = curl_ws_send(conn->easy, info.data, info.byteLength, &sent, 0, CURLWS_BINARY);
+            rc = ws_send_all(conn->easy, info.data, info.byteLength, CURLWS_BINARY);
         } else {
             return ev::fromBool(false);
         }
     } else {
         std::string str = ev::toUtf8(dataVal);
-        rc = curl_ws_send(conn->easy, str.data(), str.size(), &sent, 0, CURLWS_TEXT);
+        rc = ws_send_all(conn->easy, str.data(), str.size(), CURLWS_TEXT);
     }
 
     return ev::fromBool(rc == CURLE_OK);
@@ -200,8 +221,7 @@ static bronze::Value js_ws_close(bronze::Value, std::span<const bronze::Value> a
     payload.push_back(static_cast<uint8_t>(code & 0xFF));
     payload.insert(payload.end(), reason.begin(), reason.end());
 
-    size_t sent = 0;
-    curl_ws_send(conn->easy, payload.data(), payload.size(), &sent, 0, CURLWS_CLOSE);
+    ws_send_all(conn->easy, payload.data(), payload.size(), CURLWS_CLOSE);
 
     conn->closeCode = code;
     conn->closeReason = reason;
@@ -382,8 +402,7 @@ static bronze::Value js_ws_tick(bronze::Value, std::span<const bronze::Value>)
             }
 
             if (meta->flags & CURLWS_PING) {
-                size_t sent = 0;
-                curl_ws_send(conn->easy, buf, nread, &sent, 0, CURLWS_PONG);
+                ws_send_all(conn->easy, buf, nread, CURLWS_PONG);
                 continue;
             }
 
