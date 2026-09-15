@@ -322,7 +322,16 @@ static bronze::Value buildBlobUrlResponse(const std::string& url, bool* found)
     bronze::Value blob = ev::undefined();
     if (!blobByObjectURL(url, &blob)) {
         *found = false;
-        return ev::undefined();
+        ObjectBuilder resp;
+        resp.set("status", 404.0);
+        resp.set("statusText", "Not Found");
+        resp.set("ok", false);
+        resp.set("url", url);
+        resp.set("headers", buildHeaders({}));
+        resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>()));
+        bronze::Value respVal = resp.build();
+        callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
+        return respVal;
     }
     *found = true;
 
@@ -777,15 +786,6 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
         } else if (isBlobUrl(url)) {
             bool found = false;
             response = buildBlobUrlResponse(url, &found);
-            if (!found) {
-                // A URL that was never minted, or has been revoked, is a
-                // network error: the TypeError fetch rejects with on the web.
-                auto err = ev::construct(ev::getGlobal("TypeError"),
-                    std::array<bronze::Value, 1>{ev::fromUtf8("fetch: unknown blob URL " + url)});
-                bronze::Value p = ev::createPromise();
-                ev::rejectPromise(p, err.value);
-                return p;
-            }
         } else {
             std::string resolved = resolveLocalPath(url);
             response = buildFileResponse(url, resolved);

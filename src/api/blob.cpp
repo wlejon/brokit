@@ -38,11 +38,9 @@ struct FileData {
 struct ReaderData {
     uint32_t tag = kReaderTag;
     int readyState = 0; // 0: EMPTY, 1: LOADING, 2: DONE
+    uint64_t generation = 0;
     ev::Persistent result;
     ev::Persistent error;
-    ev::Persistent onload;
-    ev::Persistent onerror;
-    ev::Persistent onloadend;
 };
 
 HostClass g_blobClass;
@@ -138,6 +136,187 @@ Value blobText(Value thisVal, std::span<const Value>) {
     return p;
 }
 
+Value blobBytesMethod(Value thisVal, std::span<const Value>) {
+    BlobData* b = getBlobData(thisVal);
+    if (!b) return ev::throwTypeError("Blob.bytes: receiver is not a Blob");
+    Value p = ev::createPromise();
+    Value u8 = ev::createTypedArray(ev::elements::Uint8, static_cast<uint32_t>(b->bytes.size()));
+    ev::fillTypedArray(u8, std::span<const uint8_t>(b->bytes.data(), b->bytes.size()));
+    ev::resolvePromise(p, u8);
+    return p;
+}
+
+std::string base64Encode(const std::vector<uint8_t>& in) {
+    static const char* kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        const uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8) |
+                           uint32_t(in[i + 2]);
+        out += kAlphabet[(n >> 18) & 63];
+        out += kAlphabet[(n >> 12) & 63];
+        out += kAlphabet[(n >> 6) & 63];
+        out += kAlphabet[n & 63];
+    }
+    if (i + 1 == in.size()) {
+        const uint32_t n = uint32_t(in[i]) << 16;
+        out += kAlphabet[(n >> 18) & 63];
+        out += kAlphabet[(n >> 12) & 63];
+        out += "==";
+    } else if (i + 2 == in.size()) {
+        const uint32_t n = (uint32_t(in[i]) << 16) | (uint32_t(in[i + 1]) << 8);
+        out += kAlphabet[(n >> 18) & 63];
+        out += kAlphabet[(n >> 12) & 63];
+        out += kAlphabet[(n >> 6) & 63];
+        out += '=';
+    }
+    return out;
+}
+
+static HostTaskPoster g_hostTaskPoster;
+
+std::string readerListenerKey(const std::string& type) {
+    return "__brokitListeners_" + type;
+}
+
+void addReaderListener(Value target, const std::string& type, Value fn) {
+    if (!ev::isFunction(fn)) return;
+    ev::Persistent targetP(target);
+    ev::Persistent fnP(fn);
+    const std::string key = readerListenerKey(type);
+    Value list = ev::getProperty(targetP.get(), key);
+    if (!ev::isObject(list)) {
+        list = ev::createObject();
+        ev::setProperty(list, "length", ev::fromDouble(0));
+        ev::setProperty(targetP.get(), key, list);
+    }
+    Value lenV = ev::getProperty(list, "length");
+    uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        Value existing = ev::getElement(list, i);
+        if (ev::toBits(existing) == ev::toBits(fnP.get())) return;
+    }
+    ev::setElement(list, len, fnP.get());
+    ev::setProperty(list, "length", ev::fromDouble(len + 1));
+}
+
+void removeReaderListener(Value target, const std::string& type, Value fn) {
+    if (!ev::isFunction(fn)) return;
+    ev::Persistent targetP(target);
+    ev::Persistent fnP(fn);
+    const std::string key = readerListenerKey(type);
+    Value list = ev::getProperty(targetP.get(), key);
+    if (!ev::isObject(list)) return;
+    Value lenV = ev::getProperty(list, "length");
+    uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
+    uint32_t found = len;
+    for (uint32_t i = 0; i < len; ++i) {
+        Value existing = ev::getElement(list, i);
+        if (ev::toBits(existing) == ev::toBits(fnP.get())) {
+            found = i;
+            break;
+        }
+    }
+    if (found == len) return;
+    for (uint32_t i = found + 1; i < len; ++i) {
+        Value moved = ev::getElement(list, i);
+        ev::setElement(list, i - 1, moved);
+    }
+    ev::setElement(list, len - 1, ev::undefined());
+    ev::setProperty(list, "length", ev::fromDouble(len - 1));
+}
+
+void dispatchReaderEvent(Value target, const std::string& type) {
+    ev::Persistent targetP(target);
+    std::vector<ev::Persistent> handlers;
+    {
+        Value on = ev::getProperty(targetP.get(), "on" + type);
+        if (ev::isFunction(on)) handlers.emplace_back(on);
+    }
+    {
+        Value list = ev::getProperty(targetP.get(), readerListenerKey(type));
+        if (ev::isObject(list)) {
+            Value lenV = ev::getProperty(list, "length");
+            uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
+            for (uint32_t i = 0; i < len; ++i) {
+                Value h = ev::getElement(list, i);
+                if (ev::isFunction(h)) handlers.emplace_back(h);
+            }
+        }
+    }
+    if (handlers.empty()) return;
+
+    for (ev::Persistent& handler : handlers) {
+        ev::Persistent evt(ev::createObject());
+        evt.set(ev::setProperty(evt.get(), "type", ev::fromUtf8(type)));
+        evt.set(ev::setProperty(evt.get(), "target", targetP.get()));
+        Value arg = evt.get();
+        ev::call(handler.get(), targetP.get(), std::span<const Value>(&arg, 1));
+    }
+}
+
+void startRead(Value self, Value blobValue,
+               std::function<Value(const std::vector<uint8_t>&)> produce) {
+    auto* r = static_cast<ReaderData*>(ev::handleData(self));
+    if (!r) return;
+    BlobData* blob = getBlobData(blobValue);
+
+    r->readyState = 1; // LOADING
+    r->result.set(ev::null());
+    r->error.set(ev::null());
+
+    const uint64_t generation = ++r->generation;
+    std::vector<uint8_t> bytes = blob ? blob->bytes : std::vector<uint8_t>();
+    const bool haveBlob = blob != nullptr;
+
+    ev::Persistent target(self);
+
+    auto task = [target, generation, bytes = std::move(bytes), haveBlob,
+                 produce = std::move(produce)]() mutable {
+        Value selfVal = target.get();
+        auto* reader = static_cast<ReaderData*>(ev::handleData(selfVal));
+        if (!reader || reader->generation != generation) return;
+
+        reader->generation = generation;
+        reader->readyState = 2; // DONE
+
+        if (!haveBlob) {
+            ObjectBuilder err;
+            err.set("name", ev::fromUtf8("NotFoundError"));
+            err.set("message", ev::fromUtf8("FileReader: argument is not a Blob"));
+            reader->error.set(err.get());
+            dispatchReaderEvent(target.get(), "loadstart");
+            dispatchReaderEvent(target.get(), "error");
+            dispatchReaderEvent(target.get(), "loadend");
+            return;
+        }
+
+        reader->result.set(produce(bytes));
+        dispatchReaderEvent(target.get(), "loadstart");
+        dispatchReaderEvent(target.get(), "progress");
+        dispatchReaderEvent(target.get(), "load");
+        dispatchReaderEvent(target.get(), "loadend");
+    };
+
+    if (g_hostTaskPoster) {
+        g_hostTaskPoster(std::move(task));
+    } else {
+        Value setTimeoutFn = ev::getProperty(ev::globalValue("globalThis").value, "setTimeout");
+        if (ev::isFunction(setTimeoutFn)) {
+            auto sharedTask = std::make_shared<std::function<void()>>(std::move(task));
+            Value cb = ev::makeFunction([sharedTask](Value, std::span<const Value>) {
+                (*sharedTask)();
+                return ev::undefined();
+            }, 0, "fileReaderTask");
+            Value zero = ev::fromDouble(0);
+            Value args[2] = { cb, zero };
+            ev::call(setTimeoutFn, ev::undefined(), args);
+        }
+    }
+}
+
 } // namespace
 
 bool blobBytes(Value val, const uint8_t** data, size_t* len, std::string* type) {
@@ -154,6 +333,10 @@ bool setFileWebkitRelativePath(Value file, std::string_view path) {
     if (!f) return false;
     f->webkitRelativePath.assign(path.begin(), path.end());
     return true;
+}
+
+void setHostTaskPoster(HostTaskPoster poster) {
+    g_hostTaskPoster = std::move(poster);
 }
 
 void installBlob() {
@@ -186,6 +369,7 @@ void installBlob() {
             proto.def("slice", 0, blobSlice);
             proto.def("arrayBuffer", 0, blobArrayBuffer);
             proto.def("text", 0, blobText);
+            proto.def("bytes", 0, blobBytesMethod);
         }
     );
 
@@ -235,41 +419,98 @@ void installBlob() {
     g_fileReaderClass.install("FileReader", 0,
         [](Value, std::span<const Value>) {
             auto* r = new ReaderData();
-            return g_fileReaderClass.make(r, readerDtor);
+            Value obj = g_fileReaderClass.make(r, readerDtor);
+            for (const char* slot : {"onload", "onerror", "onloadend", "onloadstart",
+                                     "onprogress", "onabort"}) {
+                ev::setProperty(obj, slot, ev::null());
+            }
+            return obj;
         },
         [](ObjectBuilder& proto) {
+            proto.set("EMPTY", ev::fromDouble(0));
+            proto.set("LOADING", ev::fromDouble(1));
+            proto.set("DONE", ev::fromDouble(2));
+
             proto.accessor("readyState", [](Value thisVal, std::span<const Value>) {
                 auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
                 return ev::fromDouble(r ? static_cast<double>(r->readyState) : 0.0);
             });
             proto.accessor("result", [](Value thisVal, std::span<const Value>) {
                 auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
-                return r ? r->result.get() : ev::null();
+                return (r && !ev::isUndefined(r->result.get())) ? r->result.get() : ev::null();
             });
-            proto.def("readAsArrayBuffer", 1, [](Value thisVal, std::span<const Value> a) {
+            proto.accessor("error", [](Value thisVal, std::span<const Value>) {
                 auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
-                if (!r || a.empty()) return ev::undefined();
-                BlobData* b = getBlobData(a[0]);
-                if (!b) return ev::throwTypeError("readAsArrayBuffer: argument 1 is not a Blob");
-                r->readyState = 2;
-                r->result.set(ev::createArrayBuffer(std::span<const uint8_t>(b->bytes.data(), b->bytes.size())));
-                Value onload = ev::getProperty(thisVal, "onload");
-                if (ev::isFunction(onload)) ev::call(onload, thisVal, {});
+                return (r && !ev::isUndefined(r->error.get())) ? r->error.get() : ev::null();
+            });
+
+            proto.def("readAsArrayBuffer", 1, [](Value thisVal, std::span<const Value> a) {
+                if (a.empty()) return ev::undefined();
+                startRead(thisVal, a[0], [](const std::vector<uint8_t>& bytes) {
+                    return ev::createArrayBuffer(std::span<const uint8_t>(bytes.data(), bytes.size()));
+                });
                 return ev::undefined();
             });
             proto.def("readAsText", 1, [](Value thisVal, std::span<const Value> a) {
-                auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
-                if (!r || a.empty()) return ev::undefined();
+                if (a.empty()) return ev::undefined();
+                startRead(thisVal, a[0], [](const std::vector<uint8_t>& bytes) {
+                    return ev::fromUtf8(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+                });
+                return ev::undefined();
+            });
+            proto.def("readAsBinaryString", 1, [](Value thisVal, std::span<const Value> a) {
+                if (a.empty()) return ev::undefined();
+                startRead(thisVal, a[0], [](const std::vector<uint8_t>& bytes) {
+                    std::string utf8;
+                    utf8.reserve(bytes.size() * 2);
+                    for (uint8_t c : bytes) {
+                        if (c < 0x80) {
+                            utf8 += static_cast<char>(c);
+                        } else {
+                            utf8 += static_cast<char>(0xC0 | (c >> 6));
+                            utf8 += static_cast<char>(0x80 | (c & 0x3F));
+                        }
+                    }
+                    return ev::fromUtf8(utf8);
+                });
+                return ev::undefined();
+            });
+            proto.def("readAsDataURL", 1, [](Value thisVal, std::span<const Value> a) {
+                if (a.empty()) return ev::undefined();
                 BlobData* b = getBlobData(a[0]);
-                if (!b) return ev::throwTypeError("readAsText: argument 1 is not a Blob");
-                r->readyState = 2;
-                r->result.set(ev::fromUtf8(std::string_view(reinterpret_cast<const char*>(b->bytes.data()), b->bytes.size())));
-                Value onload = ev::getProperty(thisVal, "onload");
-                if (ev::isFunction(onload)) ev::call(onload, thisVal, {});
+                std::string mime = b && !b->type.empty() ? b->type : "application/octet-stream";
+                startRead(thisVal, a[0], [mime](const std::vector<uint8_t>& bytes) {
+                    return ev::fromUtf8("data:" + mime + ";base64," + base64Encode(bytes));
+                });
+                return ev::undefined();
+            });
+            proto.def("abort", 0, [](Value thisVal, std::span<const Value>) {
+                auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
+                if (!r) return ev::undefined();
+                ++r->generation;
+                r->readyState = 2; // DONE
+                r->result.set(ev::null());
+                dispatchReaderEvent(thisVal, "abort");
+                dispatchReaderEvent(thisVal, "loadend");
+                return ev::undefined();
+            });
+            proto.def("addEventListener", 2, [](Value thisVal, std::span<const Value> a) {
+                if (a.size() < 2) return ev::undefined();
+                std::string type = ev::toUtf8(a[0]);
+                addReaderListener(thisVal, type, a[1]);
+                return ev::undefined();
+            });
+            proto.def("removeEventListener", 2, [](Value thisVal, std::span<const Value> a) {
+                if (a.size() < 2) return ev::undefined();
+                std::string type = ev::toUtf8(a[0]);
+                removeReaderListener(thisVal, type, a[1]);
                 return ev::undefined();
             });
         }
     );
+    g_fileReaderClass.setStatic("EMPTY", ev::fromDouble(0));
+    g_fileReaderClass.setStatic("LOADING", ev::fromDouble(1));
+    g_fileReaderClass.setStatic("DONE", ev::fromDouble(2));
 }
 
 } // namespace brokit::api

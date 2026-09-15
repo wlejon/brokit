@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -179,5 +180,9 @@ bool setFileWebkitRelativePath(bronze::Value file, std::string_view path);
 /// same registry `fetch('blob:...')` serves. Returns false for a URL that was
 /// never minted or has been revoked. Call after installURLObject().
 bool blobByObjectURL(const std::string& url, bronze::Value* outBlob);
+
+/// Host task poster hook for asynchronous deliveries (e.g. FileReader).
+using HostTaskPoster = std::function<void(std::function<void()>)>;
+void setHostTaskPoster(HostTaskPoster poster);
 
 } // namespace brokit::api

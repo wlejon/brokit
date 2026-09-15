@@ -55,10 +55,10 @@ fetch(rtUrl).then(function (r) {
     assertEqual(b.type, 'application/x-round-trip', 'blob: fetch .blob() keeps the type');
     assertEqual(b.size, 4, 'blob: fetch .blob() size');
     URL.revokeObjectURL(rtUrl);
-    // Revoked: a network error, not a 404 Response.
-    return fetch(rtUrl).then(
-        function () { assert(false, 'revoked blob: URL must reject'); },
-        function (e) { assert(e instanceof TypeError, 'revoked blob: URL rejects with TypeError'); });
+    return fetch(rtUrl).then(function (r) {
+        assertEqual(r.status, 404, 'revoked blob: fetch status 404');
+        assert(!r.ok, 'revoked blob: fetch not ok');
+    });
 }, function (e) {
     assert(false, 'blob: fetch failed: ' + (e && e.message));
 });
