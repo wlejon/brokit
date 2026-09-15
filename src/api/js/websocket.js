@@ -41,6 +41,7 @@
                 protoStr = protocols.join(', ');
             }
         }
+        this.protocol = protoStr;
 
         // Initiate native connection
         var self = this;
@@ -75,6 +76,11 @@
     WebSocket.OPEN = OPEN;
     WebSocket.CLOSING = CLOSING;
     WebSocket.CLOSED = CLOSED;
+
+    WebSocket.prototype.CONNECTING = CONNECTING;
+    WebSocket.prototype.OPEN = OPEN;
+    WebSocket.prototype.CLOSING = CLOSING;
+    WebSocket.prototype.CLOSED = CLOSED;
 
     Object.defineProperties(WebSocket.prototype, {
         onopen: {
@@ -211,4 +217,19 @@
 
     // Expose
     globalThis.WebSocket = WebSocket;
+
+    if (typeof globalThis.CloseEvent === 'undefined') {
+        function CloseEvent(type, init) {
+            init = init || {};
+            this.type = String(type);
+            this.code = init.code !== undefined ? init.code : 0;
+            this.reason = init.reason !== undefined ? String(init.reason) : '';
+            this.wasClean = init.wasClean !== undefined ? Boolean(init.wasClean) : false;
+        }
+        if (typeof globalThis.Event !== 'undefined') {
+            Object.setPrototypeOf(CloseEvent.prototype, globalThis.Event.prototype);
+            Object.setPrototypeOf(CloseEvent, globalThis.Event);
+        }
+        globalThis.CloseEvent = CloseEvent;
+    }
 })();
