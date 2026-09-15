@@ -18,7 +18,20 @@
     // inherited from EventTarget because this installs before event_target.js
     // does; the event dispatched is still the platform `Event`, looked up when
     // the abort happens, so `event.target === signal` in every listener.
+    var _allowConstruct = false;
+    function createSignal() {
+        _allowConstruct = true;
+        try {
+            return new AbortSignal();
+        } finally {
+            _allowConstruct = false;
+        }
+    }
+
     function AbortSignal() {
+        if (!_allowConstruct) {
+            throw new TypeError('Illegal constructor');
+        }
         this._aborted = false;
         this._reason = undefined;
         this._listeners = [];
@@ -98,7 +111,7 @@
 
     // Static factory: AbortSignal.abort(reason?) — born aborted, no event.
     AbortSignal.abort = function(reason) {
-        var signal = new AbortSignal();
+        var signal = createSignal();
         signal._aborted = true;
         signal._reason = (reason !== undefined)
             ? reason
@@ -108,7 +121,7 @@
 
     // Static factory: AbortSignal.timeout(ms)
     AbortSignal.timeout = function(ms) {
-        var signal = new AbortSignal();
+        var signal = createSignal();
         setTimeout(function() {
             abortSignal(signal, new globalThis.DOMException('The operation timed out.', 'TimeoutError'));
         }, ms);
@@ -117,7 +130,7 @@
 
     // Static factory: AbortSignal.any(signals)
     AbortSignal.any = function(signals) {
-        var signal = new AbortSignal();
+        var signal = createSignal();
         for (var i = 0; i < signals.length; i++) {
             if (signals[i].aborted) {
                 signal._aborted = true;
@@ -136,7 +149,7 @@
 
     // --- AbortController ---
     function AbortController() {
-        this.signal = new AbortSignal();
+        this.signal = createSignal();
     }
 
     AbortController.prototype.abort = function(reason) {
