@@ -24,7 +24,18 @@ endif()
 # httpbin.org, so they are integration tests against a third-party endpoint,
 # not deterministic unit tests. Run them locally with
 # `brokit_test tests/js/test_fetch.js`.
-file(GLOB BROKIT_JS_TESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/js/*.js")
+#
+# Every one of these runs JavaScript, which brass compiles to machine code for
+# the target — and on a target it has no code generator for (BRASS_HOST_BACKEND,
+# decided in brass's CMakeLists; Apple Silicon today) that code cannot run.
+# brokit_test still builds there, which is the check that the embed links; the
+# tests are not registered rather than registered to bus-error.
+if(NOT BRASS_HOST_BACKEND)
+    message(STATUS "brokit: JS tests not registered (brass has no code generator for this target)")
+    set(BROKIT_JS_TESTS "")
+else()
+    file(GLOB BROKIT_JS_TESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/js/*.js")
+endif()
 foreach(js ${BROKIT_JS_TESTS})
     get_filename_component(name "${js}" NAME_WE)
     if(name MATCHES "^(test_fetch|test_fetch_abort)$")

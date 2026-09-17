@@ -1,11 +1,14 @@
 ## ── Compile JS polyfills with bronze AOT at build time ───────────────────
 # Each .js file in js/ is compiled directly to an object file (.o) with its
 # unique entry symbol and linked into brokit_api.
-# On Apple Silicon (arm64), Bronze/Brass generates x86_64 machine code, so native
-# arm64 stubs are linked instead to prevent Mach-O cputype mismatch.
+# On a target brass has no code generator for (BRASS_HOST_BACKEND, decided in
+# brass's CMakeLists — Apple Silicon today) nothing is compiled and native
+# no-op stubs are linked instead; tests/CMakeLists.txt reads the same
+# variable to know there is no JavaScript to run there.
 
-if(APPLE AND (CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")))
+if(NOT BRASS_HOST_BACKEND)
     set(BROKIT_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_arm64.cpp")
+    message(STATUS "brokit: api built with the no-op JS entries (brass has no code generator for this target)")
 else()
     set(GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
     file(MAKE_DIRECTORY "${GEN_DIR}")
