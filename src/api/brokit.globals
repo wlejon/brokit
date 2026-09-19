@@ -34,8 +34,12 @@ EventTarget
 CustomEvent
 MessageChannel
 MessagePort
+MessageEvent
+DOMException
+structuredClone
 TextEncoder
 TextDecoder
+TextDecoderStream
 ReadableStream
 WritableStream
 TransformStream
@@ -89,6 +93,8 @@ __test_assertEqual
 __test_results
 
 # Internal hooks
+__brokit_textencoder_encode
+__brokit_textdecoder_decode
 __brokit_fetch_has_pending
 __brokit_fetch_tick
 __brokit_ws_has_pending
