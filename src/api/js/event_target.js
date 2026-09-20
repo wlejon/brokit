@@ -128,10 +128,18 @@
             if (entry.once) {
                 this.removeEventListener(event.type, entry.listener, entry.capture);
             }
-            if (typeof entry.listener === 'function') {
-                entry.listener.call(this, event);
-            } else if (entry.listener && typeof entry.listener.handleEvent === 'function') {
-                entry.listener.handleEvent(event);
+            try {
+                if (typeof entry.listener === 'function') {
+                    entry.listener.call(this, event);
+                } else if (entry.listener && typeof entry.listener.handleEvent === 'function') {
+                    entry.listener.handleEvent(event);
+                }
+            } catch (err) {
+                if (typeof globalThis.reportError === 'function') {
+                    globalThis.reportError(err);
+                } else if (typeof console !== 'undefined' && console.error) {
+                    console.error(err);
+                }
             }
         }
         return !event.defaultPrevented;

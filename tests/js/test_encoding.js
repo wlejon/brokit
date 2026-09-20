@@ -48,3 +48,30 @@ var ab = new ArrayBuffer(5);
 var view = new Uint8Array(ab);
 view[0] = 72; view[1] = 101; view[2] = 108; view[3] = 108; view[4] = 111;
 assertEqual(dec.decode(ab), 'Hello', 'decode ArrayBuffer');
+
+// Test encodeInto
+var dest = new Uint8Array(10);
+var res = enc.encodeInto('hello', dest);
+assertEqual(res.read, 5, 'encodeInto ASCII read');
+assertEqual(res.written, 5, 'encodeInto ASCII written');
+assertEqual(dest[0], 104, 'encodeInto ASCII byte 0');
+
+// encodeInto truncation: dest too small for 3-byte char
+var destSmall = new Uint8Array(2);
+res = enc.encodeInto('\u4e16', destSmall); // 世 requires 3 bytes
+assertEqual(res.read, 0, 'encodeInto does not consume char if bytes cannot fit');
+assertEqual(res.written, 0, 'encodeInto does not write partial bytes');
+assertEqual(destSmall[0], 0, 'destSmall remained untouched');
+
+// encodeInto with surrogate pair (emoji 4 bytes)
+var destEmoji = new Uint8Array(3);
+res = enc.encodeInto('🌍', destEmoji); // 4 bytes, 2 UTF-16 code units
+assertEqual(res.read, 0, 'encodeInto emoji does not consume 2 code units when < 4 bytes');
+assertEqual(res.written, 0, 'encodeInto emoji written 0');
+
+var destEmoji4 = new Uint8Array(4);
+res = enc.encodeInto('🌍', destEmoji4);
+assertEqual(res.read, 2, 'encodeInto emoji read 2 code units');
+assertEqual(res.written, 4, 'encodeInto emoji written 4 bytes');
+assertEqual(dec.decode(destEmoji4), '🌍', 'encodeInto emoji roundtrip');
+

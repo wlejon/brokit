@@ -325,21 +325,116 @@
     };
 
     ReadableStream.prototype.pipeTo = function(dest, options) {
-        if (this._locked) throw new TypeError('Stream is locked');
-        var reader = this.getReader();
-        var writer = dest.getWriter ? dest.getWriter() : null;
-        if (!writer) return Promise.reject(new TypeError('Destination is not writable'));
+        if (this._locked) return Promise.reject(new TypeError('Stream is locked'));
+        var reader;
+        try {
+            reader = this.getReader();
+        } catch (e) {
+            return Promise.reject(e);
+        }
+
+        var writer;
+        try {
+            writer = dest && dest.getWriter ? dest.getWriter() : null;
+        } catch (e) {
+            reader.releaseLock();
+            return Promise.reject(e);
+        }
+        if (!writer) {
+            reader.releaseLock();
+            return Promise.reject(new TypeError('Destination is not writable'));
+        }
+
+        options = options || {};
+        var preventClose = !!options.preventClose;
+        var preventAbort = !!options.preventAbort;
+        var preventCancel = !!options.preventCancel;
+        var signal = options.signal;
 
         return new Promise(function(resolve, reject) {
+            var settled = false;
+            var abortHandler = null;
+
+            function cleanup() {
+                if (signal && abortHandler && typeof signal.removeEventListener === 'function') {
+                    signal.removeEventListener('abort', abortHandler);
+                }
+            }
+
+            function shutdownWithAction(actionPromise, originalError) {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                Promise.resolve(actionPromise).then(function() {
+                    if (originalError !== undefined) reject(originalError);
+                    else resolve();
+                }, function(actionErr) {
+                    reject(originalError !== undefined ? originalError : actionErr);
+                });
+            }
+
+            if (signal) {
+                if (signal.aborted) {
+                    var reason = signal.reason;
+                    var actions = [];
+                    if (!preventAbort) actions.push(writer.abort(reason));
+                    if (!preventCancel) actions.push(reader.cancel(reason));
+                    shutdownWithAction(Promise.all(actions), reason);
+                    return;
+                }
+                abortHandler = function() {
+                    var reason = signal.reason;
+                    var actions = [];
+                    if (!preventAbort) actions.push(writer.abort(reason));
+                    if (!preventCancel) actions.push(reader.cancel(reason));
+                    shutdownWithAction(Promise.all(actions), reason);
+                };
+                if (typeof signal.addEventListener === 'function') {
+                    signal.addEventListener('abort', abortHandler, { once: true });
+                }
+            }
+
             function pump() {
+                if (settled) return;
                 reader.read().then(function(result) {
+                    if (settled) return;
                     if (result.done) {
-                        writer.close().then(resolve, reject);
+                        if (!preventClose) {
+                            shutdownWithAction(writer.close(), undefined);
+                        } else {
+                            settled = true;
+                            cleanup();
+                            try { writer.releaseLock(); } catch (e) {}
+                            resolve();
+                        }
                         return;
                     }
-                    writer.write(result.value).then(pump, reject);
-                }, reject);
+                    writer.write(result.value).then(function() {
+                        pump();
+                    }, function(writeErr) {
+                        if (settled) return;
+                        if (!preventCancel) {
+                            shutdownWithAction(reader.cancel(writeErr), writeErr);
+                        } else {
+                            settled = true;
+                            cleanup();
+                            try { reader.releaseLock(); } catch (e) {}
+                            reject(writeErr);
+                        }
+                    });
+                }, function(readErr) {
+                    if (settled) return;
+                    if (!preventAbort) {
+                        shutdownWithAction(writer.abort(readErr), readErr);
+                    } else {
+                        settled = true;
+                        cleanup();
+                        try { writer.releaseLock(); } catch (e) {}
+                        reject(readErr);
+                    }
+                });
             }
+
             pump();
         });
     };

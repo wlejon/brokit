@@ -5,6 +5,7 @@
 
     function WritableStreamDefaultController(stream) {
         this._stream = stream;
+        this._abortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
     }
 
     WritableStreamDefaultController.prototype.error = function(e) {
@@ -17,8 +18,7 @@
 
     Object.defineProperty(WritableStreamDefaultController.prototype, 'signal', {
         get: function() {
-            // AbortSignal for writer abort — simplified stub
-            return undefined;
+            return this._abortController ? this._abortController.signal : undefined;
         }
     });
 
@@ -251,6 +251,12 @@
         stream._state = 'errored';
         stream._storedError = reason;
         _rejectPending(stream, reason);
+
+        if (stream._controller && stream._controller._abortController) {
+            try {
+                stream._controller._abortController.abort(reason);
+            } catch (e) {}
+        }
 
         if (stream._sink.abort) {
             try {

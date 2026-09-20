@@ -139,3 +139,16 @@ var tSig3 = new EventTarget();
 var fn3 = function() {};
 tSig3.addEventListener('sig', fn3, { signal: ac3.signal });
 tSig3.removeEventListener('sig', fn3);
+
+// ── Exception isolation in dispatchEvent ─────────────────────────────────
+var tExc = new EventTarget();
+var listener2Ran = false;
+tExc.addEventListener('test-err', function() {
+    throw new Error('Listener 1 failed deliberately');
+});
+tExc.addEventListener('test-err', function() {
+    listener2Ran = true;
+});
+tExc.dispatchEvent(new Event('test-err'));
+assert(listener2Ran, 'remaining listener ran despite earlier listener throwing');
+

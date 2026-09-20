@@ -389,3 +389,32 @@ chainReader.read().then(function(r) {
 }).then(function(r) {
     assertEqual(r.done, true, 'chain: done');
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WritableStreamDefaultController.signal
+// ═══════════════════════════════════════════════════════════════════════════
+
+var capturedController = null;
+var ctrlAbortFired = false;
+var ctrlAbortReason = null;
+
+var wsSignalTest = new WritableStream({
+    start: function(controller) {
+        capturedController = controller;
+        assert(controller.signal instanceof AbortSignal, 'controller.signal is AbortSignal');
+        assertEqual(controller.signal.aborted, false, 'controller.signal initially false');
+        controller.signal.addEventListener('abort', function() {
+            ctrlAbortFired = true;
+            ctrlAbortReason = controller.signal.reason;
+        });
+    }
+});
+
+var wsSignalWriter = wsSignalTest.getWriter();
+wsSignalWriter.abort('test-abort-reason').then(function() {
+    assert(capturedController.signal.aborted, 'controller.signal is aborted after abort()');
+    assertEqual(capturedController.signal.reason, 'test-abort-reason', 'controller.signal.reason matches');
+    assert(ctrlAbortFired, 'controller.signal abort event listener fired');
+    assertEqual(ctrlAbortReason, 'test-abort-reason', 'event listener captured correct reason');
+});
+

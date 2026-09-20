@@ -275,3 +275,34 @@ dblStream.getReader();
 var dblThrew = false;
 try { dblStream.getReader(); } catch(e) { dblThrew = true; }
 assert(dblThrew, 'double getReader throws TypeError');
+
+// ── pipeTo options tests ──────────────────────────────────────────────────
+
+// 1. preventClose
+var closedDest = false;
+var src1 = new ReadableStream({
+    start: function(c) { c.enqueue(1); c.close(); }
+});
+var dst1 = new WritableStream({
+    close: function() { closedDest = true; }
+});
+src1.pipeTo(dst1, { preventClose: true }).then(function() {
+    assertEqual(closedDest, false, 'preventClose: destination was not closed');
+});
+
+// 2. signal cancellation
+var acPipe = new AbortController();
+var srcSignal = new ReadableStream({
+    pull: function(c) { c.enqueue('chunk'); }
+});
+var dstSignal = new WritableStream({
+    write: function(chunk) {}
+});
+var pipePromise = srcSignal.pipeTo(dstSignal, { signal: acPipe.signal });
+acPipe.abort('abort-pipe-test');
+pipePromise.then(function() {
+    assert(false, 'pipeTo should have rejected on abort');
+}, function(err) {
+    assertEqual(err, 'abort-pipe-test', 'pipeTo rejected with signal reason');
+});
+
