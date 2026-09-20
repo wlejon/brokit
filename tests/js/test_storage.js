@@ -112,3 +112,22 @@ assertEqual(localStorage.getItem('shared'), 'local', 'ls independent from ss');
 assertEqual(sessionStorage.getItem('shared'), 'session', 'ss independent from ls');
 localStorage.clear();
 sessionStorage.clear();
+
+// ── W3C Storage type coercion ──────────────────────────────────────────
+localStorage.setItem('obj', {});
+assertEqual(localStorage.getItem('obj'), '[object Object]', 'coerces plain object value to string');
+
+localStorage.setItem('num', 42);
+assertEqual(localStorage.getItem('num'), '42', 'coerces number value to string');
+
+localStorage.setItem('bool', true);
+assertEqual(localStorage.getItem('bool'), 'true', 'coerces boolean value to string');
+
+localStorage.setItem(123, 'number-key');
+assertEqual(localStorage.getItem('123'), 'number-key', 'coerces number key to string');
+
+sessionStorage.setItem('obj', { foo: 'bar' });
+assertEqual(sessionStorage.getItem('obj'), '[object Object]', 'sessionStorage coerces object value to string');
+
+localStorage.clear();
+sessionStorage.clear();

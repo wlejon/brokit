@@ -67,7 +67,13 @@
         resp.json = function () { return Promise.reject(new SyntaxError('Not Found')); };
         resp.arrayBuffer = function () { return Promise.resolve(new ArrayBuffer(0)); };
         resp.blob = function () { return Promise.resolve(new Blob([])); };
-        resp.clone = function () { return Object.assign(Object.create(null), resp); };
+        resp.clone = function () {
+            if (this.bodyUsed) throw new TypeError('Cannot clone a consumed response');
+            var proto = Object.getPrototypeOf(this) || (typeof Response !== 'undefined' ? Response.prototype : Object.prototype);
+            var r = Object.create(proto);
+            Object.assign(r, this);
+            return r;
+        };
     };
 
     // Decorate a Response object backed by a fully-loaded local file body
@@ -97,8 +103,13 @@
             return Promise.resolve(new Blob([new Uint8Array(this.__body)], { type: ct }));
         };
         resp.clone = function () {
-            var r = Object.assign(Object.create(null), this);
+            if (this.bodyUsed) throw new TypeError('Cannot clone a consumed response');
+            if (this.body && this.body.locked) throw new TypeError('Cannot clone a response with locked body');
+            var proto = Object.getPrototypeOf(this) || (typeof Response !== 'undefined' ? Response.prototype : Object.prototype);
+            var r = Object.create(proto);
+            Object.assign(r, this);
             r.__body = this.__body.slice(0);
+            r.body = replayStream(function () { return r.__body; });
             return r;
         };
     };
@@ -137,51 +148,65 @@
         });
         resp.bodyUsed = false;
 
-        function consumeBody() {
-            if (resp.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
-            resp.bodyUsed = true;
-            var reader = resp.body.getReader();
-            var chunks = [];
-            function pump() {
-                return reader.read().then(function (result) {
-                    if (result.done) {
-                        var totalLen = 0;
-                        for (var i = 0; i < chunks.length; i++) totalLen += chunks[i].byteLength;
-                        var merged = new Uint8Array(totalLen);
-                        var offset = 0;
-                        for (var i = 0; i < chunks.length; i++) {
-                            merged.set(new Uint8Array(chunks[i].buffer || chunks[i]), offset);
-                            offset += chunks[i].byteLength;
+        function attachStreamingMethods(target) {
+            function consumeBody() {
+                if (target.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
+                target.bodyUsed = true;
+                var reader = target.body.getReader();
+                var chunks = [];
+                function pump() {
+                    return reader.read().then(function (result) {
+                        if (result.done) {
+                            var totalLen = 0;
+                            for (var i = 0; i < chunks.length; i++) totalLen += chunks[i].byteLength;
+                            var merged = new Uint8Array(totalLen);
+                            var offset = 0;
+                            for (var i = 0; i < chunks.length; i++) {
+                                merged.set(new Uint8Array(chunks[i].buffer || chunks[i]), offset);
+                                offset += chunks[i].byteLength;
+                            }
+                            return merged;
                         }
-                        return merged;
-                    }
-                    chunks.push(result.value);
-                    return pump();
-                });
+                        chunks.push(result.value);
+                        return pump();
+                    });
+                }
+                return pump();
             }
-            return pump();
+
+            target.text = function () {
+                return consumeBody().then(function (bytes) {
+                    return new TextDecoder().decode(bytes);
+                });
+            };
+            target.json = function () {
+                return target.text().then(function (t) { return JSON.parse(t); });
+            };
+            target.arrayBuffer = function () {
+                return consumeBody().then(function (bytes) { return bytes.buffer; });
+            };
+            target.blob = function () {
+                var ct = target.headers ? (target.headers.get('content-type') || '') : '';
+                return consumeBody().then(function (bytes) {
+                    return new Blob([bytes], { type: ct });
+                });
+            };
+            target.clone = function () {
+                if (target.bodyUsed) throw new TypeError('Cannot clone a consumed response');
+                if (target.body && target.body.locked) throw new TypeError('Cannot clone a response with locked body');
+                var branches = target.body.tee();
+                target.body = branches[0];
+                var proto = Object.getPrototypeOf(target) || (typeof Response !== 'undefined' ? Response.prototype : Object.prototype);
+                var r = Object.create(proto);
+                Object.assign(r, target);
+                r.body = branches[1];
+                r.bodyUsed = false;
+                attachStreamingMethods(r);
+                return r;
+            };
         }
 
-        resp.text = function () {
-            return consumeBody().then(function (bytes) {
-                return new TextDecoder().decode(bytes);
-            });
-        };
-        resp.json = function () {
-            return resp.text().then(function (t) { return JSON.parse(t); });
-        };
-        resp.arrayBuffer = function () {
-            return consumeBody().then(function (bytes) { return bytes.buffer; });
-        };
-        resp.blob = function () {
-            var ct = resp.headers.get('content-type') || '';
-            return consumeBody().then(function (bytes) {
-                return new Blob([bytes], { type: ct });
-            });
-        };
-        resp.clone = function () {
-            throw new TypeError('Cannot clone a streaming response');
-        };
+        attachStreamingMethods(resp);
     };
 
     // Decorate a Response whose body has already fully arrived (`resp.__body`
@@ -219,9 +244,21 @@
             return Promise.resolve(new Blob([new Uint8Array(this.__body)], { type: ct }));
         };
         resp.clone = function () {
-            var r = Object.create(Object.getPrototypeOf(this));
+            if (this.bodyUsed) throw new TypeError('Cannot clone a consumed response');
+            if (this.body && this.body.locked) throw new TypeError('Cannot clone a response with locked body');
+            var proto = Object.getPrototypeOf(this) || (typeof Response !== 'undefined' ? Response.prototype : Object.prototype);
+            var r = Object.create(proto);
             Object.assign(r, this);
-            r.__body = this.__body.slice(0);
+            var cloneBuf = this.__body.slice(0);
+            r.__body = cloneBuf;
+            var cloneEmitted = false;
+            r.body = new ReadableStream({
+                pull: function (controller) {
+                    if (cloneEmitted) { controller.close(); return; }
+                    cloneEmitted = true;
+                    controller.enqueue(new Uint8Array(cloneBuf.slice(0)));
+                }
+            });
             return r;
         };
     };

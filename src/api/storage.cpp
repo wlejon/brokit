@@ -113,7 +113,6 @@ bronze::Value makeStorageValue(StorageState* st)
     ObjectBuilder b;
     b.def("getItem", 1, [st](bronze::Value, std::span<const bronze::Value> a) {
         bronze::Value keyV = argAt(a, 0);
-        if (ev::isObject(keyV) || ev::isUndefined(keyV)) return ev::null();
         std::string key = ev::toUtf8(keyV);
         auto it = st->items.find(key);
         if (it == st->items.end()) return ev::null();
@@ -123,21 +122,18 @@ bronze::Value makeStorageValue(StorageState* st)
     b.def("setItem", 2, [st](bronze::Value, std::span<const bronze::Value> a) {
         bronze::Value keyV = argAt(a, 0);
         bronze::Value valV = argAt(a, 1);
-        if (!ev::isObject(keyV) && !ev::isUndefined(keyV)) {
-            std::string key = ev::toUtf8(keyV);
-            std::string val = (!ev::isObject(valV) && !ev::isUndefined(valV)) ? ev::toUtf8(valV) : "";
-            st->items[key] = val;
-            saveStorage(st);
-        }
+        std::string key = ev::toUtf8(keyV);
+        std::string val = ev::toUtf8(valV);
+        st->items[key] = val;
+        saveStorage(st);
         return ev::undefined();
     });
 
     b.def("removeItem", 1, [st](bronze::Value, std::span<const bronze::Value> a) {
         bronze::Value keyV = argAt(a, 0);
-        if (!ev::isObject(keyV) && !ev::isUndefined(keyV)) {
-            st->items.erase(ev::toUtf8(keyV));
-            saveStorage(st);
-        }
+        std::string key = ev::toUtf8(keyV);
+        st->items.erase(key);
+        saveStorage(st);
         return ev::undefined();
     });
 
@@ -168,8 +164,7 @@ bronze::Value makeStorageValue(StorageState* st)
         return true;
     };
     t.set = [st](const std::string& key, bronze::Value v) {
-        if (ev::isObject(v)) return;
-        st->items[key] = ev::isUndefined(v) ? "undefined" : ev::toUtf8(v);
+        st->items[key] = ev::toUtf8(v);
         saveStorage(st);
     };
     t.has = [st](const std::string& key) {

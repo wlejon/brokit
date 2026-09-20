@@ -131,12 +131,18 @@
         if (this.readyState !== OPEN) return;
 
         var binary = false;
-        if (data instanceof ArrayBuffer || data instanceof Uint8Array ||
+        var toSend = data;
+        if (data instanceof ArrayBuffer ||
             (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)) {
+            binary = true;
+        } else if (ArrayBuffer.isView(data)) {
+            binary = true;
+            toSend = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
             binary = true;
         }
 
-        globalThis.__brokit_ws_send(this._id, data, binary);
+        globalThis.__brokit_ws_send(this._id, toSend, binary);
     };
 
     WebSocket.prototype.close = function(code, reason) {
@@ -170,9 +176,19 @@
         while ((msg = globalThis.__brokit_ws_recv(this._id)) !== null) {
             if (msg.type === 'message') {
                 var msgData = msg.data;
-                if (msg.binary && this.binaryType === 'arraybuffer' &&
-                    msgData instanceof Uint8Array) {
-                    msgData = msgData.buffer;
+                if (msg.binary) {
+                    if (this.binaryType === 'arraybuffer') {
+                        if (msgData instanceof Uint8Array) {
+                            msgData = msgData.buffer.slice(
+                                msgData.byteOffset,
+                                msgData.byteOffset + msgData.byteLength
+                            );
+                        }
+                    } else if (this.binaryType === 'blob') {
+                        if (typeof Blob !== 'undefined') {
+                            msgData = new Blob([msgData]);
+                        }
+                    }
                 }
                 var event = { type: 'message', data: msgData };
                 if (this._onmessage) { try { this._onmessage(event); } catch (e) {} }

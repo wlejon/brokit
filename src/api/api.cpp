@@ -229,6 +229,7 @@ void installAll()
     installChildProcess();
     installWebSocket();
     installWebSocketJS();
+    installEventTarget();
     installEventSource();
     installFormData();
     installFetchClasses();
@@ -236,7 +237,6 @@ void installAll()
     installCompression();
     installBase64();
     installNavigator();
-    installEventTarget();
     installMessageChannel();
 #ifdef BROKIT_HAS_NOISE
     installNoise();

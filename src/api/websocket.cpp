@@ -162,10 +162,14 @@ static bronze::Value js_ws_send(bronze::Value, std::span<const bronze::Value> ar
     CURLcode rc = CURLE_OK;
 
     if (binary) {
+        const uint8_t* blobData = nullptr;
+        size_t blobLen = 0;
         if (auto info = ev::typedArrayInfo(dataVal)) {
             rc = ws_send_all(conn->easy, info.data, info.byteLength, CURLWS_BINARY);
         } else if (auto info = ev::arrayBufferInfo(dataVal)) {
             rc = ws_send_all(conn->easy, info.data, info.byteLength, CURLWS_BINARY);
+        } else if (blobBytes(dataVal, &blobData, &blobLen)) {
+            rc = ws_send_all(conn->easy, blobData, blobLen, CURLWS_BINARY);
         } else {
             return ev::fromBool(false);
         }

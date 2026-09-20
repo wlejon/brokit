@@ -20,11 +20,13 @@ assert(typeof EventSource.prototype.addEventListener === 'function', 'addEventLi
 assert(typeof EventSource.prototype.removeEventListener === 'function', 'removeEventListener exists');
 assert(typeof EventSource.prototype.dispatchEvent === 'function', 'dispatchEvent exists');
 assert(typeof EventSource.prototype.close === 'function', 'close exists');
+assert(EventSource.prototype instanceof EventTarget, 'EventSource.prototype inherits from EventTarget');
 
 // ── SSE parsing via _processEvent (white-box test) ───────────────────────
 // Create an EventSource and immediately close it to prevent any network activity,
 // then test the parsing logic directly.
 var es = new EventSource('http://127.0.0.1:1/nope');
+assert(es instanceof EventTarget, 'EventSource instance is EventTarget');
 es.close(); // immediately close — prevents reconnection and stops fetch
 
 var received = [];

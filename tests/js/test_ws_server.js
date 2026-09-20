@@ -93,6 +93,17 @@ ws.onmessage = (ev) => {
         step = 1;
         ws.send(new Uint8Array([5, 0, 200]));
     } else if (step === 1) {
+        if (typeof Blob !== 'undefined' && ev.data instanceof Blob) {
+            assert(ev.data.size === 3, 'client got binary echo back');
+            ev.data.arrayBuffer().then((ab) => {
+                const u8 = new Uint8Array(ab);
+                assert(u8[0] === 5 && u8[1] === 0 && u8[2] === 200,
+                       'binary echo bytes intact');
+                step = 2;
+                ws.close(4001, 'done testing');
+            });
+            return;
+        }
         assert(ev.data instanceof Uint8Array && ev.data.length === 3,
                'client got binary echo back');
         assert(ev.data[0] === 5 && ev.data[1] === 0 && ev.data[2] === 200,

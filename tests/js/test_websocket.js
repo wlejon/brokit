@@ -112,6 +112,47 @@ assertEqual(ws3.readyState, WebSocket.CLOSED, 'ws3 closed immediately');
 ws3.close();
 assertEqual(ws3.readyState, WebSocket.CLOSED, 'ws3 still closed');
 
+// ── send views and blobs ──────────────────────────────────────────────────
+var sentArgs = null;
+var origWsSend = globalThis.__brokit_ws_send;
+globalThis.__brokit_ws_send = function(id, data, binary) {
+    sentArgs = { id: id, data: data, binary: binary };
+};
+var dummyWs = new WebSocket('ws://127.0.0.1:1/dummy-send');
+dummyWs.readyState = WebSocket.OPEN;
+
+dummyWs.send(new Int32Array([1, 2]));
+assert(sentArgs.binary, 'Int32Array send marked binary');
+assert(sentArgs.data instanceof Uint8Array, 'ArrayBufferView converted to Uint8Array');
+assertEqual(sentArgs.data.byteLength, 8, 'Uint8Array byteLength 8');
+
+dummyWs.send(new Blob(['hello']));
+assert(sentArgs.binary, 'Blob send marked binary');
+assert(sentArgs.data instanceof Blob, 'Blob passed to native send');
+globalThis.__brokit_ws_send = origWsSend;
+dummyWs.close();
+
+// ── _drainEvents binaryType blob vs arraybuffer ───────────────────────────
+var dummyWsRecv = new WebSocket('ws://127.0.0.1:1/dummy-recv');
+dummyWsRecv.readyState = WebSocket.OPEN;
+var receivedEvent = null;
+dummyWsRecv.onmessage = function(e) { receivedEvent = e; };
+var origWsRecv = globalThis.__brokit_ws_recv;
+var mockQueue = [{ type: 'message', binary: true, data: new Uint8Array([42]) }];
+globalThis.__brokit_ws_recv = function() { return mockQueue.shift() || null; };
+
+dummyWsRecv.binaryType = 'blob';
+dummyWsRecv._drainEvents();
+assert(receivedEvent.data instanceof Blob, 'binaryType blob produces Blob');
+
+mockQueue.push({ type: 'message', binary: true, data: new Uint8Array([42]) });
+dummyWsRecv.binaryType = 'arraybuffer';
+dummyWsRecv._drainEvents();
+assert(receivedEvent.data instanceof ArrayBuffer, 'binaryType arraybuffer produces ArrayBuffer');
+
+globalThis.__brokit_ws_recv = origWsRecv;
+dummyWsRecv.close();
+
 // ── Echo server integration test ─────────────────────────────────────────
 // Commented out for CI — uncomment to test with a real WebSocket echo server.
 // To run: uncomment below, build, and run with network access.

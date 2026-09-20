@@ -114,3 +114,28 @@ var detailReceived;
 t5.addEventListener('custom', function(e) { detailReceived = e.detail; });
 t5.dispatchEvent(new CustomEvent('custom', { detail: 'hello' }));
 assertEqual(detailReceived, 'hello', 'CustomEvent detail via EventTarget');
+
+// ── options.signal (AbortSignal) ──────────────────────────────────────────
+var ac1 = new AbortController();
+ac1.abort();
+var signalCount1 = 0;
+var tSig1 = new EventTarget();
+tSig1.addEventListener('sig', function() { signalCount1++; }, { signal: ac1.signal });
+tSig1.dispatchEvent(new Event('sig'));
+assertEqual(signalCount1, 0, 'listener with already aborted signal is not added');
+
+var ac2 = new AbortController();
+var signalCount2 = 0;
+var tSig2 = new EventTarget();
+tSig2.addEventListener('sig', function() { signalCount2++; }, { signal: ac2.signal });
+tSig2.dispatchEvent(new Event('sig'));
+assertEqual(signalCount2, 1, 'listener ran before signal abort');
+ac2.abort();
+tSig2.dispatchEvent(new Event('sig'));
+assertEqual(signalCount2, 1, 'listener removed after signal abort');
+
+var ac3 = new AbortController();
+var tSig3 = new EventTarget();
+var fn3 = function() {};
+tSig3.addEventListener('sig', fn3, { signal: ac3.signal });
+tSig3.removeEventListener('sig', fn3);

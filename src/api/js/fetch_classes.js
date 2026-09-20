@@ -175,7 +175,9 @@
     // — text() after arrayBuffer() would otherwise find the stream drained.
     function drainStream(resp) {
         if (resp._bodyBytes) return Promise.resolve(resp._bodyBytes);
-        var reader = resp._bodyStream.getReader();
+        var stream = resp._bodyStream || (typeof resp.body === 'object' && resp.body) || resp._stream;
+        if (!stream) return Promise.resolve(new Uint8Array(0));
+        var reader = stream.getReader();
         var chunks = [];
         var total = 0;
         return (function pump() {
@@ -245,7 +247,26 @@
 
     Response.prototype.clone = function() {
         if (this.bodyUsed) throw new TypeError('Cannot clone a consumed response');
-        var r = new Response(this._bodyBlob || this._bodyBytes, {
+        if (this.body && this.body.locked) throw new TypeError('Cannot clone a response with locked body');
+        var body;
+        if (this._bodyBlob) {
+            body = this._bodyBlob;
+        } else if (this._bodyBytes) {
+            body = this._bodyBytes.slice(0);
+        } else if (this.body && typeof this.body.tee === 'function') {
+            var branches = this.body.tee();
+            this.body = branches[0];
+            this._bodyStream = branches[0];
+            body = branches[1];
+        } else if (this._bodyStream && typeof this._bodyStream.tee === 'function') {
+            var branches = this._bodyStream.tee();
+            this._bodyStream = branches[0];
+            this.body = branches[0];
+            body = branches[1];
+        } else {
+            body = null;
+        }
+        var r = new Response(body, {
             status: this.status,
             statusText: this.statusText,
             headers: new Headers(this.headers)
@@ -297,20 +318,162 @@
             this.method = (init.method || input.method || 'GET').toUpperCase();
             this.headers = new Headers(init.headers || input.headers);
             this._body = init.body !== undefined ? init.body : input._body;
+            this.signal = init.signal !== undefined ? init.signal : input.signal;
         } else {
             this.url = String(input);
             this.method = (init.method || 'GET').toUpperCase();
             this.headers = new Headers(init.headers);
             this._body = init.body !== undefined ? init.body : null;
+            this.signal = init.signal || null;
         }
 
-        this.signal = init.signal || null;
         this.bodyUsed = false;
+        this._bodyBytes = null;
+        this._bodyBlob = null;
+        this._bodyStream = null;
+        this._stream = null;
+
+        if (this._body !== null && this._body !== undefined) {
+            if (typeof this._body === 'string') {
+                this._bodyBytes = new TextEncoder().encode(this._body);
+            } else if (this._body instanceof ArrayBuffer) {
+                this._bodyBytes = new Uint8Array(this._body);
+            } else if (ArrayBuffer.isView(this._body)) {
+                this._bodyBytes = new Uint8Array(this._body.buffer, this._body.byteOffset, this._body.byteLength);
+            } else if (typeof Blob !== 'undefined' && this._body instanceof Blob) {
+                this._bodyBlob = this._body;
+            } else if (this._body && typeof this._body.getReader === 'function') {
+                this._bodyStream = this._body;
+            }
+        }
     }
+
+    Object.defineProperty(Request.prototype, 'body', {
+        get: function() {
+            if (this._body === null || this._body === undefined) return null;
+            if (this._bodyStream) return this._bodyStream;
+            if (this._stream) return this._stream;
+            if (typeof ReadableStream !== 'function') return null;
+            var self = this;
+            var emitted = false;
+            this._stream = new ReadableStream({
+                pull: function(controller) {
+                    if (emitted) { controller.close(); return; }
+                    emitted = true;
+                    if (self._bodyBytes) {
+                        controller.enqueue(new Uint8Array(self._bodyBytes));
+                        return;
+                    }
+                    if (self._bodyBlob) {
+                        return self._bodyBlob.arrayBuffer().then(function(buf) {
+                            controller.enqueue(new Uint8Array(buf));
+                        });
+                    }
+                    if (typeof FormData !== 'undefined' && self._body instanceof FormData) {
+                        return serializeFormData(self._body).then(function(res) {
+                            controller.enqueue(res.body);
+                        });
+                    }
+                    var bytes = new TextEncoder().encode(String(self._body));
+                    controller.enqueue(bytes);
+                }
+            });
+            return this._stream;
+        },
+        enumerable: true,
+        configurable: true
+    });
+
+    Request.prototype.text = function() {
+        if (this.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
+        this.bodyUsed = true;
+        if (this._body === null || this._body === undefined) return Promise.resolve('');
+        if (this._bodyBlob) return this._bodyBlob.text();
+        if (this._bodyStream || (this._stream && this._stream.locked)) {
+            return drainStream(this).then(function(bytes) {
+                return new TextDecoder().decode(bytes);
+            });
+        }
+        if (this._bodyBytes) return Promise.resolve(new TextDecoder().decode(this._bodyBytes));
+        if (typeof FormData !== 'undefined' && this._body instanceof FormData) {
+            return serializeFormData(this._body).then(function(res) {
+                return new TextDecoder().decode(res.body);
+            });
+        }
+        return Promise.resolve(String(this._body));
+    };
+
+    Request.prototype.json = function() {
+        return this.text().then(function(t) { return JSON.parse(t); });
+    };
+
+    Request.prototype.arrayBuffer = function() {
+        if (this.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
+        this.bodyUsed = true;
+        if (this._body === null || this._body === undefined) return Promise.resolve(new ArrayBuffer(0));
+        if (this._bodyBlob) return this._bodyBlob.arrayBuffer();
+        if (this._bodyStream || (this._stream && this._stream.locked)) {
+            return drainStream(this).then(function(bytes) {
+                return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            });
+        }
+        if (this._bodyBytes) {
+            return Promise.resolve(this._bodyBytes.buffer.slice(
+                this._bodyBytes.byteOffset,
+                this._bodyBytes.byteOffset + this._bodyBytes.byteLength
+            ));
+        }
+        if (typeof FormData !== 'undefined' && this._body instanceof FormData) {
+            return serializeFormData(this._body).then(function(res) {
+                return res.body.buffer.slice(res.body.byteOffset, res.body.byteOffset + res.body.byteLength);
+            });
+        }
+        var bytes = new TextEncoder().encode(String(this._body));
+        return Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    };
+
+    Request.prototype.blob = function() {
+        if (this.bodyUsed) return Promise.reject(new TypeError('Body already consumed'));
+        this.bodyUsed = true;
+        var ct = this.headers.get('content-type') || '';
+        if (this._body === null || this._body === undefined) return Promise.resolve(new Blob([], { type: ct }));
+        if (this._bodyBlob) return Promise.resolve(this._bodyBlob);
+        if (this._bodyStream || (this._stream && this._stream.locked)) {
+            return drainStream(this).then(function(bytes) {
+                return new Blob([bytes], { type: ct });
+            });
+        }
+        if (this._bodyBytes) return Promise.resolve(new Blob([this._bodyBytes], { type: ct }));
+        if (typeof FormData !== 'undefined' && this._body instanceof FormData) {
+            return serializeFormData(this._body).then(function(res) {
+                return new Blob([res.body], { type: ct || res.contentType });
+            });
+        }
+        var bytes = new TextEncoder().encode(String(this._body));
+        return Promise.resolve(new Blob([bytes], { type: ct }));
+    };
 
     Request.prototype.clone = function() {
         if (this.bodyUsed) throw new TypeError('Cannot clone a consumed request');
-        return new Request(this, {});
+        var stream = this._bodyStream || this._stream;
+        if (stream && stream.locked) throw new TypeError('Cannot clone a request with locked body');
+        var body = this._body;
+        if (this._bodyBlob) {
+            body = this._bodyBlob;
+        } else if (this._bodyBytes) {
+            body = this._bodyBytes.slice(0);
+        } else if (stream && typeof stream.tee === 'function') {
+            var branches = stream.tee();
+            this._bodyStream = branches[0];
+            this._stream = branches[0];
+            body = branches[1];
+        }
+        return new Request(this.url, {
+            method: this.method,
+            headers: new Headers(this.headers),
+            body: body,
+            signal: this.signal
+        });
     };
 
     Request.prototype[Symbol.toStringTag] = 'Request';
@@ -502,6 +665,9 @@
                 resp.headers.forEach(function(v, k) { h.append(k, v); });
             }
             resp.headers = h;
+        }
+        if (typeof Response !== 'undefined' && Object.getPrototypeOf(resp) === Object.prototype) {
+            Object.setPrototypeOf(resp, Response.prototype);
         }
         return resp;
     }

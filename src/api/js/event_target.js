@@ -60,20 +60,42 @@
 
     EventTarget.prototype.addEventListener = function(type, listener, options) {
         if (typeof listener !== 'function' && !(listener && typeof listener.handleEvent === 'function')) return;
-        var once = false, capture = false;
+        var once = false, capture = false, signal = null;
         if (typeof options === 'boolean') {
             capture = options;
         } else if (options && typeof options === 'object') {
             once = !!options.once;
             capture = !!options.capture;
+            if (options.signal) signal = options.signal;
         }
+
+        if (signal && signal.aborted) return;
+
         if (!this._listeners[type]) this._listeners[type] = [];
         // Deduplicate
         var list = this._listeners[type];
         for (var i = 0; i < list.length; i++) {
             if (list[i].listener === listener && list[i].capture === capture) return;
         }
-        list.push({ listener: listener, once: once, capture: capture });
+
+        var self = this;
+        var abortHandler = null;
+        if (signal) {
+            abortHandler = function() {
+                self.removeEventListener(type, listener, { capture: capture });
+            };
+            if (typeof signal.addEventListener === 'function') {
+                signal.addEventListener('abort', abortHandler, { once: true });
+            }
+        }
+
+        list.push({
+            listener: listener,
+            once: once,
+            capture: capture,
+            signal: signal,
+            abortHandler: abortHandler
+        });
     };
 
     EventTarget.prototype.removeEventListener = function(type, listener, options) {
@@ -84,6 +106,10 @@
         var list = this._listeners[type];
         for (var i = 0; i < list.length; i++) {
             if (list[i].listener === listener && list[i].capture === capture) {
+                var entry = list[i];
+                if (entry.signal && entry.abortHandler && typeof entry.signal.removeEventListener === 'function') {
+                    entry.signal.removeEventListener('abort', entry.abortHandler);
+                }
                 list.splice(i, 1);
                 break;
             }
@@ -112,4 +138,9 @@
     };
 
     globalThis.EventTarget = EventTarget;
+
+    if (typeof globalThis.EventSource !== 'undefined' && !(globalThis.EventSource.prototype instanceof EventTarget)) {
+        Object.setPrototypeOf(globalThis.EventSource.prototype, EventTarget.prototype);
+        Object.setPrototypeOf(globalThis.EventSource, EventTarget);
+    }
 })();

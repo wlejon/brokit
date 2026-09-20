@@ -10,13 +10,18 @@
             throw new TypeError("Failed to construct 'EventSource': use 'new'");
         if (!url) throw new SyntaxError("Failed to construct 'EventSource': URL required");
 
+        if (typeof globalThis.EventTarget === 'function') {
+            globalThis.EventTarget.call(this);
+        } else {
+            this._listeners = {};
+        }
+
         this.url = String(url);
         this.withCredentials = (options && options.withCredentials) ? true : false;
         this.readyState = CONNECTING;
 
         this._lastEventId = '';
         this._retryMs = 3000;
-        this._listeners = {};
         this._onopen = null;
         this._onmessage = null;
         this._onerror = null;
@@ -29,6 +34,36 @@
     EventSource.CONNECTING = CONNECTING;
     EventSource.OPEN = OPEN;
     EventSource.CLOSED = CLOSED;
+
+    if (typeof globalThis.EventTarget !== 'undefined') {
+        EventSource.prototype = Object.create(globalThis.EventTarget.prototype);
+        EventSource.prototype.constructor = EventSource;
+    } else {
+        EventSource.prototype.addEventListener = function(type, listener) {
+            if (typeof listener !== 'function') return;
+            if (!this._listeners[type]) this._listeners[type] = [];
+            this._listeners[type].push({ listener: listener });
+        };
+        EventSource.prototype.removeEventListener = function(type, listener) {
+            var list = this._listeners[type];
+            if (!list) return;
+            for (var i = list.length - 1; i >= 0; i--) {
+                if (list[i].listener === listener) { list.splice(i, 1); break; }
+            }
+        };
+        EventSource.prototype.dispatchEvent = function(event) {
+            var list = this._listeners[event.type];
+            if (list) {
+                for (var i = 0; i < list.length; i++) {
+                    try { list[i].listener.call(this, event); } catch (e) {}
+                }
+            }
+        };
+    }
+
+    EventSource.prototype.CONNECTING = CONNECTING;
+    EventSource.prototype.OPEN = OPEN;
+    EventSource.prototype.CLOSED = CLOSED;
 
     Object.defineProperties(EventSource.prototype, {
         onopen: {
@@ -44,29 +79,6 @@
             set: function(fn) { this._onerror = typeof fn === 'function' ? fn : null; }
         }
     });
-
-    EventSource.prototype.addEventListener = function(type, listener) {
-        if (typeof listener !== 'function') return;
-        if (!this._listeners[type]) this._listeners[type] = [];
-        this._listeners[type].push(listener);
-    };
-
-    EventSource.prototype.removeEventListener = function(type, listener) {
-        var list = this._listeners[type];
-        if (!list) return;
-        for (var i = list.length - 1; i >= 0; i--) {
-            if (list[i] === listener) { list.splice(i, 1); break; }
-        }
-    };
-
-    EventSource.prototype.dispatchEvent = function(event) {
-        var list = this._listeners[event.type];
-        if (list) {
-            for (var i = 0; i < list.length; i++) {
-                try { list[i].call(this, event); } catch (e) { /* swallow */ }
-            }
-        }
-    };
 
     EventSource.prototype.close = function() {
         this._closed = true;

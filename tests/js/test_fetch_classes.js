@@ -261,6 +261,69 @@ bodyTests = bodyTests.then(function() {
         }
         assert(found, 'binary payload preserved intact with no byte corruption or UTF-8 expansion');
     });
+}).then(function() {
+    // ── Request Body mixin tests ──
+    var reqJson = new Request('https://example.com/api', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hello: 'world', count: 42 })
+    });
+    assert(reqJson.body instanceof ReadableStream, 'Request.body returns ReadableStream');
+    return reqJson.json().then(function(data) {
+        assertEqual(data.hello, 'world', 'Request.json() parsed');
+        assertEqual(data.count, 42, 'Request.json() count');
+        assert(reqJson.bodyUsed, 'Request bodyUsed is true after json()');
+    });
+}).then(function() {
+    var reqTxt = new Request('https://example.com', { method: 'POST', body: 'some text' });
+    return reqTxt.text().then(function(t) {
+        assertEqual(t, 'some text', 'Request.text()');
+    });
+}).then(function() {
+    var u8 = new Uint8Array([1, 2, 3, 4]);
+    var reqAb = new Request('https://example.com', { method: 'POST', body: u8 });
+    return reqAb.arrayBuffer().then(function(ab) {
+        var view = new Uint8Array(ab);
+        assertEqual(view.length, 4, 'Request.arrayBuffer() length');
+        assertEqual(view[0], 1, 'Request.arrayBuffer() byte 0');
+        assertEqual(view[3], 4, 'Request.arrayBuffer() byte 3');
+    });
+}).then(function() {
+    var reqBlob = new Request('https://example.com', { method: 'POST', body: 'blobby' });
+    return reqBlob.blob().then(function(b) {
+        assert(b instanceof Blob, 'Request.blob() returns Blob');
+        assertEqual(b.size, 6, 'Blob size is 6');
+    });
+}).then(function() {
+    // ── Request.clone() ──
+    var reqOrig = new Request('https://example.com/clone', { method: 'POST', body: 'clone me' });
+    var reqCloned = reqOrig.clone();
+    assert(!reqOrig.bodyUsed, 'original request not consumed after clone');
+    assert(!reqCloned.bodyUsed, 'cloned request not consumed');
+    return Promise.all([reqOrig.text(), reqCloned.text()]).then(function(results) {
+        assertEqual(results[0], 'clone me', 'original req text matches');
+        assertEqual(results[1], 'clone me', 'cloned req text matches');
+    });
+}).then(function() {
+    // ── Response.clone() with ReadableStream ──
+    var stream = new ReadableStream({
+        start: function(controller) {
+            controller.enqueue(new Uint8Array([10, 20, 30]));
+            controller.close();
+        }
+    });
+    var resp = new Response(stream, { status: 200, statusText: 'OK' });
+    var clonedResp = resp.clone();
+    assert(resp.body instanceof ReadableStream, 'resp.body is ReadableStream');
+    assert(clonedResp.body instanceof ReadableStream, 'clonedResp.body is ReadableStream');
+    return Promise.all([resp.arrayBuffer(), clonedResp.arrayBuffer()]).then(function(results) {
+        var v1 = new Uint8Array(results[0]);
+        var v2 = new Uint8Array(results[1]);
+        assertEqual(v1.length, 3, 'resp stream read length');
+        assertEqual(v2.length, 3, 'clonedResp stream read length');
+        assertEqual(v1[1], 20, 'resp byte 1');
+        assertEqual(v2[1], 20, 'clonedResp byte 1');
+    });
 }).catch(function(e) {
     assert(false, 'test_fetch_classes failed: ' + (e && e.stack || e));
 });
