@@ -132,7 +132,10 @@
 
         var binary = false;
         var toSend = data;
-        if (data instanceof ArrayBuffer ||
+        if (data && (data._isBuffer || data._u8)) {
+            binary = true;
+            toSend = data._u8 || data;
+        } else if (data instanceof ArrayBuffer ||
             (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)) {
             binary = true;
         } else if (ArrayBuffer.isView(data)) {

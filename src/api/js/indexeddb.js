@@ -54,6 +54,110 @@
         return true;
     };
 
+    function _matchKey(query, val) {
+        if (query === undefined || query === null) return true;
+        if (query instanceof IDBKeyRange) return query.includes(val);
+        return val === query || String(val) === String(query);
+    }
+
+    // ── IDBCursor ────────────────────────────────────────────────────────────
+
+    function IDBCursor(source, direction, request, items, isIndex) {
+        this.source = source;
+        this.direction = direction || 'next';
+        this.request = request;
+        this._items = items;
+        this._index = 0;
+        this._isIndex = !!isIndex;
+        this._updatePos();
+    }
+
+    IDBCursor.prototype._updatePos = function() {
+        if (this._index < this._items.length) {
+            var item = this._items[this._index];
+            this.key = item.key;
+            this.primaryKey = item.primaryKey;
+        } else {
+            this.key = undefined;
+            this.primaryKey = undefined;
+        }
+    };
+
+    IDBCursor.prototype.continue = function(key) {
+        var cursor = this;
+        var req = cursor.request;
+        req.readyState = 'pending';
+        queueMicrotask(function() {
+            if (key !== undefined) {
+                while (cursor._index < cursor._items.length) {
+                    cursor._index++;
+                    if (cursor._index < cursor._items.length) {
+                        var k = cursor._items[cursor._index].key;
+                        var cmp = cmpKeys(k, key);
+                        if (cursor.direction.indexOf('prev') === 0 ? cmp <= 0 : cmp >= 0) break;
+                    }
+                }
+            } else {
+                cursor._index++;
+            }
+            if (cursor._index < cursor._items.length) {
+                cursor._updatePos();
+                req._resolve(cursor);
+            } else {
+                req._resolve(null);
+            }
+        });
+    };
+
+    IDBCursor.prototype.advance = function(count) {
+        if (typeof count !== 'number' || count <= 0) throw new TypeError('Count must be a positive number');
+        var cursor = this;
+        var req = cursor.request;
+        req.readyState = 'pending';
+        queueMicrotask(function() {
+            cursor._index += count;
+            if (cursor._index < cursor._items.length) {
+                cursor._updatePos();
+                req._resolve(cursor);
+            } else {
+                req._resolve(null);
+            }
+        });
+    };
+
+    IDBCursor.prototype.update = function(value) {
+        if (!this.source || this._index >= this._items.length) {
+            throw new DOMException('The cursor is not positioned on a record', 'InvalidStateError');
+        }
+        var store = this._isIndex ? this.source.objectStore : this.source;
+        return store.put(value, this.primaryKey);
+    };
+
+    IDBCursor.prototype.delete = function() {
+        if (!this.source || this._index >= this._items.length) {
+            throw new DOMException('The cursor is not positioned on a record', 'InvalidStateError');
+        }
+        var store = this._isIndex ? this.source.objectStore : this.source;
+        return store.delete(this.primaryKey);
+    };
+
+    // ── IDBCursorWithValue ───────────────────────────────────────────────────
+
+    function IDBCursorWithValue(source, direction, request, items, isIndex) {
+        IDBCursor.call(this, source, direction, request, items, isIndex);
+    }
+    IDBCursorWithValue.prototype = Object.create(IDBCursor.prototype);
+    IDBCursorWithValue.prototype.constructor = IDBCursorWithValue;
+
+    Object.defineProperty(IDBCursorWithValue.prototype, 'value', {
+        get: function() {
+            if (this._index < this._items.length) {
+                return this._items[this._index].value;
+            }
+            return undefined;
+        }
+    });
+
     // ── IDBRequest ───────────────────────────────────────────────────────────
 
     function IDBRequest() {
@@ -252,6 +356,116 @@
                 } catch (e) {}
             }
             queueMicrotask(function() { req._resolve(count); });
+        } catch (e) {
+            queueMicrotask(function() { req._reject(e); });
+        }
+        return req;
+    };
+
+    IDBIndex.prototype.openCursor = function(query, direction) {
+        var req = new IDBRequest();
+        req.source = this;
+        req.transaction = this.objectStore ? this.objectStore.transaction : null;
+        var dir = direction || 'next';
+        var dbName = this.objectStore ? this.objectStore._dbName : '';
+        var storeName = this.objectStore ? this.objectStore.name : '';
+        var keyPath = this.keyPath;
+        var self = this;
+
+        try {
+            var pairs = globalThis.__brokit_idb_get_all(dbName, storeName, 0) || [];
+            var items = [];
+            for (var i = 0; i < pairs.length; i++) {
+                var pk = pairs[i][0];
+                var obj = undefined;
+                try { obj = JSON.parse(pairs[i][1]); } catch (e) {}
+                if (obj && obj[keyPath] !== undefined) {
+                    var idxKey = obj[keyPath];
+                    if (_matchKey(query, idxKey)) {
+                        items.push({ key: idxKey, primaryKey: pk, value: obj });
+                    }
+                }
+            }
+            items.sort(function(a, b) {
+                var c = cmpKeys(a.key, b.key);
+                return c !== 0 ? c : cmpKeys(a.primaryKey, b.primaryKey);
+            });
+            if (dir === 'prev' || dir === 'prevunique') items.reverse();
+            if (dir === 'nextunique' || dir === 'prevunique') {
+                var uniq = [];
+                var lastKey = undefined;
+                for (var j = 0; j < items.length; j++) {
+                    if (j === 0 || cmpKeys(items[j].key, lastKey) !== 0) {
+                        uniq.push(items[j]);
+                        lastKey = items[j].key;
+                    }
+                }
+                items = uniq;
+            }
+
+            queueMicrotask(function() {
+                if (items.length > 0) {
+                    var cursor = new IDBCursorWithValue(self, dir, req, items, true);
+                    req._resolve(cursor);
+                } else {
+                    req._resolve(null);
+                }
+            });
+        } catch (e) {
+            queueMicrotask(function() { req._reject(e); });
+        }
+        return req;
+    };
+
+    IDBIndex.prototype.openKeyCursor = function(query, direction) {
+        var req = new IDBRequest();
+        req.source = this;
+        req.transaction = this.objectStore ? this.objectStore.transaction : null;
+        var dir = direction || 'next';
+        var dbName = this.objectStore ? this.objectStore._dbName : '';
+        var storeName = this.objectStore ? this.objectStore.name : '';
+        var keyPath = this.keyPath;
+        var self = this;
+
+        try {
+            var pairs = globalThis.__brokit_idb_get_all(dbName, storeName, 0) || [];
+            var items = [];
+            for (var i = 0; i < pairs.length; i++) {
+                var pk = pairs[i][0];
+                var obj = undefined;
+                try { obj = JSON.parse(pairs[i][1]); } catch (e) {}
+                if (obj && obj[keyPath] !== undefined) {
+                    var idxKey = obj[keyPath];
+                    if (_matchKey(query, idxKey)) {
+                        items.push({ key: idxKey, primaryKey: pk, value: undefined });
+                    }
+                }
+            }
+            items.sort(function(a, b) {
+                var c = cmpKeys(a.key, b.key);
+                return c !== 0 ? c : cmpKeys(a.primaryKey, b.primaryKey);
+            });
+            if (dir === 'prev' || dir === 'prevunique') items.reverse();
+            if (dir === 'nextunique' || dir === 'prevunique') {
+                var uniq = [];
+                var lastKey = undefined;
+                for (var j = 0; j < items.length; j++) {
+                    if (j === 0 || cmpKeys(items[j].key, lastKey) !== 0) {
+                        uniq.push(items[j]);
+                        lastKey = items[j].key;
+                    }
+                }
+                items = uniq;
+            }
+
+            queueMicrotask(function() {
+                if (items.length > 0) {
+                    var cursor = new IDBCursor(self, dir, req, items, true);
+                    req._resolve(cursor);
+                } else {
+                    req._resolve(null);
+                }
+            });
         } catch (e) {
             queueMicrotask(function() { req._reject(e); });
         }
@@ -515,6 +729,92 @@
         return req;
     };
 
+    IDBObjectStore.prototype.openCursor = function(query, direction) {
+        var req = new IDBRequest();
+        req.source = this;
+        req.transaction = this.transaction;
+        var dir = direction || 'next';
+        var self = this;
+        try {
+            var pairs = globalThis.__brokit_idb_get_all(this._dbName, this.name, 0) || [];
+            var items = [];
+            for (var i = 0; i < pairs.length; i++) {
+                var pk = pairs[i][0];
+                var val = undefined;
+                try { val = JSON.parse(pairs[i][1]); } catch (e) { val = pairs[i][1]; }
+                var effectiveKey = (val && self.keyPath && val[self.keyPath] !== undefined) ? val[self.keyPath] : pk;
+                if (_matchKey(query, effectiveKey)) {
+                    items.push({ key: effectiveKey, primaryKey: pk, value: val });
+                }
+            }
+            items.sort(function(a, b) {
+                var c = cmpKeys(a.key, b.key);
+                return c !== 0 ? c : cmpKeys(a.primaryKey, b.primaryKey);
+            });
+            if (dir === 'prev' || dir === 'prevunique') items.reverse();
+            if (dir === 'nextunique' || dir === 'prevunique') {
+                var uniq = [];
+                var lastKey = undefined;
+                for (var j = 0; j < items.length; j++) {
+                    if (j === 0 || cmpKeys(items[j].key, lastKey) !== 0) {
+                        uniq.push(items[j]);
+                        lastKey = items[j].key;
+                    }
+                }
+                items = uniq;
+            }
+            queueMicrotask(function() {
+                req._resolve(items.length > 0 ? new IDBCursorWithValue(self, dir, req, items, false) : null);
+            });
+        } catch (e) {
+            queueMicrotask(function() { req._reject(e); });
+        }
+        return req;
+    };
+
+    IDBObjectStore.prototype.openKeyCursor = function(query, direction) {
+        var req = new IDBRequest();
+        req.source = this;
+        req.transaction = this.transaction;
+        var dir = direction || 'next';
+        var self = this;
+        try {
+            var pairs = globalThis.__brokit_idb_get_all(this._dbName, this.name, 0) || [];
+            var items = [];
+            for (var i = 0; i < pairs.length; i++) {
+                var pk = pairs[i][0];
+                var val = undefined;
+                try { val = JSON.parse(pairs[i][1]); } catch (e) { val = pairs[i][1]; }
+                var effectiveKey = (val && self.keyPath && val[self.keyPath] !== undefined) ? val[self.keyPath] : pk;
+                if (_matchKey(query, effectiveKey)) {
+                    items.push({ key: effectiveKey, primaryKey: pk, value: undefined });
+                }
+            }
+            items.sort(function(a, b) {
+                var c = cmpKeys(a.key, b.key);
+                return c !== 0 ? c : cmpKeys(a.primaryKey, b.primaryKey);
+            });
+            if (dir === 'prev' || dir === 'prevunique') items.reverse();
+            if (dir === 'nextunique' || dir === 'prevunique') {
+                var uniq = [];
+                var lastKey = undefined;
+                for (var j = 0; j < items.length; j++) {
+                    if (j === 0 || cmpKeys(items[j].key, lastKey) !== 0) {
+                        uniq.push(items[j]);
+                        lastKey = items[j].key;
+                    }
+                }
+                items = uniq;
+            }
+            queueMicrotask(function() {
+                req._resolve(items.length > 0 ? new IDBCursor(self, dir, req, items, false) : null);
+            });
+        } catch (e) {
+            queueMicrotask(function() { req._reject(e); });
+        }
+        return req;
+    };
+
     // ── IDBTransaction ───────────────────────────────────────────────────────
 
     function IDBTransaction(db, storeNames, mode) {
@@ -547,6 +847,7 @@
             var undo = this._undoLog.pop();
             try { undo(); } catch (e) {}
         }
+        this._undoLog = [];
     };
 
     IDBTransaction.prototype.objectStore = function(name) {
@@ -558,6 +859,7 @@
         this._aborted = true;
         this._completed = true;
         if (err) this.error = err;
+        else if (!this.error) this.error = new DOMException('The transaction was aborted.', 'AbortError');
         this._rollback();
         var self = this;
         queueMicrotask(function() {
@@ -676,5 +978,7 @@
     globalThis.IDBTransaction = IDBTransaction;
     globalThis.IDBObjectStore = IDBObjectStore;
     globalThis.IDBIndex = IDBIndex;
+    globalThis.IDBCursor = IDBCursor;
+    globalThis.IDBCursorWithValue = IDBCursorWithValue;
     globalThis.IDBKeyRange = IDBKeyRange;
 })();

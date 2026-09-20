@@ -43,7 +43,12 @@ static bool fillRandom(uint8_t* buf, size_t len)
 static bronze::Value getRandomValues(bronze::Value, std::span<const bronze::Value> a)
 {
     if (a.empty()) return ev::throwTypeError("crypto.getRandomValues: expected TypedArray");
-    auto info = ev::typedArrayInfo(a[0]);
+    bronze::Value arg = a[0];
+    if (ev::isObject(arg)) {
+        bronze::Value u8 = ev::getProperty(arg, "_u8");
+        if (ev::isObject(u8)) arg = u8;
+    }
+    auto info = ev::typedArrayInfo(arg);
     if (!info) return ev::throwTypeError("crypto.getRandomValues: expected TypedArray");
     if (info.byteLength > 65536) {
         return ev::throwRangeError("crypto.getRandomValues: quota exceeded (max 65536 bytes)");

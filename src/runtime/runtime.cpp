@@ -14,6 +14,8 @@
 #include <fstream>
 #include <sstream>
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -57,6 +59,15 @@ ModuleHandle openModule(const std::string& path, std::string& error) {
 #endif
 }
 
+void closeModule(ModuleHandle handle) {
+    if (!handle) return;
+#ifdef _WIN32
+    ::FreeLibrary(reinterpret_cast<HMODULE>(handle));
+#else
+    ::dlclose(handle);
+#endif
+}
+
 void* moduleSymbol(ModuleHandle handle, const char* name) {
 #ifdef _WIN32
     return reinterpret_cast<void*>(
@@ -67,11 +78,17 @@ void* moduleSymbol(ModuleHandle handle, const char* name) {
 }
 
 static std::atomic<uint64_t> g_evalCounter{1};
+static std::vector<ModuleHandle> g_loadedModules;
+static std::vector<std::string> g_tempSos;
+static std::atomic<int> g_activeRuntimes{0};
+static std::mutex g_moduleMutex;
 
 } // namespace
 
 Runtime::Runtime()
 {
+    g_activeRuntimes.fetch_add(1, std::memory_order_relaxed);
+
     // Try to find default brokit.globals
     for (const auto& candidate : {
         fs::current_path() / "src/api/brokit.globals",
@@ -87,6 +104,19 @@ Runtime::Runtime()
 
 Runtime::~Runtime()
 {
+    if (g_activeRuntimes.fetch_sub(1, std::memory_order_relaxed) == 1) {
+        std::lock_guard<std::mutex> lock(g_moduleMutex);
+        for (auto h : g_loadedModules) {
+            closeModule(h);
+        }
+        g_loadedModules.clear();
+
+        std::error_code ec;
+        for (const auto& f : g_tempSos) {
+            fs::remove(f, ec);
+        }
+        g_tempSos.clear();
+    }
 }
 
 bool Runtime::loadModule(const std::string& modulePath)
@@ -98,9 +128,22 @@ bool Runtime::loadModule(const std::string& modulePath)
         return false;
     }
 
+    fs::path p(modulePath);
+    std::error_code ec;
+    fs::path scratchDir = fs::temp_directory_path() / "brokit_build";
+    if (fs::equivalent(p.parent_path(), scratchDir, ec)) {
+#ifndef _WIN32
+        fs::remove(p, ec);
+#else
+        std::lock_guard<std::mutex> lock(g_moduleMutex);
+        g_tempSos.push_back(p.string());
+#endif
+    }
+
     const auto* moduleAbi = static_cast<const uint32_t*>(moduleSymbol(handle, kFingerprintSymbol));
     if (!moduleAbi) {
         log(LogLevel::Error, "%s exports no %s (not a bronze module)", modulePath.c_str(), kFingerprintSymbol);
+        closeModule(handle);
         return false;
     }
 
@@ -108,13 +151,20 @@ bool Runtime::loadModule(const std::string& modulePath)
     if (*moduleAbi != kRuntimeAbi) {
         log(LogLevel::Error, "%s compiled against bronze ABI %08x, but runtime speaks %08x",
             modulePath.c_str(), *moduleAbi, kRuntimeAbi);
+        closeModule(handle);
         return false;
     }
 
     auto entry = reinterpret_cast<void (*)()>(moduleSymbol(handle, kEntrySymbol));
     if (!entry) {
         log(LogLevel::Error, "%s carries bronze ABI stamp but exports no %s", modulePath.c_str(), kEntrySymbol);
+        closeModule(handle);
         return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_moduleMutex);
+        g_loadedModules.push_back(handle);
     }
 
     bronze::embed::runEntry(entry);
@@ -196,7 +246,12 @@ bool Runtime::eval(const std::string& code, const std::string& filename)
     out << code;
     out.close();
 
-    return loadFile(tempJs.string());
+    bool ok = loadFile(tempJs.string());
+
+    std::error_code ec;
+    fs::remove(tempJs, ec);
+
+    return ok;
 }
 
 bool Runtime::evalModule(const std::string& code, const std::string& filename)

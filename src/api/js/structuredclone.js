@@ -126,6 +126,24 @@
             return arrClone;
         }
 
+        // File (checked before Blob since File extends Blob)
+        if (typeof File !== 'undefined' && value instanceof File) {
+            var fileClone = new File([value], value.name, {
+                type: value.type,
+                lastModified: value.lastModified,
+                webkitRelativePath: value.webkitRelativePath
+            });
+            seen.push({ src: value, dst: fileClone });
+            return fileClone;
+        }
+
+        // Blob
+        if (typeof Blob !== 'undefined' && value instanceof Blob) {
+            var blobClone = new Blob([value], { type: value.type });
+            seen.push({ src: value, dst: blobClone });
+            return blobClone;
+        }
+
         // Plain object
         var objClone = {};
         seen.push({ src: value, dst: objClone });

@@ -127,6 +127,10 @@ static bool parseAlgorithm(bronze::Value algo, AlgorithmInfo& out) {
 // ---------------------------------------------------------------------------
 
 static bool getBytes(bronze::Value val, std::vector<uint8_t>& out) {
+    if (ev::isObject(val)) {
+        bronze::Value u8 = ev::getProperty(val, "_u8");
+        if (ev::isObject(u8)) val = u8;
+    }
     if (auto info = ev::typedArrayInfo(val)) {
         out.assign(info.data, info.data + info.byteLength);
         return true;
@@ -926,6 +930,40 @@ static bronze::Value subtleExportKey(bronze::Value, std::span<const bronze::Valu
     return rejectPromise("exportKey: only 'raw' format supported");
 }
 
+static bronze::Value rejectNotSupported(const char* method) {
+    ev::Persistent p{ev::createPromise()};
+    bronze::Value domEx = ev::getGlobal("DOMException");
+    bronze::Value err;
+    std::string msg = std::string("SubtleCrypto.") + method + " is not supported";
+    if (ev::isFunction(domEx)) {
+        std::array<bronze::Value, 2> args = { ev::fromUtf8(msg), ev::fromUtf8("NotSupportedError") };
+        auto res = ev::construct(domEx, args);
+        err = res.value;
+    } else {
+        auto errRes = ev::construct(ev::getGlobal("Error"),
+            std::array<bronze::Value, 1>{ev::fromUtf8(msg)});
+        err = errRes.value;
+    }
+    ev::rejectPromise(p.get(), err);
+    return p.get();
+}
+
+static bronze::Value subtleDeriveKey(bronze::Value, std::span<const bronze::Value>) {
+    return rejectNotSupported("deriveKey");
+}
+
+static bronze::Value subtleDeriveBits(bronze::Value, std::span<const bronze::Value>) {
+    return rejectNotSupported("deriveBits");
+}
+
+static bronze::Value subtleWrapKey(bronze::Value, std::span<const bronze::Value>) {
+    return rejectNotSupported("wrapKey");
+}
+
+static bronze::Value subtleUnwrapKey(bronze::Value, std::span<const bronze::Value>) {
+    return rejectNotSupported("unwrapKey");
+}
+
 void installSubtleCrypto() {
     bronze::Value crypto = ev::getGlobal("crypto");
     if (!ev::isObject(crypto)) {
@@ -942,6 +980,10 @@ void installSubtleCrypto() {
     subtle.def("encrypt", 3, subtleEncrypt);
     subtle.def("decrypt", 3, subtleDecrypt);
     subtle.def("exportKey", 2, subtleExportKey);
+    subtle.def("deriveKey", 5, subtleDeriveKey);
+    subtle.def("deriveBits", 3, subtleDeriveBits);
+    subtle.def("wrapKey", 4, subtleWrapKey);
+    subtle.def("unwrapKey", 5, subtleUnwrapKey);
 
     ev::setProperty(crypto, "subtle", subtle.get());
 }

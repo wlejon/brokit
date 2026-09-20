@@ -8,37 +8,58 @@
 (function () {
     var internals = {};
 
+    function ensureResponsePrototype(resp) {
+        if (typeof Response === 'function' && Response.prototype) {
+            Object.setPrototypeOf(resp, Response.prototype);
+        }
+    }
+
+    internals.applyResponsePrototype = ensureResponsePrototype;
+
     // Build a Headers-like object from a plain {name: value} dictionary.
     internals.headers = function (entries) {
+        if (typeof Headers === 'function') {
+            return new Headers(entries);
+        }
         var obj = {
             get: function (name) { return entries[name.toLowerCase()] || null; },
             has: function (name) { return entries[name.toLowerCase()] !== undefined; },
-            forEach: function (cb) {
+            set: function (name, value) { entries[name.toLowerCase()] = String(value); },
+            append: function (name, value) {
+                var k = name.toLowerCase();
+                if (entries[k] !== undefined) entries[k] += ', ' + String(value);
+                else entries[k] = String(value);
+            },
+            delete: function (name) { delete entries[name.toLowerCase()]; },
+            forEach: function (cb, thisArg) {
                 var keys = Object.keys(entries);
-                for (var i = 0; i < keys.length; i++) cb(entries[keys[i]], keys[i], this);
+                for (var i = 0; i < keys.length; i++) cb.call(thisArg, entries[keys[i]], keys[i], this);
             },
             entries: function () {
                 var keys = Object.keys(entries); var i = 0;
                 return { next: function () {
-                    if (i >= keys.length) return { done: true };
+                    if (i >= keys.length) return { done: true, value: undefined };
                     var k = keys[i++]; return { done: false, value: [k, entries[k]] };
                 }, [Symbol.iterator]: function () { return this; } };
             },
             keys: function () {
                 var keys = Object.keys(entries); var i = 0;
                 return { next: function () {
-                    if (i >= keys.length) return { done: true };
+                    if (i >= keys.length) return { done: true, value: undefined };
                     return { done: false, value: keys[i++] };
                 }, [Symbol.iterator]: function () { return this; } };
             },
             values: function () {
                 var keys = Object.keys(entries); var i = 0;
                 return { next: function () {
-                    if (i >= keys.length) return { done: true };
+                    if (i >= keys.length) return { done: true, value: undefined };
                     return { done: false, value: entries[keys[i++]] };
                 }, [Symbol.iterator]: function () { return this; } };
             }
         };
+        if (typeof Headers !== 'undefined' && Headers.prototype) {
+            Object.setPrototypeOf(obj, Headers.prototype);
+        }
         obj[Symbol.iterator] = obj.entries;
         return obj;
     };
@@ -61,6 +82,7 @@
 
     // Decorate a Response object that represents a missing local file (404).
     internals.applyNotFoundBody = function (resp) {
+        ensureResponsePrototype(resp);
         resp.bodyUsed = false;
         resp.body = null;
         resp.text = function () { return Promise.resolve(''); };
@@ -79,6 +101,7 @@
     // Decorate a Response object backed by a fully-loaded local file body
     // (already attached as `resp.__body`, an ArrayBuffer).
     internals.applyFileBody = function (resp) {
+        ensureResponsePrototype(resp);
         resp.bodyUsed = false;
         // `body` is a ReadableStream over the bytes, not null. A response that
         // HAS a body and reports `body === null` reads as "bodyless" to any
@@ -118,6 +141,7 @@
     // Pulls chunks from `__brokit_fetch_stream_read(streamId)` and uses
     // `__brokit_fetch_stream_wait` to suspend until more data arrives.
     internals.applyStreamingBody = function (resp) {
+        ensureResponsePrototype(resp);
         var streamId = resp.__streamId;
 
         resp.body = new ReadableStream({
@@ -213,6 +237,7 @@
     // is the complete ArrayBuffer). The `.body` ReadableStream replays the
     // buffer once, so no native chunk queue is required.
     internals.applyCompleteBody = function (resp) {
+        ensureResponsePrototype(resp);
         resp.bodyUsed = false;
 
         var bodyBuf = resp.__body;

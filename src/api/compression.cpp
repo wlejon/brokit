@@ -171,7 +171,12 @@ static bronze::Value codecPush(bronze::Value thisVal, std::span<const bronze::Va
     if (st->closed) return ev::throwTypeError("codec is closed");
 
     if (a.empty()) return ev::throwTypeError("push() expects a chunk");
-    auto info = ev::typedArrayInfo(a[0]);
+    bronze::Value chunk = a[0];
+    if (ev::isObject(chunk)) {
+        bronze::Value u8 = ev::getProperty(chunk, "_u8");
+        if (ev::isObject(u8)) chunk = u8;
+    }
+    auto info = ev::typedArrayInfo(chunk);
     if (!info) return ev::throwTypeError("push() expects a TypedArray");
 
     const uint8_t* inPtr = info.data;

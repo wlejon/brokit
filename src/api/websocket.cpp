@@ -162,6 +162,10 @@ static bronze::Value js_ws_send(bronze::Value, std::span<const bronze::Value> ar
     CURLcode rc = CURLE_OK;
 
     if (binary) {
+        if (ev::isObject(dataVal)) {
+            bronze::Value u8 = ev::getProperty(dataVal, "_u8");
+            if (ev::isObject(u8)) dataVal = u8;
+        }
         const uint8_t* blobData = nullptr;
         size_t blobLen = 0;
         if (auto info = ev::typedArrayInfo(dataVal)) {

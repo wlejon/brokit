@@ -7,6 +7,8 @@
 #include <span>
 #include <string>
 
+#include <memory>
+
 namespace brokit::api {
 
 namespace ev = bronze::embed;
@@ -15,8 +17,8 @@ using Value = bronze::Value;
 class HostClass {
 public:
     struct Slots {
-        ev::Persistent* proto = nullptr;
-        ev::Persistent* ctor = nullptr;
+        std::unique_ptr<ev::Persistent> proto;
+        std::unique_ptr<ev::Persistent> ctor;
     };
 
     void install(const char* name, uint32_t arity, ev::NativeFn body,

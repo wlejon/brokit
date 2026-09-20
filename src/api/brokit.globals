@@ -38,6 +38,7 @@ MessageEvent
 DOMException
 structuredClone
 TextEncoder
+TextEncoderStream
 TextDecoder
 TextDecoderStream
 ReadableStream
