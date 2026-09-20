@@ -125,8 +125,13 @@ async function testKeyRoundtrip() {
 }
 
 // Run all async tests
-testDigest();
-testHMAC();
-testGenerateKey();
-testAESGCM();
-testKeyRoundtrip();
+(async function() {
+    await testDigest();
+    await testHMAC();
+    await testGenerateKey();
+    await testAESGCM();
+    await testKeyRoundtrip();
+})().catch(function(e) {
+    assert(false, 'test_crypto_subtle failed: ' + (e && e.stack || e));
+});
+

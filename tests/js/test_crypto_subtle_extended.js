@@ -335,4 +335,7 @@
         aadKey, aadCt
     );
     assertEqual(new TextDecoder().decode(aadPt), 'cbc plaintext data', 'AES-GCM with AAD round-trip');
-})();
+})().catch(function(e) {
+    assert(false, 'test_crypto_subtle_extended rejected: ' + (e && e.stack || e));
+});
+

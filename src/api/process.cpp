@@ -201,10 +201,7 @@ void installProcess() {
         process.set("stderr", stderrObj.get());
     }
 
-    process.def("on", 2, [](Value thisValue, std::span<const Value>) { return thisValue; });
-    process.def("addListener", 2, [](Value thisValue, std::span<const Value>) { return thisValue; });
-    process.def("removeListener", 2, [](Value thisValue, std::span<const Value>) { return thisValue; });
-    process.def("emit", 1, [](Value, std::span<const Value>) { return ev::fromBool(true); });
+
 
     ev::registerGlobal("process", process.get());
     auto g = ev::globalValue("globalThis");

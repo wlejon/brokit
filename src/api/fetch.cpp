@@ -848,13 +848,13 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
         }
 
         bronze::Value bodyVal = ev::getProperty(opt, "body");
-        if (ev::isString(bodyVal)) {
-            std::string body = ev::toUtf8(bodyVal);
-            req->requestBody.assign(body.begin(), body.end());
-        } else if (auto info = ev::typedArrayInfo(bodyVal)) {
+        if (auto info = ev::typedArrayInfo(bodyVal)) {
             req->requestBody.assign(info.data, info.data + info.byteLength);
         } else if (auto info = ev::arrayBufferInfo(bodyVal)) {
             req->requestBody.assign(info.data, info.data + info.byteLength);
+        } else if (ev::isString(bodyVal)) {
+            std::string body = ev::toUtf8(bodyVal);
+            req->requestBody.assign(body.begin(), body.end());
         }
 
         if (req->requestHeaders) {

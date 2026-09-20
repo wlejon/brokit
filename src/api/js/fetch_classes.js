@@ -331,62 +331,70 @@
         return boundary;
     }
 
-    // Serialize FormData to multipart/form-data string
-    // Returns { body: string, contentType: string }
-    // For File/Blob entries, synchronously extracts bytes via the native
-    // C++ blob storage (arrayBuffer resolves immediately).
+    // Serialize FormData to multipart/form-data byte buffer
+    // Returns Promise<{ body: Uint8Array, contentType: string }>
+    // For File/Blob entries, extracts raw bytes without String.fromCharCode / UTF-8 conversion.
     function serializeFormData(fd) {
         var boundary = generateBoundary();
-        var parts = [];
+        var encoder = new TextEncoder();
+        var items = [];
 
         fd.forEach(function(value, name) {
             if (value instanceof File) {
-                // Binary file — encode bytes as latin1 string for transport
                 var header = '--' + boundary + '\r\n' +
                     'Content-Disposition: form-data; name="' + name + '"; filename="' + value.name + '"\r\n' +
                     'Content-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n';
-                parts.push({ header: header, file: value });
+                items.push({ header: encoder.encode(header), file: value });
             } else if (value instanceof Blob) {
                 var header = '--' + boundary + '\r\n' +
                     'Content-Disposition: form-data; name="' + name + '"; filename="blob"\r\n' +
                     'Content-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n';
-                parts.push({ header: header, file: value });
+                items.push({ header: encoder.encode(header), file: value });
             } else {
-                parts.push({
-                    text: '--' + boundary + '\r\n' +
-                        'Content-Disposition: form-data; name="' + name + '"\r\n\r\n' +
-                        String(value) + '\r\n'
-                });
+                var header = '--' + boundary + '\r\n' +
+                    'Content-Disposition: form-data; name="' + name + '"\r\n\r\n';
+                var valBytes = encoder.encode(String(value));
+                items.push({ header: encoder.encode(header), data: valBytes });
             }
         });
 
-        // If no blob/file entries, can return synchronously
-        var hasFiles = parts.some(function(p) { return p.file; });
+        var crlf = new Uint8Array([13, 10]);
+        var footer = encoder.encode('--' + boundary + '--\r\n');
         var contentType = 'multipart/form-data; boundary=' + boundary;
 
-        if (!hasFiles) {
-            var body = '';
-            for (var i = 0; i < parts.length; i++) body += parts[i].text;
-            body += '--' + boundary + '--\r\n';
-            return Promise.resolve({ body: body, contentType: contentType });
-        }
-
-        // Has files — need to await arrayBuffer() calls
-        var promises = parts.map(function(part) {
-            if (part.text) return Promise.resolve(part.text);
-            return part.file.arrayBuffer().then(function(ab) {
-                var bytes = new Uint8Array(ab);
-                var str = '';
-                for (var i = 0; i < bytes.length; i++) {
-                    str += String.fromCharCode(bytes[i]);
-                }
-                return part.header + str + '\r\n';
+        var promises = items.map(function(item) {
+            if (item.data) {
+                return Promise.resolve([item.header, item.data, crlf]);
+            }
+            return item.file.arrayBuffer().then(function(ab) {
+                return [item.header, new Uint8Array(ab), crlf];
             });
         });
 
-        return Promise.all(promises).then(function(resolved) {
-            return { body: resolved.join('') + '--' + boundary + '--\r\n', contentType: contentType };
+        return Promise.all(promises).then(function(chunksArray) {
+            var totalLen = footer.length;
+            for (var i = 0; i < chunksArray.length; i++) {
+                var triplet = chunksArray[i];
+                totalLen += triplet[0].length + triplet[1].length + triplet[2].length;
+            }
+            var result = new Uint8Array(totalLen);
+            var offset = 0;
+            for (var i = 0; i < chunksArray.length; i++) {
+                var triplet = chunksArray[i];
+                result.set(triplet[0], offset);
+                offset += triplet[0].length;
+                result.set(triplet[1], offset);
+                offset += triplet[1].length;
+                result.set(triplet[2], offset);
+                offset += triplet[2].length;
+            }
+            result.set(footer, offset);
+            return { body: result, contentType: contentType };
         });
+    }
+
+    if (typeof globalThis.FormData !== 'undefined') {
+        globalThis.FormData._serialize = serializeFormData;
     }
 
     // -----------------------------------------------------------------------

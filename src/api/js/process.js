@@ -49,4 +49,137 @@
 
     // process.emitWarning — no-op
     process.emitWarning = function() {};
+
+    // Event emitter semantics for process
+    var _events = Object.create(null);
+    var _maxListeners = 10;
+    process._events = _events;
+
+    process.addListener = function(event, listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('The "listener" argument must be of type Function');
+        }
+        var key = String(event);
+        if (!_events[key]) {
+            _events[key] = [];
+        }
+        _events[key].push(listener);
+        return process;
+    };
+    process.on = process.addListener;
+
+    process.prependListener = function(event, listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('The "listener" argument must be of type Function');
+        }
+        var key = String(event);
+        if (!_events[key]) {
+            _events[key] = [];
+        }
+        _events[key].unshift(listener);
+        return process;
+    };
+
+    process.once = function(event, listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('The "listener" argument must be of type Function');
+        }
+        var g = function() {
+            process.removeListener(event, g);
+            listener.apply(process, arguments);
+        };
+        g.listener = listener;
+        return process.addListener(event, g);
+    };
+
+    process.prependOnceListener = function(event, listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('The "listener" argument must be of type Function');
+        }
+        var g = function() {
+            process.removeListener(event, g);
+            listener.apply(process, arguments);
+        };
+        g.listener = listener;
+        return process.prependListener(event, g);
+    };
+
+    process.removeListener = function(event, listener) {
+        if (typeof listener !== 'function') {
+            throw new TypeError('The "listener" argument must be of type Function');
+        }
+        var key = String(event);
+        var list = _events[key];
+        if (!list) return process;
+        for (var i = list.length - 1; i >= 0; i--) {
+            if (list[i] === listener || list[i].listener === listener) {
+                list.splice(i, 1);
+                break;
+            }
+        }
+        if (list.length === 0) {
+            delete _events[key];
+        }
+        return process;
+    };
+    process.off = process.removeListener;
+
+    process.removeAllListeners = function(event) {
+        if (event === undefined) {
+            _events = Object.create(null);
+            process._events = _events;
+        } else {
+            delete _events[String(event)];
+        }
+        return process;
+    };
+
+    process.emit = function(event) {
+        var key = String(event);
+        var list = _events[key];
+        var args = Array.prototype.slice.call(arguments, 1);
+        if (!list || list.length === 0) {
+            if (key === 'error') {
+                var err = args[0];
+                if (err instanceof Error) throw err;
+                throw new Error(err !== undefined ? String(err) : 'Unhandled error.');
+            }
+            return false;
+        }
+        var copy = list.slice();
+        for (var i = 0; i < copy.length; i++) {
+            copy[i].apply(process, args);
+        }
+        return true;
+    };
+
+    process.listeners = function(event) {
+        var list = _events[String(event)];
+        if (!list) return [];
+        return list.map(function(fn) { return fn.listener || fn; });
+    };
+
+    process.rawListeners = function(event) {
+        var list = _events[String(event)];
+        if (!list) return [];
+        return list.slice();
+    };
+
+    process.listenerCount = function(event) {
+        var list = _events[String(event)];
+        return list ? list.length : 0;
+    };
+
+    process.eventNames = function() {
+        return Object.keys(_events);
+    };
+
+    process.setMaxListeners = function(n) {
+        _maxListeners = n;
+        return process;
+    };
+
+    process.getMaxListeners = function() {
+        return _maxListeners;
+    };
 })();

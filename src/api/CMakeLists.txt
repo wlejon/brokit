@@ -171,7 +171,11 @@ target_link_libraries(brokit_api PUBLIC Threads::Threads)
 # net.cpp — raw TCP/UDP sockets need Winsock on Windows.
 if(WIN32)
     target_link_libraries(brokit_api PUBLIC ws2_32)
+else()
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(brokit_api PUBLIC OpenSSL::Crypto)
 endif()
 if(APPLE)
     target_link_libraries(brokit_api PUBLIC "-framework CoreServices" "-framework CoreFoundation")
 endif()
+

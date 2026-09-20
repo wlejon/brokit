@@ -229,3 +229,38 @@ var reqFd = new Request('https://example.com/upload', {
     body: fd
 });
 assert(reqFd._body instanceof FormData, 'Request preserves FormData body');
+
+bodyTests = bodyTests.then(function() {
+    assert(typeof FormData._serialize === 'function', 'FormData._serialize function exists');
+    var fdBin = new FormData();
+    var allBytes = new Uint8Array(256);
+    for (var i = 0; i < 256; i++) allBytes[i] = i;
+    var binFile = new File([allBytes], 'binary.bin', { type: 'application/octet-stream' });
+    fdBin.append('upload', binFile);
+    fdBin.append('name', 'test_binary');
+
+    return FormData._serialize(fdBin).then(function(res) {
+        assert(res.body instanceof Uint8Array, 'serialized body is Uint8Array');
+        assert(res.contentType.indexOf('multipart/form-data; boundary=') === 0, 'content-type is multipart');
+
+        // Check that all 256 bytes are present sequentially in the Uint8Array
+        var bodyBytes = res.body;
+        var found = false;
+        for (var i = 0; i <= bodyBytes.length - 256; i++) {
+            var match = true;
+            for (var j = 0; j < 256; j++) {
+                if (bodyBytes[i + j] !== j) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                found = true;
+                break;
+            }
+        }
+        assert(found, 'binary payload preserved intact with no byte corruption or UTF-8 expansion');
+    });
+}).catch(function(e) {
+    assert(false, 'test_fetch_classes failed: ' + (e && e.stack || e));
+});

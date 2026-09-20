@@ -81,3 +81,38 @@ assertEqual(process.stderr.fd, 2, 'process.stderr.fd is 2');
 // process.emitWarning — no-op, should not throw
 assert(typeof process.emitWarning === 'function', 'process.emitWarning exists');
 process.emitWarning('test warning');
+
+// process event emitter
+assert(typeof process.on === 'function', 'process.on exists');
+assert(typeof process.addListener === 'function', 'process.addListener exists');
+assert(typeof process.removeListener === 'function', 'process.removeListener exists');
+assert(typeof process.emit === 'function', 'process.emit exists');
+assert(typeof process.once === 'function', 'process.once exists');
+assert(typeof process.off === 'function', 'process.off exists');
+
+var eventFired = 0;
+var eventArgs = [];
+function handler(arg1, arg2) {
+    eventFired++;
+    eventArgs = [arg1, arg2];
+}
+
+process.on('custom_event', handler);
+assertEqual(process.listenerCount('custom_event'), 1, 'listenerCount 1');
+assertEqual(process.emit('custom_event', 'foo', 42), true, 'emit returns true');
+assertEqual(eventFired, 1, 'handler called once');
+assertEqual(eventArgs[0], 'foo', 'arg1 matches');
+assertEqual(eventArgs[1], 42, 'arg2 matches');
+
+var onceFired = 0;
+process.once('single_event', function(val) {
+    onceFired += val;
+});
+process.emit('single_event', 10);
+process.emit('single_event', 20);
+assertEqual(onceFired, 10, 'once handler called only once');
+
+process.removeListener('custom_event', handler);
+assertEqual(process.listenerCount('custom_event'), 0, 'listenerCount 0 after removeListener');
+assertEqual(process.emit('custom_event', 'bar', 99), false, 'emit on event with no listeners returns false');
+assertEqual(eventFired, 1, 'handler not called after removeListener');

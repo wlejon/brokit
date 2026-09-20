@@ -16,6 +16,7 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#include <openssl/evp.h>
 #endif
 
 namespace brokit::api {
@@ -149,8 +150,9 @@ static bronze::Value resolvePromise(bronze::Value result) {
 
 static bronze::Value rejectPromise(const char* msg) {
     ev::Persistent p{ev::createPromise()};
-    bronze::Value err = ev::throwTypeError(msg);
-    ev::rejectPromise(p.get(), err);
+    auto errRes = ev::construct(ev::getGlobal("Error"),
+        std::array<bronze::Value, 1>{ev::fromUtf8(msg)});
+    ev::rejectPromise(p.get(), errRes.value);
     return p.get();
 }
 
@@ -317,18 +319,225 @@ static bool bcryptDecrypt(const std::string&,
 }
 
 #else
-static bool bcryptDigest(const std::string&, const uint8_t*, size_t,
-                         std::vector<uint8_t>&) { return false; }
-static bool bcryptHMAC(const std::string&, const uint8_t*, size_t,
-                       const uint8_t*, size_t, std::vector<uint8_t>&) { return false; }
-static bool bcryptEncrypt(const std::string&, const uint8_t*, size_t,
-                          const uint8_t*, size_t, const uint8_t*, size_t,
-                          const uint8_t*, size_t, std::vector<uint8_t>&,
-                          std::vector<uint8_t>&) { return false; }
-static bool bcryptDecrypt(const std::string&, const uint8_t*, size_t,
-                          const uint8_t*, size_t, const uint8_t*, size_t,
-                          const uint8_t*, size_t, const uint8_t*, size_t,
-                          std::vector<uint8_t>&) { return false; }
+
+static const EVP_MD* opensslDigestMd(const std::string& hash) {
+    std::string h = hash;
+    for (char& c : h) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (h == "SHA-256" || h == "SHA256") return EVP_sha256();
+    if (h == "SHA-384" || h == "SHA384") return EVP_sha384();
+    if (h == "SHA-512" || h == "SHA512") return EVP_sha512();
+    if (h == "SHA-1"   || h == "SHA1")   return EVP_sha1();
+    return nullptr;
+}
+
+static bool bcryptDigest(const std::string& algorithm,
+                         const uint8_t* data, size_t dataLen,
+                         std::vector<uint8_t>& out) {
+    const EVP_MD* md = opensslDigestMd(algorithm);
+    if (!md) return false;
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+
+    if (EVP_DigestInit_ex(ctx, md, nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+    if (EVP_DigestUpdate(ctx, data, dataLen) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    out.resize(static_cast<size_t>(EVP_MD_size(md)));
+    unsigned int outLen = 0;
+    if (EVP_DigestFinal_ex(ctx, out.data(), &outLen) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+    out.resize(outLen);
+    EVP_MD_CTX_free(ctx);
+    return true;
+}
+
+static bool bcryptHMAC(const std::string& hashAlg,
+                       const uint8_t* key, size_t keyLen,
+                       const uint8_t* data, size_t dataLen,
+                       std::vector<uint8_t>& out) {
+    const EVP_MD* md = opensslDigestMd(hashAlg);
+    if (!md) return false;
+
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_HMAC, nullptr, key, keyLen);
+    if (!pkey) return false;
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    if (EVP_DigestSignInit(ctx, nullptr, md, nullptr, pkey) != 1) {
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    if (EVP_DigestSignUpdate(ctx, data, dataLen) != 1) {
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    size_t reqLen = 0;
+    if (EVP_DigestSignFinal(ctx, nullptr, &reqLen) != 1) {
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    out.resize(reqLen);
+    if (EVP_DigestSignFinal(ctx, out.data(), &reqLen) != 1) {
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    out.resize(reqLen);
+
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return true;
+}
+
+static bool bcryptEncrypt(const std::string& algo,
+                          const uint8_t* key, size_t keyLen,
+                          const uint8_t* iv, size_t ivLen,
+                          const uint8_t* data, size_t dataLen,
+                          const uint8_t* aad, size_t aadLen,
+                          std::vector<uint8_t>& out,
+                          std::vector<uint8_t>& tag) {
+    if (algo != "AES-GCM") return false;
+
+    const EVP_CIPHER* cipher = nullptr;
+    if (keyLen == 16) cipher = EVP_aes_128_gcm();
+    else if (keyLen == 24) cipher = EVP_aes_192_gcm();
+    else if (keyLen == 32) cipher = EVP_aes_256_gcm();
+    else return false;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+
+    if (EVP_EncryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(ivLen), nullptr) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    int len = 0;
+    if (aad && aadLen > 0) {
+        if (EVP_EncryptUpdate(ctx, nullptr, &len, aad, static_cast<int>(aadLen)) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+    }
+
+    out.resize(dataLen);
+    if (dataLen > 0) {
+        if (EVP_EncryptUpdate(ctx, out.data(), &len, data, static_cast<int>(dataLen)) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+    }
+    int ciphertextLen = len;
+
+    if (EVP_EncryptFinal_ex(ctx, out.data() + ciphertextLen, &len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    ciphertextLen += len;
+    out.resize(static_cast<size_t>(ciphertextLen));
+
+    tag.resize(16);
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    return true;
+}
+
+static bool bcryptDecrypt(const std::string& algo,
+                          const uint8_t* key, size_t keyLen,
+                          const uint8_t* iv, size_t ivLen,
+                          const uint8_t* data, size_t dataLen,
+                          const uint8_t* aad, size_t aadLen,
+                          const uint8_t* tagIn, size_t tagLen,
+                          std::vector<uint8_t>& out) {
+    if (algo != "AES-GCM") return false;
+
+    const EVP_CIPHER* cipher = nullptr;
+    if (keyLen == 16) cipher = EVP_aes_128_gcm();
+    else if (keyLen == 24) cipher = EVP_aes_192_gcm();
+    else if (keyLen == 32) cipher = EVP_aes_256_gcm();
+    else return false;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+
+    if (EVP_DecryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(ivLen), nullptr) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    int len = 0;
+    if (aad && aadLen > 0) {
+        if (EVP_DecryptUpdate(ctx, nullptr, &len, aad, static_cast<int>(aadLen)) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+    }
+
+    out.resize(dataLen);
+    if (dataLen > 0) {
+        if (EVP_DecryptUpdate(ctx, out.data(), &len, data, static_cast<int>(dataLen)) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+    }
+    int plaintextLen = len;
+
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(tagLen), const_cast<uint8_t*>(tagIn)) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+
+    int ret = EVP_DecryptFinal_ex(ctx, out.data() + plaintextLen, &len);
+    EVP_CIPHER_CTX_free(ctx);
+
+    if (ret <= 0) {
+        return false;
+    }
+    plaintextLen += len;
+    out.resize(static_cast<size_t>(plaintextLen));
+    return true;
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -361,15 +570,44 @@ static bronze::Value subtleDigest(bronze::Value, std::span<const bronze::Value> 
 // subtle.importKey(format, keyData, algorithm, extractable, keyUsages)
 // ---------------------------------------------------------------------------
 
+static bool base64urlDecode(const std::string& in, std::vector<uint8_t>& out) {
+    std::string b64 = in;
+    for (char& c : b64) {
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+    }
+    while (b64.size() % 4 != 0) b64.push_back('=');
+    static const int8_t kLookup[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+    };
+    out.clear();
+    out.reserve((b64.size() / 4) * 3);
+    for (size_t i = 0; i + 3 < b64.size(); i += 4) {
+        int8_t v0 = kLookup[static_cast<uint8_t>(b64[i])];
+        int8_t v1 = kLookup[static_cast<uint8_t>(b64[i + 1])];
+        int8_t v2 = (b64[i + 2] == '=') ? 0 : kLookup[static_cast<uint8_t>(b64[i + 2])];
+        int8_t v3 = (b64[i + 3] == '=') ? 0 : kLookup[static_cast<uint8_t>(b64[i + 3])];
+        if (v0 < 0 || v1 < 0 || (b64[i + 2] != '=' && v2 < 0) || (b64[i + 3] != '=' && v3 < 0)) return false;
+        uint32_t triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+        out.push_back(static_cast<uint8_t>((triple >> 16) & 0xFF));
+        if (b64[i + 2] != '=') out.push_back(static_cast<uint8_t>((triple >> 8) & 0xFF));
+        if (b64[i + 3] != '=') out.push_back(static_cast<uint8_t>(triple & 0xFF));
+    }
+    return true;
+}
+
 static bronze::Value subtleImportKey(bronze::Value, std::span<const bronze::Value> a) {
     if (a.size() < 5) return rejectPromise("importKey requires format, keyData, algorithm, extractable, keyUsages");
 
     if (!ev::isString(a[0])) return rejectPromise("importKey: format must be string");
     std::string format = ev::toUtf8(a[0]);
-
-    std::vector<uint8_t> keyBytes;
-    if (!getBytes(a[1], keyBytes))
-        return rejectPromise("importKey: keyData must be ArrayBuffer or TypedArray");
 
     AlgorithmInfo algo;
     if (!parseAlgorithm(a[2], algo))
@@ -379,6 +617,30 @@ static bronze::Value subtleImportKey(bronze::Value, std::span<const bronze::Valu
     uint32_t usages = parseUsages(a[4]);
 
     if (format == "raw") {
+        std::vector<uint8_t> keyBytes;
+        if (!getBytes(a[1], keyBytes))
+            return rejectPromise("importKey: keyData must be ArrayBuffer or TypedArray");
+
+        auto* key = new CryptoKeyData();
+        key->rawKey = std::move(keyBytes);
+        key->algorithm = algo.name;
+        key->hash = algo.hash;
+        key->extractable = extractable;
+        key->usages = usages;
+        return resolvePromise(makeCryptoKeyJS(key));
+    }
+
+    if (format == "jwk") {
+        if (!ev::isObject(a[1]))
+            return rejectPromise("importKey: keyData must be an object for JWK");
+        bronze::Value kVal = ev::getProperty(a[1], "k");
+        std::vector<uint8_t> keyBytes;
+        if (ev::isString(kVal)) {
+            std::string kStr = ev::toUtf8(kVal);
+            if (!kStr.empty()) {
+                base64urlDecode(kStr, keyBytes);
+            }
+        }
         auto* key = new CryptoKeyData();
         key->rawKey = std::move(keyBytes);
         key->algorithm = algo.name;
@@ -561,6 +823,15 @@ static bronze::Value subtleEncrypt(bronze::Value, std::span<const bronze::Value>
                            aad.empty() ? nullptr : aad.data(), aad.size(),
                            ciphertext, tag))
             return rejectPromise("encrypt: AES-GCM failed");
+
+        int tagLen = 16;
+        bronze::Value tlVal = ev::getProperty(a[0], "tagLength");
+        if (ev::isDouble(tlVal)) {
+            tagLen = static_cast<int>(ev::toDouble(tlVal)) / 8;
+        }
+        if (tagLen > 0 && tagLen < static_cast<int>(tag.size())) {
+            tag.resize(static_cast<size_t>(tagLen));
+        }
 
         std::vector<uint8_t> result;
         result.reserve(ciphertext.size() + tag.size());
