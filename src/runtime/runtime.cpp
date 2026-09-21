@@ -19,6 +19,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -77,6 +78,20 @@ void* moduleSymbol(ModuleHandle handle, const char* name) {
 
 static std::atomic<uint64_t> g_evalCounter{1};
 static std::atomic<bool> g_scratchSwept{false};
+
+// Scratch names carry the process id as well as the counter: every process
+// counts from one, and the scratch directory is shared, so two bro processes
+// running side by side used to write the same eval_1.js and then fail to
+// overwrite eval_1_2.dll while the other still had it mapped.
+std::string scratchTag(uint64_t id)
+{
+#ifdef _WIN32
+    const unsigned long pid = ::GetCurrentProcessId();
+#else
+    const unsigned long pid = static_cast<unsigned long>(::getpid());
+#endif
+    return std::to_string(pid) + "_" + std::to_string(id);
+}
 
 // A compiled image stays mapped for the life of the process (see the note on
 // closeModule), so on Windows the temporary .dll behind it cannot be deleted
@@ -205,13 +220,13 @@ bool Runtime::loadFile(const std::string& path)
         guard.emplace(absPath.parent_path());
     }
 
-    uint64_t id = g_evalCounter.fetch_add(1, std::memory_order_relaxed);
+    const std::string tag = scratchTag(g_evalCounter.fetch_add(1, std::memory_order_relaxed));
 #ifdef _WIN32
-    fs::path outSo = scratchDir / (p.stem().string() + "_" + std::to_string(id) + ".dll");
+    fs::path outSo = scratchDir / (p.stem().string() + "_" + tag + ".dll");
 #elif defined(__APPLE__)
-    fs::path outSo = scratchDir / (p.stem().string() + "_" + std::to_string(id) + ".dylib");
+    fs::path outSo = scratchDir / (p.stem().string() + "_" + tag + ".dylib");
 #else
-    fs::path outSo = scratchDir / (p.stem().string() + "_" + std::to_string(id) + ".so");
+    fs::path outSo = scratchDir / (p.stem().string() + "_" + tag + ".so");
 #endif
 
     std::string err;
@@ -243,8 +258,8 @@ bool Runtime::eval(const std::string& code, const std::string& filename)
     fs::path scratchDir = fs::temp_directory_path() / "brokit_build";
     fs::create_directories(scratchDir);
 
-    uint64_t id = g_evalCounter.fetch_add(1, std::memory_order_relaxed);
-    fs::path tempJs = scratchDir / ("eval_" + std::to_string(id) + ".js");
+    fs::path tempJs = scratchDir /
+        ("eval_" + scratchTag(g_evalCounter.fetch_add(1, std::memory_order_relaxed)) + ".js");
 
     std::ofstream out(tempJs, std::ios::out | std::ios::binary);
     if (!out) {

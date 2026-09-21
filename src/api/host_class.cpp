@@ -9,9 +9,14 @@ namespace brokit::api {
 
 namespace {
 
+// The slot table is deliberately never destroyed. Its Slots hold Persistent
+// handles into the bronze heap, and a thread_local with a destructor runs it
+// at process exit after the runtime has already been torn down: releasing
+// the handles then wrote through a null runtime pointer on every exit. The
+// classes live for the whole process, so the table can as well.
 std::unordered_map<const HostClass*, HostClass::Slots>& threadSlots() {
-    static thread_local std::unordered_map<const HostClass*, HostClass::Slots> t;
-    return t;
+    static thread_local auto* t = new std::unordered_map<const HostClass*, HostClass::Slots>();
+    return *t;
 }
 
 } // namespace
