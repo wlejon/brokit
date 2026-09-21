@@ -12,14 +12,38 @@
     MessagePort.prototype = Object.create(EventTarget.prototype);
     MessagePort.prototype.constructor = MessagePort;
 
-    MessagePort.prototype.postMessage = function(data) {
+    MessagePort.prototype.postMessage = function(data, transferOrOptions) {
         var other = this._otherPort;
         if (!other) return;
-        var msg = { data: typeof structuredClone === 'function' ? structuredClone(data) : data };
+
+        var transferList = [];
+        if (transferOrOptions) {
+            if (Array.isArray(transferOrOptions)) {
+                transferList = transferOrOptions;
+            } else if (Array.isArray(transferOrOptions.transfer)) {
+                transferList = transferOrOptions.transfer;
+            }
+        }
+
+        var clonedData;
+        if (typeof structuredClone === 'function') {
+            clonedData = structuredClone(data, transferList.length > 0 ? { transfer: transferList } : undefined);
+        } else {
+            clonedData = data;
+        }
+
+        var transferredPorts = [];
+        for (var pi = 0; pi < transferList.length; pi++) {
+            if (typeof MessagePort !== 'undefined' && transferList[pi] instanceof MessagePort) {
+                transferredPorts.push(transferList[pi]);
+            }
+        }
+
+        var msg = { data: clonedData, ports: transferredPorts };
         if (other._started) {
             var port = other;
             queueMicrotask(function() {
-                var event = new MessageEvent('message', { data: msg.data });
+                var event = new MessageEvent('message', { data: msg.data, ports: msg.ports });
                 if (typeof port.onmessage === 'function') port.onmessage(event);
                 port.dispatchEvent(event);
             });
@@ -38,7 +62,7 @@
         for (var i = 0; i < queued.length; i++) {
             (function(msg) {
                 queueMicrotask(function() {
-                    var event = new MessageEvent('message', { data: msg.data });
+                    var event = new MessageEvent('message', { data: msg.data, ports: msg.ports || [] });
                     if (typeof port.onmessage === 'function') port.onmessage(event);
                     port.dispatchEvent(event);
                 });

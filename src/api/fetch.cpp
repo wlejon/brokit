@@ -34,6 +34,11 @@ struct FetchRequest {
 
     std::vector<uint8_t> requestBody;
     struct curl_slist* requestHeaders = nullptr;
+    std::string mode = "cors";
+    std::string credentials = "same-origin";
+    std::string cache = "default";
+    std::string redirect = "follow";
+    std::string referrer;
 
     int streamId = 0;
     bool headersResolved = false;
@@ -815,6 +820,50 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
 
     if (args.size() >= 2 && ev::isObject(args[1])) {
         bronze::Value opt = args[1];
+
+        bronze::Value mVal = ev::getProperty(opt, "mode");
+        if (ev::isString(mVal)) {
+            std::string m = ev::toUtf8(mVal);
+            if (m != "cors" && m != "no-cors" && m != "same-origin" && m != "navigate")
+                return ev::throwTypeError("fetch: invalid mode '" + m + "'");
+            req->mode = m;
+        }
+        bronze::Value cVal = ev::getProperty(opt, "credentials");
+        if (ev::isString(cVal)) {
+            std::string c = ev::toUtf8(cVal);
+            if (c != "omit" && c != "same-origin" && c != "include")
+                return ev::throwTypeError("fetch: invalid credentials '" + c + "'");
+            req->credentials = c;
+            if (c == "omit") curl_easy_setopt(req->easy, CURLOPT_COOKIE, nullptr);
+        }
+        bronze::Value caVal = ev::getProperty(opt, "cache");
+        if (ev::isString(caVal)) {
+            std::string ca = ev::toUtf8(caVal);
+            if (ca != "default" && ca != "no-store" && ca != "reload" && ca != "no-cache" &&
+                ca != "force-cache" && ca != "only-if-cached")
+                return ev::throwTypeError("fetch: invalid cache '" + ca + "'");
+            req->cache = ca;
+            if (ca == "no-store" || ca == "reload") curl_easy_setopt(req->easy, CURLOPT_FRESH_CONNECT, 1L);
+        }
+        bronze::Value rVal = ev::getProperty(opt, "redirect");
+        if (ev::isString(rVal)) {
+            std::string r = ev::toUtf8(rVal);
+            if (r != "follow" && r != "error" && r != "manual")
+                return ev::throwTypeError("fetch: invalid redirect '" + r + "'");
+            req->redirect = r;
+            if (r == "error" || r == "manual") curl_easy_setopt(req->easy, CURLOPT_FOLLOWLOCATION, 0L);
+        }
+        bronze::Value refVal = ev::getProperty(opt, "referrer");
+        if (ev::isUndefined(refVal)) refVal = ev::getProperty(opt, "referer");
+        if (ev::isString(refVal)) {
+            req->referrer = ev::toUtf8(refVal);
+            if (!req->referrer.empty() && req->referrer != "no-referrer") {
+                curl_easy_setopt(req->easy, CURLOPT_REFERER, req->referrer.c_str());
+            } else if (req->referrer == "no-referrer") {
+                curl_easy_setopt(req->easy, CURLOPT_REFERER, nullptr);
+            }
+        }
+
         bronze::Value methodVal = ev::getProperty(opt, "method");
         if (ev::isString(methodVal)) {
             std::string method = ev::toUtf8(methodVal);

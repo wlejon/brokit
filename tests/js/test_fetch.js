@@ -58,3 +58,37 @@ fetch('https://httpbin.org/response-headers?X-Test=hello')
     .catch(function(err) {
         assert(true, 'headers test skipped (network): ' + err.message);
     });
+
+// Options validation
+var threwInvalidMode = false;
+try {
+    fetch('http://localhost/test', { mode: 'invalid_mode' });
+} catch (e) {
+    threwInvalidMode = true;
+}
+assert(threwInvalidMode, 'fetch rejects invalid mode');
+
+var threwInvalidCredentials = false;
+try {
+    fetch('http://localhost/test', { credentials: 'invalid_creds' });
+} catch (e) {
+    threwInvalidCredentials = true;
+}
+assert(threwInvalidCredentials, 'fetch rejects invalid credentials');
+
+var threwInvalidCache = false;
+try {
+    fetch('http://localhost/test', { cache: 'invalid_cache' });
+} catch (e) {
+    threwInvalidCache = true;
+}
+assert(threwInvalidCache, 'fetch rejects invalid cache');
+
+var threwInvalidRedirect = false;
+try {
+    fetch('http://localhost/test', { redirect: 'invalid_redirect' });
+} catch (e) {
+    threwInvalidRedirect = true;
+}
+assert(threwInvalidRedirect, 'fetch rejects invalid redirect');
+

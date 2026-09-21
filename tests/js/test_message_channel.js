@@ -58,3 +58,15 @@ ch5.port1.postMessage('queued2');
 // Not started yet — messages are queued
 ch5.port2.onmessage = function(e) { queuedData.push(e.data); };
 ch5.port2.start(); // should drain queue
+
+// --- Transfer ArrayBuffer ---
+var ch6 = new MessageChannel();
+var transferredData;
+ch6.port2.onmessage = function(e) { transferredData = e.data; };
+ch6.port2.start();
+var abMsg = new ArrayBuffer(16);
+var u8Msg = new Uint8Array(abMsg);
+u8Msg[0] = 77;
+ch6.port1.postMessage(abMsg, [abMsg]);
+assert(abMsg.detached === true || abMsg.byteLength === 0, 'postMessage detached ArrayBuffer');
+

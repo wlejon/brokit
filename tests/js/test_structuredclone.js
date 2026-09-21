@@ -109,3 +109,26 @@ assertEqual(threwOnFn, true, 'throws on function');
 var threwOnSym = false;
 try { structuredClone(Symbol('x')); } catch(e) { threwOnSym = true; }
 assertEqual(threwOnSym, true, 'throws on symbol');
+
+// --- Transfer options ---
+var abTransfer = new ArrayBuffer(8);
+var u8Transfer = new Uint8Array(abTransfer);
+u8Transfer[0] = 42; u8Transfer[7] = 99;
+var clonedWithTransfer = structuredClone(abTransfer, { transfer: [abTransfer] });
+assert(clonedWithTransfer instanceof ArrayBuffer, 'cloned transferred ArrayBuffer is ArrayBuffer');
+assertEqual(clonedWithTransfer.byteLength, 8, 'transferred ArrayBuffer byteLength preserved');
+var u8Cloned = new Uint8Array(clonedWithTransfer);
+assertEqual(u8Cloned[0], 42, 'transferred byte 0');
+assertEqual(u8Cloned[7], 99, 'transferred byte 7');
+assert(abTransfer.detached === true || abTransfer.byteLength === 0, 'original ArrayBuffer is detached');
+
+// --- Transfer duplicate throws ---
+var threwOnDup = false;
+var abDup = new ArrayBuffer(4);
+try {
+    structuredClone(abDup, { transfer: [abDup, abDup] });
+} catch (e) {
+    threwOnDup = true;
+}
+assertEqual(threwOnDup, true, 'throws on duplicate transfer');
+

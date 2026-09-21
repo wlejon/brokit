@@ -17,6 +17,21 @@
         'BigInt64Array', 'BigUint64Array'
     ];
 
+    function detachArrayBuffer(ab) {
+        if (typeof ab.transfer === 'function') {
+            return ab.transfer();
+        }
+        var copy = ab.slice(0);
+        try {
+            new Uint8Array(ab).fill(0);
+        } catch (e) {}
+        try {
+            Object.defineProperty(ab, 'byteLength', { value: 0 });
+            Object.defineProperty(ab, 'detached', { value: true });
+        } catch (e) {}
+        return copy;
+    }
+
     function cloneValue(value, seen) {
         // Primitives
         if (value === null || value === undefined) return value;
@@ -30,7 +45,7 @@
             throw new globalThis.DOMException('Functions cannot be cloned.', 'DataCloneError');
         }
 
-        // Circular reference check
+        // Circular reference / transfer check
         for (var i = 0; i < seen.length; i++) {
             if (seen[i].src === value) return seen[i].dst;
         }
@@ -61,6 +76,9 @@
 
         // ArrayBuffer
         if (value instanceof ArrayBuffer) {
+            if (value.detached) {
+                throw new globalThis.DOMException('Cannot clone detached ArrayBuffer', 'DataCloneError');
+            }
             var cloned = value.slice(0);
             seen.push({ src: value, dst: cloned });
             return cloned;
@@ -70,8 +88,18 @@
         for (var ti = 0; ti < TypedArrayTypes.length; ti++) {
             var TACtor = globalThis[TypedArrayTypes[ti]];
             if (TACtor && value instanceof TACtor) {
-                var abClone = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-                var taClone = new TACtor(abClone);
+                if (value.buffer && value.buffer.detached) {
+                    throw new globalThis.DOMException('Cannot clone TypedArray with detached buffer', 'DataCloneError');
+                }
+                var abTarget = null;
+                for (var si = 0; si < seen.length; si++) {
+                    if (seen[si].src === value.buffer) {
+                        abTarget = seen[si].dst;
+                        break;
+                    }
+                }
+                var abClone = abTarget ? abTarget : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+                var taClone = abTarget ? new TACtor(abClone, value.byteOffset, value.length) : new TACtor(abClone);
                 seen.push({ src: value, dst: taClone });
                 return taClone;
             }
@@ -79,8 +107,18 @@
 
         // DataView
         if (typeof DataView !== 'undefined' && value instanceof DataView) {
-            var dvBuf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
-            var dvClone = new DataView(dvBuf);
+            if (value.buffer && value.buffer.detached) {
+                throw new globalThis.DOMException('Cannot clone DataView with detached buffer', 'DataCloneError');
+            }
+            var abTargetDv = null;
+            for (var sdi = 0; sdi < seen.length; sdi++) {
+                if (seen[sdi].src === value.buffer) {
+                    abTargetDv = seen[sdi].dst;
+                    break;
+                }
+            }
+            var dvBuf = abTargetDv ? abTargetDv : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+            var dvClone = new DataView(dvBuf, abTargetDv ? value.byteOffset : 0, value.byteLength);
             seen.push({ src: value, dst: dvClone });
             return dvClone;
         }
@@ -154,7 +192,39 @@
         return objClone;
     }
 
-    globalThis.structuredClone = function structuredClone(value) {
-        return cloneValue(value, []);
+    globalThis.structuredClone = function structuredClone(value, options) {
+        var transferList = [];
+        if (options) {
+            if (Array.isArray(options)) {
+                transferList = options;
+            } else if (Array.isArray(options.transfer)) {
+                transferList = options.transfer;
+            }
+        }
+        var seen = [];
+        if (transferList.length > 0) {
+            for (var ti = 0; ti < transferList.length; ti++) {
+                for (var tj = ti + 1; tj < transferList.length; tj++) {
+                    if (transferList[ti] === transferList[tj]) {
+                        throw new globalThis.DOMException('Duplicate transferable in transfer list', 'DataCloneError');
+                    }
+                }
+            }
+            for (var i = 0; i < transferList.length; i++) {
+                var item = transferList[i];
+                if (item instanceof ArrayBuffer) {
+                    if (item.detached) {
+                        throw new globalThis.DOMException('Cannot transfer detached ArrayBuffer', 'DataCloneError');
+                    }
+                    var transferred = detachArrayBuffer(item);
+                    seen.push({ src: item, dst: transferred });
+                } else if (typeof MessagePort !== 'undefined' && item instanceof MessagePort) {
+                    seen.push({ src: item, dst: item });
+                } else {
+                    throw new globalThis.DOMException('Transfer list element is not transferable', 'DataCloneError');
+                }
+            }
+        }
+        return cloneValue(value, seen);
     };
 })();
