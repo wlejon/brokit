@@ -3,11 +3,12 @@
 #include "api/host_class.h"
 #include "api/object_builder.h"
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <vector>
-#include <algorithm>
-#include <cctype>
 
 #ifdef _WIN32
 #include <windows.h>
