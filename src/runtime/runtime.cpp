@@ -14,8 +14,6 @@
 #include <fstream>
 #include <sstream>
 #include <atomic>
-#include <mutex>
-#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -78,16 +76,36 @@ void* moduleSymbol(ModuleHandle handle, const char* name) {
 }
 
 static std::atomic<uint64_t> g_evalCounter{1};
-static std::vector<ModuleHandle> g_loadedModules;
-static std::vector<std::string> g_tempSos;
-static std::atomic<int> g_activeRuntimes{0};
-static std::mutex g_moduleMutex;
+static std::atomic<bool> g_scratchSwept{false};
+
+// A compiled image stays mapped for the life of the process (see the note on
+// closeModule), so on Windows the temporary .dll behind it cannot be deleted
+// while this process runs. Instead each process sweeps what earlier ones left
+// behind: anything in the scratch directory older than an hour is either an
+// orphan or still mapped by a long-running sibling, and a mapped file simply
+// refuses the remove. Files younger than that may belong to a sibling that is
+// between writing its image and loading it, so they are left alone.
+void sweepStaleScratch()
+{
+    if (g_scratchSwept.exchange(true, std::memory_order_acq_rel)) return;
+    std::error_code ec;
+    const fs::path scratchDir = fs::temp_directory_path(ec) / "brokit_build";
+    if (ec || !fs::is_directory(scratchDir, ec)) return;
+    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(1);
+    for (const auto& entry : fs::directory_iterator(scratchDir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        const auto stamp = entry.last_write_time(ec);
+        if (ec || stamp > cutoff) continue;
+        fs::remove(entry.path(), ec);
+    }
+}
 
 } // namespace
 
 Runtime::Runtime()
 {
-    g_activeRuntimes.fetch_add(1, std::memory_order_relaxed);
+    sweepStaleScratch();
 
     // Try to find default brokit.globals
     for (const auto& candidate : {
@@ -102,22 +120,14 @@ Runtime::Runtime()
     }
 }
 
-Runtime::~Runtime()
-{
-    if (g_activeRuntimes.fetch_sub(1, std::memory_order_relaxed) == 1) {
-        std::lock_guard<std::mutex> lock(g_moduleMutex);
-        for (auto h : g_loadedModules) {
-            closeModule(h);
-        }
-        g_loadedModules.clear();
-
-        std::error_code ec;
-        for (const auto& f : g_tempSos) {
-            fs::remove(f, ec);
-        }
-        g_tempSos.clear();
-    }
-}
+// A Runtime is a compile-and-load handle, not the owner of what it loaded:
+// require() builds one per module, evaluates the module through it and lets
+// it go, while every function the module defined lives on in the JS heap
+// pointing straight into the image. bronze's embed contract (embed.h, "THE
+// HOST MUST NEVER FreeLibrary/dlclose THE IMAGE") exists for exactly that
+// reason, and a destructor that unmapped the images turned the first call
+// into any required module into a jump to unmapped memory.
+Runtime::~Runtime() = default;
 
 bool Runtime::loadModule(const std::string& modulePath)
 {
@@ -128,18 +138,21 @@ bool Runtime::loadModule(const std::string& modulePath)
         return false;
     }
 
-    fs::path p(modulePath);
-    std::error_code ec;
-    fs::path scratchDir = fs::temp_directory_path() / "brokit_build";
-    if (fs::equivalent(p.parent_path(), scratchDir, ec)) {
+    // A scratch image is unlinked as soon as it is mapped where the platform
+    // allows it; Windows keeps the file pinned while mapped, and a later
+    // process sweeps it (sweepStaleScratch).
 #ifndef _WIN32
-        fs::remove(p, ec);
-#else
-        std::lock_guard<std::mutex> lock(g_moduleMutex);
-        g_tempSos.push_back(p.string());
-#endif
+    {
+        fs::path p(modulePath);
+        std::error_code ec;
+        fs::path scratchDir = fs::temp_directory_path() / "brokit_build";
+        if (fs::equivalent(p.parent_path(), scratchDir, ec)) fs::remove(p, ec);
     }
+#endif
 
+    // The three failure exits below unmap the image again: nothing has run
+    // from it yet, so nothing can be left pointing into it. Once runEntry has
+    // been called the image is permanent.
     const auto* moduleAbi = static_cast<const uint32_t*>(moduleSymbol(handle, kFingerprintSymbol));
     if (!moduleAbi) {
         log(LogLevel::Error, "%s exports no %s (not a bronze module)", modulePath.c_str(), kFingerprintSymbol);
@@ -160,11 +173,6 @@ bool Runtime::loadModule(const std::string& modulePath)
         log(LogLevel::Error, "%s carries bronze ABI stamp but exports no %s", modulePath.c_str(), kEntrySymbol);
         closeModule(handle);
         return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_moduleMutex);
-        g_loadedModules.push_back(handle);
     }
 
     bronze::embed::runEntry(entry);
