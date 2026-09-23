@@ -38,6 +38,11 @@ assert(sum > 0, 'getRandomValues produces non-zero bytes');
 var errName = null;
 try { crypto.getRandomValues(new Float32Array(4)); } catch (e) { errName = e.name; }
 assertEqual(errName, 'TypeMismatchError', 'getRandomValues refuses Float32Array');
+if (typeof Float16Array === 'function') {
+    errName = null;
+    try { crypto.getRandomValues(new Float16Array(4)); } catch (e) { errName = e.name; }
+    assertEqual(errName, 'TypeMismatchError', 'getRandomValues refuses Float16Array');
+}
 errName = null;
 try { crypto.getRandomValues(new Uint8Array(65537)); } catch (e) { errName = e.name; }
 assertEqual(errName, 'QuotaExceededError', 'getRandomValues quota');

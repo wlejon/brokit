@@ -53,7 +53,8 @@ static bronze::Value getRandomValues(bronze::Value, std::span<const bronze::Valu
     if (!info) return ev::throwTypeError("crypto.getRandomValues: expected TypedArray");
     // WebCrypto: only integer arrays (TypeMismatchError), at most 65536 bytes
     // (QuotaExceededError).
-    if (info.elementKind == elements::Float32 || info.elementKind == elements::Float64) {
+    if (info.elementKind == elements::Float16 || info.elementKind == elements::Float32 ||
+        info.elementKind == elements::Float64) {
         return throwDOMException("crypto.getRandomValues: the array must be an integer TypedArray",
                                  "TypeMismatchError");
     }
