@@ -11,8 +11,26 @@ namespace brokit::api {
 
 namespace {
 
+// Node's console formats through util.format: printf-style %s/%d/%i/%f/%j/%o/%O
+// substitution, and util.inspect for objects. The util module is looked up at
+// call time because installUtil runs after installConsole.
+bool formatWithUtil(std::span<const Value> args, std::string& out) {
+    auto reg = ev::globalValue("__brokit_modules");
+    if (!reg.found || !ev::isObject(reg.value)) return false;
+    ev::Persistent util{ev::getProperty(reg.value, "util")};
+    if (!ev::isObject(util.get())) return false;
+    ev::Persistent fmt{ev::getProperty(util.get(), "format")};
+    if (!ev::isFunction(fmt.get())) return false;
+    ev::CallResult r = ev::call(fmt.get(), util.get(), args);
+    if (r.thrown || !ev::isString(r.value)) return false;
+    out = ev::toUtf8(r.value);
+    return true;
+}
+
 std::string formatArgs(std::span<const Value> args) {
     std::string result;
+    if (formatWithUtil(args, result)) return result;
+    result.clear();
     for (size_t i = 0; i < args.size(); ++i) {
         if (i > 0) result += ' ';
         Value v = args[i];

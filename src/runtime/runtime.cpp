@@ -299,11 +299,24 @@ void Runtime::setLogCallback(LogCallback cb)
 
 void Runtime::log(LogLevel level, const char* fmt, ...)
 {
-    char buf[2048];
+    // Sized to the message: console.log of a large JSON blob must not be cut
+    // off at a fixed buffer.
+    char stackBuf[2048];
+    std::string heapBuf;
+    const char* buf = stackBuf;
     va_list args;
     va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_list args2;
+    va_copy(args2, args);
+    int n = vsnprintf(stackBuf, sizeof(stackBuf), fmt, args);
     va_end(args);
+    if (n >= static_cast<int>(sizeof(stackBuf))) {
+        heapBuf.resize(static_cast<size_t>(n) + 1);
+        vsnprintf(heapBuf.data(), heapBuf.size(), fmt, args2);
+        heapBuf.resize(static_cast<size_t>(n));
+        buf = heapBuf.c_str();
+    }
+    va_end(args2);
 
     if (logCallback_) {
         logCallback_(level, buf);
