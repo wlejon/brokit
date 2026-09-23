@@ -33,16 +33,55 @@ namespace brokit::api {
 
 // `data` points into the MOVING heap (embed.h's pointer contract): it is dead
 // after any allocating embed call, and reading an options object with
-// getProperty allocates. Each kernel therefore calls refresh() on its views
-// after its last option read and before it touches the bytes.
+// getProperty allocates. Each kernel therefore calls refreshViews() on its
+// views after its last option read and before it touches the bytes.
 struct TypedArrayView {
     uint8_t* data = nullptr;
     size_t   byte_len = 0;
     size_t   bpe = 0;
     ev::Persistent root;
 
-    void refresh() { data = ev::typedArrayInfo(root.get()).data; }
+    // False when the view no longer holds the bytes it was validated with:
+    // an option getter can run script that detaches its buffer
+    // (ArrayBuffer.prototype.transfer) or shrinks a resizable one, and the
+    // sizes checked earlier would then run past the end.
+    bool refresh() {
+        auto info = ev::typedArrayInfo(root.get());
+        if (!info.data || info.byteLength < byte_len) {
+            data = nullptr;
+            return false;
+        }
+        data = info.data;
+        return true;
+    }
 };
+
+// Refresh every view a kernel is about to touch; throws a TypeError naming
+// `fn` and answers false if any of them lost its bytes.
+static bool refreshViews(std::initializer_list<TypedArrayView*> views, const char* fn)
+{
+    for (TypedArrayView* v : views) {
+        if (!v->refresh()) {
+            ev::throwTypeError(std::string(fn) + ": a buffer was detached or shrunk during the call");
+            return false;
+        }
+    }
+    return true;
+}
+
+// `have` bytes hold dims[0] * dims[1] * ... elements of `elemBytes` each,
+// computed without overflow (three script int32s multiply past 2^64).
+static bool holdsElements(size_t have, std::initializer_list<int64_t> dims, size_t elemBytes)
+{
+    uint64_t cap = static_cast<uint64_t>(have) / elemBytes;
+    uint64_t product = 1;
+    for (int64_t d : dims) {
+        if (d < 0) return false;
+        if (d != 0 && product > cap / static_cast<uint64_t>(d)) return false;
+        product *= static_cast<uint64_t>(d);
+    }
+    return product <= cap;
+}
 
 static bool unpack_typed_array(bronze::Value val, const char* name, TypedArrayView* out)
 {
@@ -80,7 +119,7 @@ static bool get_prop_i32(bronze::Value obj, const char* key, int32_t* out, int32
         return true;
     }
     if (ev::isDouble(v)) {
-        *out = static_cast<int32_t>(ev::toDouble(v));
+        *out = saturateI32(ev::toDouble(v));
         return true;
     }
     return false;
@@ -138,13 +177,18 @@ static bronze::Value image_gradient(bronze::Value, std::span<const bronze::Value
     ArgReader reader(args);
     int32_t n = reader.getInt(1, 256);
     if (n < 2) return ev::throwRangeError("gradient: n must be >= 2");
+    // 4*n bytes are built host-side before the buffer is made.
+    constexpr int32_t kMaxGradientEntries = 1 << 24;
+    if (n > kMaxGradientEntries)
+        return ev::throwRangeError("gradient: n must be <= " + std::to_string(kMaxGradientEntries));
 
     // args[0] is read from the rooted span each time and each stop is rooted:
     // the "length" reads may allocate (property-key interning).
     bronze::Value lenVal = ev::getProperty(args[0], "length");
     if (!ev::isDouble(lenVal)) return ev::throwTypeError("gradient: stops must be an array");
-    uint32_t stop_count = static_cast<uint32_t>(ev::toDouble(lenVal));
+    uint32_t stop_count = saturateU32(ev::toDouble(lenVal));
     if (stop_count < 2) return ev::throwTypeError("gradient: need at least 2 stops");
+    if (stop_count > kMaxScriptList) return ev::throwRangeError("gradient: too many stops");
 
     std::vector<broimage::GradientStop> stops(stop_count);
     for (uint32_t i = 0; i < stop_count; i++) {
@@ -154,7 +198,7 @@ static bronze::Value image_gradient(bronze::Value, std::span<const bronze::Value
             return ev::throwTypeError("gradient: stop must be an array");
 
         bronze::Value lv = ev::getProperty(stop.get(), "length");
-        uint32_t slen = ev::isDouble(lv) ? static_cast<uint32_t>(ev::toDouble(lv)) : 0;
+        uint32_t slen = ev::isDouble(lv) ? saturateU32(ev::toDouble(lv)) : 0;
         if (slen < 4)
             return ev::throwTypeError("gradient: stop must be [t, r, g, b, a?]");
 
@@ -198,7 +242,12 @@ static bronze::Value image_alloc(bronze::Value, std::span<const bronze::Value> a
 
     std::string dtype = reader.getString(3, "float32");
 
-    size_t count = static_cast<size_t>(w) * static_cast<size_t>(h) * static_cast<size_t>(channels);
+    // Three int32s can overflow size_t, and a count past uint32 used to be
+    // truncated into a wrong-sized array.
+    const double countD = static_cast<double>(w) * h * channels;
+    if (countD > static_cast<double>(UINT32_MAX))
+        return ev::throwRangeError("alloc: w * h * channels is too large");
+    size_t count = static_cast<size_t>(countD);
     bronze::ElementKind kind;
     if (dtype == "float32")      { kind = elements::Float32;      }
     else if (dtype == "float64") { kind = elements::Float64;      }
@@ -247,7 +296,7 @@ static bronze::Value image_lookup(bronze::Value, std::span<const bronze::Value> 
     ScalarKind kind{};
     if (!probe_scalar_kind(args[1], &kind)) return ev::undefined();
 
-    dst.refresh(); src.refresh(); lut.refresh();
+    if (!refreshViews({&dst, &src, &lut}, "lookup")) return ev::undefined();
     if (kind.is_float && src.bpe == 4) {
         broimage::lookup_f32(
             reinterpret_cast<const float*>(src.data), static_cast<int>(n),
@@ -270,12 +319,17 @@ static bronze::Value image_lookup(bronze::Value, std::span<const bronze::Value> 
         float t = (v - lo_f) * inv_span;
         float fi = t * idx_max;
         int idx;
+        // NaN converted to int is undefined (INT_MIN in practice: an index
+        // far outside the LUT); it maps to entry 0, as in broimage::lookup_f32.
+        if (!(fi == fi)) fi = 0;
         if (wrap) {
             float lf = static_cast<float>(lut_n);
             fi = std::fmod(fi, lf);
+            if (!(fi == fi)) fi = 0;  // fmod(inf, n)
             if (fi < 0) fi += lf;
             idx = static_cast<int>(fi);
             if (idx >= static_cast<int>(lut_n)) idx = static_cast<int>(lut_n) - 1;
+            if (idx < 0) idx = 0;
         } else {
             if (fi < 0) fi = 0;
             if (fi > idx_max) fi = idx_max;
@@ -314,7 +368,7 @@ static bronze::Value image_reduce(bronze::Value, std::span<const bronze::Value> 
         if (!get_prop_i32(args[2], "stride", &stride, 1)) return ev::undefined();
         if (stride < 1) return ev::throwRangeError("reduce: stride must be >= 1");
     }
-    src.refresh();
+    if (!refreshViews({&src}, "reduce")) return ev::undefined();
     const size_t step = static_cast<size_t>(stride);
     const bool f32_path = (kind.is_float && src.bpe == 4);
     auto read_at = [&](size_t i) -> float {
@@ -367,7 +421,11 @@ static bronze::Value image_reduce(bronze::Value, std::span<const bronze::Value> 
         if (!get_prop_f64(args[2], "hi", &hi, 1)) return ev::undefined();
         if (bins < 1) return ev::throwRangeError("histogram: bins must be >= 1");
         if (hi <= lo) return ev::throwRangeError("histogram: hi must be > lo");
-        src.refresh();
+        // The counts are a host vector and then a JS buffer (256 MiB cap).
+        constexpr int32_t kMaxBins = 1 << 24;
+        if (bins > kMaxBins)
+            return ev::throwRangeError("histogram: bins must be <= " + std::to_string(kMaxBins));
+        if (!refreshViews({&src}, "reduce")) return ev::undefined();
 
         std::vector<uint32_t> counts(static_cast<size_t>(bins), 0);
         if (f32_path) {
@@ -380,8 +438,12 @@ static bronze::Value image_reduce(bronze::Value, std::span<const bronze::Value> 
             for (size_t i = 0; i < n; i += step) {
                 float v = read_at(i);
                 float t = (v - lo_f) * inv_span;
-                int idx = static_cast<int>(t * static_cast<float>(bins));
-                if (idx < 0 || idx >= bins) continue;
+                const float fi = t * static_cast<float>(bins);
+                // Range-checked as a float: NaN or a huge value would be
+                // undefined behaviour to convert.
+                if (!(fi >= 0.0f) || !(fi < static_cast<float>(bins))) continue;
+                int idx = static_cast<int>(fi);
+                if (idx >= bins) continue;
                 counts[idx]++;
             }
         }
@@ -415,26 +477,28 @@ static bronze::Value image_map(bronze::Value, std::span<const bronze::Value> arg
     const float* sp = nullptr;
     float* dp = nullptr;
     auto bytes = [&] {
-        src.refresh(); dst.refresh();
+        if (!refreshViews({&src, &dst}, "map")) return false;
         sp = reinterpret_cast<const float*>(src.data);
         dp = reinterpret_cast<float*>(dst.data);
+        return true;
     };
-    bytes();
+    if (!bytes()) return ev::undefined();
 
     if (op == "affine") {
         double a = 1, b = 0;
         if (!get_prop_f64(args[2], "a", &a, 1)) return ev::undefined();
         if (!get_prop_f64(args[2], "b", &b, 0)) return ev::undefined();
-        bronze::Value cv = ev::getProperty(args[2], "clamp");
-        bool clamp = ev::isObject(cv);
+        // Rooted: the first element read allocates before the second.
+        ev::Persistent cv{ev::getProperty(args[2], "clamp")};
+        bool clamp = ev::isObject(cv.get());
         float clo = 0, chi = 0;
         if (clamp) {
-            clo = static_cast<float>(ev::toDouble(ev::getElement(cv, 0)));
-            chi = static_cast<float>(ev::toDouble(ev::getElement(cv, 1)));
-            bytes();
+            clo = static_cast<float>(ev::toDouble(ev::getElement(cv.get(), 0)));
+            chi = static_cast<float>(ev::toDouble(ev::getElement(cv.get(), 1)));
+            if (!bytes()) return ev::undefined();
             broimage::map_affine_clamp_f32(sp, dp, n, static_cast<float>(a), static_cast<float>(b), clo, chi);
         } else {
-            bytes();
+            if (!bytes()) return ev::undefined();
             broimage::map_affine_f32(sp, dp, n, static_cast<float>(a), static_cast<float>(b));
         }
         return ev::undefined();
@@ -446,7 +510,7 @@ static bronze::Value image_map(bronze::Value, std::span<const bronze::Value> arg
     if (op == "pow") {
         double e = 1;
         if (!get_prop_f64(args[2], "exp", &e, 1)) return ev::undefined();
-        bytes();
+        if (!bytes()) return ev::undefined();
         broimage::map_pow_f32(sp, dp, n, static_cast<float>(e));
         return ev::undefined();
     }
@@ -480,12 +544,13 @@ static bronze::Value image_combine(bronze::Value, std::span<const bronze::Value>
     const float* bp = nullptr;
     float* dp = nullptr;
     auto bytes = [&] {
-        va.refresh(); vb.refresh(); dst.refresh();
+        if (!refreshViews({&va, &vb, &dst}, "combine")) return false;
         ap = reinterpret_cast<const float*>(va.data);
         bp = reinterpret_cast<const float*>(vb.data);
         dp = reinterpret_cast<float*>(dst.data);
+        return true;
     };
-    bytes();
+    if (!bytes()) return ev::undefined();
 
     if (op == "add") { broimage::combine_add_f32(ap, bp, dp, n); return ev::undefined(); }
     if (op == "sub") { broimage::combine_sub_f32(ap, bp, dp, n); return ev::undefined(); }
@@ -495,7 +560,7 @@ static bronze::Value image_combine(bronze::Value, std::span<const bronze::Value>
     if (op == "lerp") {
         double t = 0;
         if (!get_prop_f64(args[3], "t", &t, 0)) return ev::undefined();
-        bytes();
+        if (!bytes()) return ev::undefined();
         broimage::combine_lerp_f32(ap, bp, dp, n, static_cast<float>(t));
         return ev::undefined();
     }
@@ -503,7 +568,7 @@ static bronze::Value image_combine(bronze::Value, std::span<const bronze::Value>
         double wa = 1, wb = 1;
         if (!get_prop_f64(args[3], "wa", &wa, 1)) return ev::undefined();
         if (!get_prop_f64(args[3], "wb", &wb, 1)) return ev::undefined();
-        bytes();
+        if (!bytes()) return ev::undefined();
         broimage::combine_wsum_f32(ap, bp, dp, n, static_cast<float>(wa), static_cast<float>(wb));
         return ev::undefined();
     }
@@ -523,17 +588,18 @@ static bronze::Value image_stencil(bronze::Value, std::span<const bronze::Value>
     if (dst.bpe != 4 || src.bpe != 4)
         return ev::throwTypeError("stencil: dst and src must be Float32Array");
 
-    bronze::Value kdata_v = ev::getProperty(args[2], "data");
+    // Rooted: the w/h reads below allocate before the view is unpacked.
+    ev::Persistent kdata_v{ev::getProperty(args[2], "data")};
     int32_t kw = 0, kh = 0;
     if (!get_prop_i32(args[2], "w", &kw, 0)) return ev::undefined();
     if (!get_prop_i32(args[2], "h", &kh, 0)) return ev::undefined();
     TypedArrayView kdata;
-    if (!unpack_typed_array(kdata_v, "kernel.data", &kdata)) return ev::undefined();
+    if (!unpack_typed_array(kdata_v.get(), "kernel.data", &kdata)) return ev::undefined();
     if (kdata.bpe != 4) return ev::throwTypeError("stencil: kernel.data must be Float32Array");
     if (kw <= 0 || kh <= 0) return ev::throwRangeError("stencil: kernel w/h must be positive");
     if ((kw & 1) == 0 || (kh & 1) == 0)
         return ev::throwRangeError("stencil: kernel w/h must be odd");
-    if (kdata.byte_len < static_cast<size_t>(kw) * static_cast<size_t>(kh) * 4)
+    if (!holdsElements(kdata.byte_len, {kw, kh}, 4))
         return ev::throwRangeError("stencil: kernel.data too small for w*h");
 
     int32_t srcW = 0, srcH = 0;
@@ -541,9 +607,9 @@ static bronze::Value image_stencil(bronze::Value, std::span<const bronze::Value>
     if (!get_prop_i32(args[3], "srcH", &srcH, 0)) return ev::undefined();
     if (srcW <= 0 || srcH <= 0)
         return ev::throwRangeError("stencil: srcW/srcH required and positive");
-    if (src.byte_len < static_cast<size_t>(srcW) * static_cast<size_t>(srcH) * 4)
+    if (!holdsElements(src.byte_len, {srcW, srcH}, 4))
         return ev::throwRangeError("stencil: src too small for srcW*srcH");
-    if (dst.byte_len < static_cast<size_t>(srcW) * static_cast<size_t>(srcH) * 4)
+    if (!holdsElements(dst.byte_len, {srcW, srcH}, 4))
         return ev::throwRangeError("stencil: dst too small for srcW*srcH");
 
     std::string edge;
@@ -558,7 +624,7 @@ static bronze::Value image_stencil(bronze::Value, std::span<const bronze::Value>
     if (!get_prop_f64(args[3], "divisor", &divisor, 1)) return ev::undefined();
     if (!get_prop_f64(args[3], "bias",    &bias,    0)) return ev::undefined();
 
-    src.refresh(); dst.refresh(); kdata.refresh();
+    if (!refreshViews({&src, &dst, &kdata}, "stencil")) return ev::undefined();
     broimage::stencil_f32(
         reinterpret_cast<const float*>(src.data),
         reinterpret_cast<float*>(dst.data),
@@ -589,10 +655,10 @@ static bronze::Value image_resample(bronze::Value, std::span<const bronze::Value
     if (!get_prop_i32(args[2], "channels", &channels, 1)) return ev::undefined();
     if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0 || channels <= 0)
         return ev::throwRangeError("resample: all dims/channels must be positive");
-    size_t need_src = static_cast<size_t>(srcW) * srcH * channels * 4;
-    size_t need_dst = static_cast<size_t>(dstW) * dstH * channels * 4;
-    if (src.byte_len < need_src) return ev::throwRangeError("resample: src too small");
-    if (dst.byte_len < need_dst) return ev::throwRangeError("resample: dst too small");
+    if (!holdsElements(src.byte_len, {srcW, srcH, channels}, 4))
+        return ev::throwRangeError("resample: src too small");
+    if (!holdsElements(dst.byte_len, {dstW, dstH, channels}, 4))
+        return ev::throwRangeError("resample: dst too small");
 
     std::string filter;
     if (!get_prop_str(args[2], "filter", &filter)) return ev::undefined();
@@ -603,7 +669,7 @@ static bronze::Value image_resample(bronze::Value, std::span<const bronze::Value
     else if (filter == "bilinear") f = broimage::Filter::Bilinear;
     else return ev::throwTypeError("resample: filter must be 'nearest'|'bilinear'");
 
-    src.refresh(); dst.refresh();
+    if (!refreshViews({&src, &dst}, "resample")) return ev::undefined();
     broimage::resample_f32(
         reinterpret_cast<const float*>(src.data), srcW, srcH,
         reinterpret_cast<float*>(dst.data),       dstW, dstH,
