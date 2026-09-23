@@ -243,11 +243,19 @@ bool getBytes(Value val, Bytes& out)
     Value offV = ev::getProperty(root.get(), "byteOffset");
     Value lenV = ev::getProperty(root.get(), "byteLength");
     if (!ev::isNumber(offV) || !ev::isNumber(lenV)) return false;
-    size_t off = static_cast<size_t>(ev::toDouble(offV));
-    size_t len = static_cast<size_t>(ev::toDouble(lenV));
+    // The window is the script's (any object with these three properties
+    // gets here): check it as doubles, so a huge offset cannot wrap
+    // `off + len` back inside the buffer.
+    const double offD = ev::toDouble(offV);
+    const double lenD = ev::toDouble(lenV);
+    if (!(offD >= 0.0) || !(lenD >= 0.0)) return false;
     Value buf = ev::getProperty(root.get(), "buffer");
     auto info = ev::arrayBufferInfo(buf);
-    if (!info || off + len > info.byteLength) return false;
+    if (!info || offD > static_cast<double>(info.byteLength) ||
+        lenD > static_cast<double>(info.byteLength) - offD)
+        return false;
+    const size_t off = static_cast<size_t>(offD);
+    const size_t len = static_cast<size_t>(lenD);
     out.assign(info.data + off, info.data + off + len);
     return true;
 }
@@ -319,7 +327,7 @@ bool parseUsages(Value arr, uint32_t& mask, Failure& err)
         err = {nullptr, "keyUsages must be a sequence of strings"};
         return false;
     }
-    uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+    uint32_t len = saturateU32(ev::toDouble(lenVal));
     for (uint32_t i = 0; i < len; i++) {
         Value item = ev::getElement(root.get(), i);
         std::string s = ev::isString(item) ? ev::toUtf8(item) : std::string();

@@ -61,7 +61,7 @@ std::string resolveBrokitPrefixMount(const std::string& path)
                     ev::Persistent keys{res.value};
                     if (!res.thrown && ev::isObject(keys.get())) {
                         auto lenVal = ev::getProperty(keys.get(), "length");
-                        uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+                        uint32_t len = saturateU32(ev::toDouble(lenVal));
                         for (uint32_t i = 0; i < len; ++i) {
                             auto k = ev::getElement(keys.get(), i);
                             std::string prefix = ev::toUtf8(k);
@@ -119,7 +119,10 @@ std::string resolveFsPath(const char* path, bool forCreate = false)
         ev::Persistent arr{ev::getProperty(g.value, "__brokit_fs_base_paths")};
         if (ev::isObject(arr.get())) {
             auto lenVal = ev::getProperty(arr.get(), "length");
-            int32_t len = static_cast<int32_t>(ev::toDouble(lenVal));
+            // A script-writable global: bound the walk.
+            int32_t len = ev::isNumber(lenVal)
+                              ? static_cast<int32_t>((std::min)(saturateU32(ev::toDouble(lenVal)), kMaxScriptList))
+                              : 0;
             for (int32_t i = len - 1; i >= 0; --i) {
                 auto elem = ev::getElement(arr.get(), static_cast<uint32_t>(i));
                 if (ev::isString(elem)) {
@@ -339,6 +342,17 @@ static std::optional<bronze::embed::TypedArrayInfo> getBufferOrTypedArrayInfo(br
     return std::nullopt;
 }
 
+// [offset, offset + length) inside a buffer of byteLength bytes, checked
+// without forming offset + length (two script-sized int64s can overflow it
+// back into range).
+static bool windowFits(int64_t offset, int64_t length, size_t byteLength)
+{
+    if (offset < 0 || length < 0) return false;
+    const uint64_t cap = static_cast<uint64_t>(byteLength);
+    return static_cast<uint64_t>(offset) <= cap &&
+           static_cast<uint64_t>(length) <= cap - static_cast<uint64_t>(offset);
+}
+
 // readSync(fd, buffer, offset, length[, position]) -> bytes read
 static bronze::Value js_readSync(bronze::Value, std::span<const bronze::Value> a)
 {
@@ -353,26 +367,26 @@ static bronze::Value js_readSync(bronze::Value, std::span<const bronze::Value> a
 
     int64_t offset = 0, length = static_cast<int64_t>(byteLength);
     if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
-        offset = static_cast<int64_t>(ev::toDouble(a[2]));
+        offset = saturateI64(ev::toDouble(a[2]));
     }
     if (a.size() >= 4 && !ev::isUndefined(a[3]) && !ev::isNull(a[3])) {
-        length = static_cast<int64_t>(ev::toDouble(a[3]));
+        length = saturateI64(ev::toDouble(a[3]));
     }
-    if (offset < 0 || length < 0 || offset + length > static_cast<int64_t>(byteLength)) {
+    if (!windowFits(offset, length, byteLength)) {
         return ev::throwRangeError("readSync: offset/length out of buffer bounds");
     }
 
     bool seek = false;
     int64_t position = 0;
     if (a.size() >= 5 && !ev::isUndefined(a[4]) && !ev::isNull(a[4])) {
-        position = static_cast<int64_t>(ev::toDouble(a[4]));
+        position = saturateI64(ev::toDouble(a[4]));
         if (position >= 0) seek = true;
     }
 
     // The option reads above can run user code (valueOf) and allocate, so
     // the buffer's address is taken again, and its bounds rechecked, here.
     info = getBufferOrTypedArrayInfo(a[1]);
-    if (!info || offset + length > static_cast<int64_t>(info->byteLength))
+    if (!info || !windowFits(offset, length, info->byteLength))
         return ev::throwRangeError("readSync: buffer changed size during the call");
     base = info->data;
 
@@ -407,24 +421,24 @@ static bronze::Value js_writeSync(bronze::Value, std::span<const bronze::Value> 
 
     int64_t offset = 0, length = static_cast<int64_t>(byteLength);
     if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
-        offset = static_cast<int64_t>(ev::toDouble(a[2]));
+        offset = saturateI64(ev::toDouble(a[2]));
     }
     if (a.size() >= 4 && !ev::isUndefined(a[3]) && !ev::isNull(a[3])) {
-        length = static_cast<int64_t>(ev::toDouble(a[3]));
+        length = saturateI64(ev::toDouble(a[3]));
     }
-    if (offset < 0 || length < 0 || offset + length > static_cast<int64_t>(byteLength)) {
+    if (!windowFits(offset, length, byteLength)) {
         return ev::throwRangeError("writeSync: offset/length out of buffer bounds");
     }
 
     bool seek = false;
     int64_t position = 0;
     if (a.size() >= 5 && !ev::isUndefined(a[4]) && !ev::isNull(a[4])) {
-        position = static_cast<int64_t>(ev::toDouble(a[4]));
+        position = saturateI64(ev::toDouble(a[4]));
         if (position >= 0) seek = true;
     }
 
     info = getBufferOrTypedArrayInfo(a[1]);
-    if (!info || offset + length > static_cast<int64_t>(info->byteLength))
+    if (!info || !windowFits(offset, length, info->byteLength))
         return ev::throwRangeError("writeSync: buffer changed size during the call");
     base = info->data;
 
