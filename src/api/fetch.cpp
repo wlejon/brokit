@@ -791,6 +791,19 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
         } else if (isBlobUrl(url)) {
             bool found = false;
             response = buildBlobUrlResponse(url, &found);
+            if (!found) {
+                // Fetch's blob scheme fetch: a URL with no entry in the blob
+                // URL store (revoked, or never minted) is a network error,
+                // which fetch() reports as a TypeError rejection, not a 404.
+                ev::Persistent p(ev::createPromise());
+                ev::Persistent msg(ev::fromUtf8(
+                    "fetch: " + url + " is not a live object URL (revoked, or never created)"));
+                ev::Persistent ctor(ev::getGlobal("TypeError"));
+                auto err = ev::construct(ctor.get(), std::array<bronze::Value, 1>{msg.get()});
+                ev::Persistent errP(err.value);
+                ev::rejectPromise(p.get(), errP.get());
+                return p.get();
+            }
         } else {
             std::string resolved = resolveLocalPath(url);
             response = buildFileResponse(url, resolved);
