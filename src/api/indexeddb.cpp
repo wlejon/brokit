@@ -30,11 +30,47 @@ struct IdbState {
 static thread_local IdbState g_idbState;
 static thread_local std::string g_idbBasePath = ".";
 
+// A database name is any string, so it is percent-encoded into a file name:
+// separators, `..` and reserved characters must not reach the filesystem.
+// Plain names ("app", "my-db_2", "v1.cache") map to themselves, so existing
+// databases keep their files.
+static std::string dbFileName(const std::string& name) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(name.size());
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(name[i]);
+        bool plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ' ' ||
+                     (c == '.' && i != 0);
+        if (plain) {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 15];
+        }
+    }
+    return out;
+}
+
 static std::string dbPath(const std::string& name) {
     std::string base = g_idbBasePath;
     if (base.empty()) base = ".";
     if (base.back() != '/' && base.back() != '\\') base += '/';
-    return base + name + ".idb";
+    return base + dbFileName(name) + ".idb";
+}
+
+// An object-store name is any string; it becomes an SQL identifier, quoted
+// with embedded quotes doubled so no name can end the identifier early.
+static std::string quoteIdent(const std::string& name) {
+    std::string out = "\"";
+    for (char c : name) {
+        if (c == '"') out += '"';
+        out += c;
+    }
+    out += '"';
+    return out;
 }
 
 static sqlite3* openDb(const std::string& name) {
@@ -144,11 +180,11 @@ static bronze::Value js_idb_create_store(bronze::Value, std::span<const bronze::
     // Create table — key column + value column (JSON)
     std::string sql;
     if (autoIncrement) {
-        sql = "CREATE TABLE IF NOT EXISTS [" + storeName +
-              "](key INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)";
+        sql = "CREATE TABLE IF NOT EXISTS " + quoteIdent(storeName) +
+              "(key INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)";
     } else {
-        sql = "CREATE TABLE IF NOT EXISTS [" + storeName +
-              "](key TEXT PRIMARY KEY, value TEXT)";
+        sql = "CREATE TABLE IF NOT EXISTS " + quoteIdent(storeName) +
+              "(key TEXT PRIMARY KEY, value TEXT)";
     }
 
     char* errMsg = nullptr;
@@ -175,7 +211,7 @@ static bronze::Value js_idb_delete_store(bronze::Value, std::span<const bronze::
     sqlite3* db = openDb(dbName);
     if (!db) return ev::fromBool(false);
 
-    std::string sql = "DROP TABLE IF EXISTS [" + storeName + "]";
+    std::string sql = "DROP TABLE IF EXISTS " + quoteIdent(storeName);
     sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr);
     return ev::fromBool(true);
 }
@@ -196,8 +232,8 @@ static bronze::Value js_idb_put(bronze::Value, std::span<const bronze::Value> ar
         return ev::throwError("idb_put: database not open");
     }
 
-    std::string sql = "INSERT OR REPLACE INTO [" + storeName +
-                      "](key, value) VALUES(?, ?)";
+    std::string sql = "INSERT OR REPLACE INTO " + quoteIdent(storeName) +
+                      "(key, value) VALUES(?, ?)";
 
     sqlite3_stmt* stmt;
     int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
@@ -231,7 +267,7 @@ static bronze::Value js_idb_get(bronze::Value, std::span<const bronze::Value> ar
     sqlite3* db = openDb(dbName);
     if (!db) return ev::undefined();
 
-    std::string sql = "SELECT value FROM [" + storeName + "] WHERE key=?";
+    std::string sql = "SELECT value FROM " + quoteIdent(storeName) + " WHERE key=?";
 
     sqlite3_stmt* stmt;
     int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
@@ -263,7 +299,7 @@ static bronze::Value js_idb_delete(bronze::Value, std::span<const bronze::Value>
     sqlite3* db = openDb(dbName);
     if (!db) return ev::fromBool(false);
 
-    std::string sql = "DELETE FROM [" + storeName + "] WHERE key=?";
+    std::string sql = "DELETE FROM " + quoteIdent(storeName) + " WHERE key=?";
 
     sqlite3_stmt* stmt;
     int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
@@ -288,7 +324,7 @@ static bronze::Value js_idb_clear(bronze::Value, std::span<const bronze::Value> 
     sqlite3* db = openDb(dbName);
     if (!db) return ev::fromBool(false);
 
-    std::string sql = "DELETE FROM [" + storeName + "]";
+    std::string sql = "DELETE FROM " + quoteIdent(storeName);
     return ev::fromBool(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
@@ -305,7 +341,7 @@ static bronze::Value js_idb_get_all(bronze::Value, std::span<const bronze::Value
     sqlite3* db = openDb(dbName);
     if (!db) return hostArrayOf(std::span<const bronze::Value>{});
 
-    std::string sql = "SELECT key, value FROM [" + storeName + "] ORDER BY key";
+    std::string sql = "SELECT key, value FROM " + quoteIdent(storeName) + " ORDER BY key";
     if (limit > 0) sql += " LIMIT " + std::to_string(limit);
 
     sqlite3_stmt* stmt;
@@ -313,18 +349,17 @@ static bronze::Value js_idb_get_all(bronze::Value, std::span<const bronze::Value
         return hostArrayOf(std::span<const bronze::Value>{});
     }
 
-    std::vector<bronze::Value> rows;
+    ArrayBuilder rows;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char* key = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        bronze::Value pairArr[2] = {
-            key ? ev::fromUtf8(key) : ev::null(),
-            val ? ev::fromUtf8(val) : ev::null()
-        };
-        rows.push_back(hostArrayOf(std::span<const bronze::Value>(pairArr, 2)));
+        ArrayBuilder pair;
+        pair.push(key ? ev::fromUtf8(key) : ev::null());
+        pair.push(val ? ev::fromUtf8(val) : ev::null());
+        rows.push(pair.get());
     }
     sqlite3_finalize(stmt);
-    return hostArrayOf(rows);
+    return rows.get();
 }
 
 // __brokit_idb_count(dbName, storeName) → int
@@ -339,7 +374,7 @@ static bronze::Value js_idb_count(bronze::Value, std::span<const bronze::Value> 
     sqlite3* db = openDb(dbName);
     if (!db) return ev::fromDouble(0);
 
-    std::string sql = "SELECT COUNT(*) FROM [" + storeName + "]";
+    std::string sql = "SELECT COUNT(*) FROM " + quoteIdent(storeName);
 
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
@@ -367,18 +402,22 @@ static bronze::Value js_idb_store_names(bronze::Value, std::span<const bronze::V
 
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db,
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '__idb_%'",
+            // Internal tables only: `_` is a LIKE wildcard, so a prefix test
+            // is spelled with substr, and sqlite_sequence (made by the first
+            // autoIncrement store) is SQLite's, not a store.
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND substr(name, 1, 6) <> '__idb_' AND substr(name, 1, 7) <> 'sqlite_'",
             -1, &stmt, nullptr) != SQLITE_OK) {
         return hostArrayOf(std::span<const bronze::Value>{});
     }
 
-    std::vector<bronze::Value> names;
+    ArrayBuilder names;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char* name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        if (name) names.push_back(ev::fromUtf8(name));
+        if (name) names.push(ev::fromUtf8(name));
     }
     sqlite3_finalize(stmt);
-    return hostArrayOf(names);
+    return names.get();
 }
 
 // __brokit_idb_delete_db(name) → bool
