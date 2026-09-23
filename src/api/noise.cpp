@@ -49,6 +49,26 @@ static bronze::Value make_float32_array(const float* data, size_t count)
     return ev::createTypedArrayView(elements::Float32, ab, 0, static_cast<uint32_t>(count));
 }
 
+// Largest grid a generator allocates: the result becomes one Float32Array,
+// and bronze caps a buffer at 256 MiB.
+static constexpr size_t kMaxGridFloats = size_t{1} << 26;
+
+// xSize * ySize (* zSize) floats, multiplied without overflow and bounded by
+// `cap`. Three script int32s multiply past 2^64, and a product that wrapped
+// small would pass a size check FastNoise then writes far beyond; bounding
+// it also keeps FastNoise's own int arithmetic in range.
+static bool gridCount(std::initializer_list<int32_t> dims, size_t cap, size_t* out)
+{
+    size_t product = 1;
+    for (int32_t d : dims) {
+        if (d <= 0) return false;
+        if (product > cap / static_cast<size_t>(d)) return false;
+        product *= static_cast<size_t>(d);
+    }
+    *out = product;
+    return true;
+}
+
 static bool resolve_f32(bronze::Value v, const char* name,
                         float** out, size_t* count)
 {
@@ -135,14 +155,16 @@ static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronz
         }
         if (mv.type == FastNoise::Metadata::MemberVariable::EInt) {
             if (!ev::isDouble(val)) return ev::throwTypeError("expected number");
-            int32_t i = static_cast<int32_t>(ev::toDouble(val));
+            int32_t i = saturateI32(ev::toDouble(val));
             return mv.setFunc(w->node.get(), FastNoise::Metadata::MemberVariable::ValueUnion(static_cast<int>(i)))
                 ? ev::undefined() : ev::throwTypeError("Failed to set variable");
         }
         if (mv.type == FastNoise::Metadata::MemberVariable::EEnum) {
             int32_t i = -1;
             if (ev::isDouble(val)) {
-                i = static_cast<int32_t>(ev::toDouble(val));
+                i = saturateI32(ev::toDouble(val));
+                if (i < 0 || static_cast<size_t>(i) >= mv.enumNames.size())
+                    return ev::throwRangeError("Enum index out of range");
             } else if (ev::isString(val)) {
                 std::string es = ev::toUtf8(val);
                 for (size_t ei = 0; ei < mv.enumNames.size(); ei++) {
@@ -274,7 +296,9 @@ static bronze::Value fast_noise_gen_uniform_grid2_d(bronze::Value thisVal, std::
         return ev::throwRangeError("Grid dimensions must be positive");
     
     float step = static_cast<float>(frequency);
-    size_t count = static_cast<size_t>(xSize) * static_cast<size_t>(ySize);
+    size_t count = 0;
+    if (!gridCount({xSize, ySize}, kMaxGridFloats, &count))
+        return ev::throwRangeError("genUniformGrid2D: grid too large");
     std::vector<float> output(count);
     w->node->GenUniformGrid2D(output.data(),
                                static_cast<float>(xOffset), static_cast<float>(yOffset),
@@ -304,10 +328,11 @@ static bronze::Value fast_noise_gen_uniform_grid2_d_into(bronze::Value thisVal, 
     if (xSize <= 0 || ySize <= 0)
         return ev::throwRangeError("Grid dimensions must be positive");
     
-    size_t count = static_cast<size_t>(xSize) * static_cast<size_t>(ySize);
-    if (n_dest < count)
-        return ev::throwRangeError("dest too small: " + std::to_string(count) + " floats required");
-    
+    size_t count = 0;
+    if (!gridCount({xSize, ySize}, n_dest, &count))
+        return ev::throwRangeError("dest too small: " + std::to_string(xSize) + " x " +
+                                   std::to_string(ySize) + " floats required");
+
     float step = static_cast<float>(frequency);
     w->node->GenUniformGrid2D(dest,
                                static_cast<float>(xOffset), static_cast<float>(yOffset),
@@ -336,7 +361,9 @@ static bronze::Value fast_noise_gen_uniform_grid3_d(bronze::Value thisVal, std::
         return ev::throwRangeError("Grid dimensions must be positive");
     
     float step = static_cast<float>(frequency);
-    size_t count = static_cast<size_t>(xSize) * static_cast<size_t>(ySize) * static_cast<size_t>(zSize);
+    size_t count = 0;
+    if (!gridCount({xSize, ySize, zSize}, kMaxGridFloats, &count))
+        return ev::throwRangeError("genUniformGrid3D: grid too large");
     std::vector<float> output(count);
     w->node->GenUniformGrid3D(output.data(),
                                static_cast<float>(xOff), static_cast<float>(yOff),
@@ -370,9 +397,11 @@ static bronze::Value fast_noise_gen_uniform_grid3_d_into(bronze::Value thisVal, 
     if (xSize <= 0 || ySize <= 0 || zSize <= 0)
         return ev::throwRangeError("Grid dimensions must be positive");
     
-    size_t count = static_cast<size_t>(xSize) * static_cast<size_t>(ySize) * static_cast<size_t>(zSize);
-    if (n_dest < count)
-        return ev::throwRangeError("dest too small: " + std::to_string(count) + " floats required");
+    size_t count = 0;
+    if (!gridCount({xSize, ySize, zSize}, n_dest, &count))
+        return ev::throwRangeError("dest too small: " + std::to_string(xSize) + " x " +
+                                   std::to_string(ySize) + " x " + std::to_string(zSize) +
+                                   " floats required");
     
     float step = static_cast<float>(frequency);
     w->node->GenUniformGrid3D(dest,
@@ -476,7 +505,9 @@ static bronze::Value fast_noise_gen_tileable2_d(bronze::Value thisVal, std::span
         return ev::throwRangeError("Grid dimensions must be positive");
     
     float step = static_cast<float>(frequency);
-    size_t count = static_cast<size_t>(xSize) * static_cast<size_t>(ySize);
+    size_t count = 0;
+    if (!gridCount({xSize, ySize}, kMaxGridFloats, &count))
+        return ev::throwRangeError("genTileable2D: grid too large");
     std::vector<float> output(count);
     w->node->GenTileable2D(output.data(), xSize, ySize, step, step, seed);
     return make_float32_array(output.data(), count);
