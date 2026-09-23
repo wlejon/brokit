@@ -22,9 +22,12 @@ var lut = img.gradient([[0, 10, 20, 30], [1, 200, 210, 220]], 4);
     });
 });
 
-// Histogram: NaN samples are dropped; bins is capped.
-var hist = img.reduce(new Float64Array([NaN, 0.25, 0.75]), 'histogram', { bins: 2, lo: 0, hi: 1 });
-assert(hist[0] === 1 && hist[1] === 1, 'histogram drops NaN');
+// Histogram: NaN samples are dropped (a sample just below lo still truncates
+// into bin 0, as the Float32 kernel does); bins is capped.
+[Float32Array, Float64Array].forEach(function (T) {
+    var hist = img.reduce(new T([NaN, 0.25, 0.75, -0.25]), 'histogram', { bins: 2, lo: 0, hi: 1 });
+    assert(hist[0] === 2 && hist[1] === 1, 'histogram drops NaN (' + T.name + ')');
+});
 throws(function () { img.reduce(new Float32Array(4), 'histogram', { bins: 2147483647, lo: 0, hi: 1 }); },
        'histogram bins is capped');
 

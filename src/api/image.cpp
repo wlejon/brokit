@@ -440,10 +440,11 @@ static bronze::Value image_reduce(bronze::Value, std::span<const bronze::Value> 
                 float t = (v - lo_f) * inv_span;
                 const float fi = t * static_cast<float>(bins);
                 // Range-checked as a float: NaN or a huge value would be
-                // undefined behaviour to convert.
-                if (!(fi >= 0.0f) || !(fi < static_cast<float>(bins))) continue;
+                // undefined behaviour to convert. (-1, 0) still truncates
+                // into bin 0, matching the Float32 kernel.
+                if (!(fi > -1.0f) || !(fi < static_cast<float>(bins))) continue;
                 int idx = static_cast<int>(fi);
-                if (idx >= bins) continue;
+                if (idx < 0 || idx >= bins) continue;
                 counts[idx]++;
             }
         }
