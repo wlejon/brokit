@@ -57,6 +57,7 @@ assertEqual(util.format('a', 'b', 'c'), 'a b c', 'format appends extra args');
 assertEqual(util.format('%d', 'nope'), 'NaN', 'format %d of non-number is NaN');
 assertEqual(util.format('%s %s', 'one'), 'one %s', 'format leaves missing specifier literal');
 assertEqual(util.format('%j', { a: 1 }), '{"a":1}', 'format %j stringifies');
+assertEqual(util.format('%cstyled%c done', 'color: red', ''), 'styled done', 'format %c consumes its CSS argument');
 
 // --- inspect ---
 assert(typeof util.inspect === 'function', 'util.inspect is a function');

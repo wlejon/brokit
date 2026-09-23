@@ -187,7 +187,7 @@
             return pieces.join(' ');
         }
 
-        var str = f.replace(/%[sdifjoO%]/g, function(match) {
+        var str = f.replace(/%[sdifjoOc%]/g, function(match) {
             if (match === '%%') return '%';
             if (i >= args.length) return match; // missing arg -> leave literal
             var arg = args[i++];
@@ -202,6 +202,9 @@
                     catch (e) { return '[Circular]'; }
                 case '%o':
                 case '%O': return inspect(arg);
+                // CSS for a browser console; Node consumes the argument and
+                // prints nothing, and so does a terminal.
+                case '%c': return '';
                 default: return match;
             }
         });
