@@ -43,15 +43,23 @@ static bool fillRandom(uint8_t* buf, size_t len)
 static bronze::Value getRandomValues(bronze::Value, std::span<const bronze::Value> a)
 {
     if (a.empty()) return ev::throwTypeError("crypto.getRandomValues: expected TypedArray");
+    // The "_u8" read may allocate, so never hold a[0] in a local copy across it.
     bronze::Value arg = a[0];
-    if (ev::isObject(arg)) {
-        bronze::Value u8 = ev::getProperty(arg, "_u8");
-        if (ev::isObject(u8)) arg = u8;
+    if (!ev::typedArrayInfo(a[0]) && ev::isObject(a[0])) {
+        bronze::Value u8 = ev::getProperty(a[0], "_u8");
+        arg = ev::isObject(u8) ? u8 : a[0];
     }
     auto info = ev::typedArrayInfo(arg);
     if (!info) return ev::throwTypeError("crypto.getRandomValues: expected TypedArray");
+    // WebCrypto: only integer arrays (TypeMismatchError), at most 65536 bytes
+    // (QuotaExceededError).
+    if (info.elementKind == elements::Float32 || info.elementKind == elements::Float64) {
+        return throwDOMException("crypto.getRandomValues: the array must be an integer TypedArray",
+                                 "TypeMismatchError");
+    }
     if (info.byteLength > 65536) {
-        return ev::throwRangeError("crypto.getRandomValues: quota exceeded (max 65536 bytes)");
+        return throwDOMException("crypto.getRandomValues: quota exceeded (max 65536 bytes)",
+                                 "QuotaExceededError");
     }
 
     if (info.byteLength > 0 && !fillRandom(info.data, info.byteLength)) {

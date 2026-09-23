@@ -27,11 +27,18 @@
     } catch (e) { rejected = true; }
     assert(rejected, 'importKey pkcs8 format rejects');
 
-    // importKey with non-object algorithm — exercises parseAlgorithm's string path
+    // A bare 'HMAC' string names no hash, which HMAC import requires: TypeError.
+    rejected = false;
+    try {
+        await crypto.subtle.importKey('raw', new Uint8Array(32), 'HMAC', false, ['sign']);
+    } catch (e) { rejected = e instanceof TypeError; }
+    assert(rejected, 'importKey HMAC without hash rejects with TypeError');
+
+    // A string algorithm name is accepted where the algorithm needs no params.
     var stringAlgoKey = await crypto.subtle.importKey(
-        'raw', new Uint8Array(32), 'HMAC', false, ['sign']
+        'raw', new Uint8Array(16), 'aes-gcm', false, ['encrypt']
     );
-    assert(stringAlgoKey !== null, 'importKey accepts string algorithm name');
+    assertEqual(stringAlgoKey.algorithm.name, 'AES-GCM', 'string algorithm name normalizes');
 
     // importKey raw with non-buffer rejects
     rejected = false;
@@ -60,12 +67,15 @@
     var ok = await crypto.subtle.verify({ name: 'HMAC' }, jwkKey, sig, msg);
     assertEqual(ok, true, 'JWK key verify');
 
-    // JWK with empty k field — currently accepts "undefined" string; just exercise path
-    var emptyJwk = await crypto.subtle.importKey(
-        'jwk', { kty: 'oct', k: '' },
-        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-    );
-    assert(emptyJwk !== null, 'JWK empty-k import (degenerate but accepted)');
+    // JWK with an empty k is not key material: DataError.
+    rejected = false;
+    try {
+        await crypto.subtle.importKey(
+            'jwk', { kty: 'oct', k: '' },
+            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+        );
+    } catch (e) { rejected = e.name === 'DataError'; }
+    assert(rejected, 'JWK empty-k import rejects with DataError');
 
     // ── generateKey AES-192 ────────────────────────────────────────────────
     var aes192 = await crypto.subtle.generateKey(
@@ -212,7 +222,7 @@
 
     // ── encrypt with unsupported algorithm rejects ────────────────────────
     var aesGood = await crypto.subtle.generateKey(
-        { name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt', 'sign', 'verify']
+        { name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt']
     );
     var iv12 = new Uint8Array(12);
     rejected = false;
@@ -274,9 +284,18 @@
     } catch (e) { rejected = true; }
     assert(rejected, 'AES-GCM decrypt tampered rejects');
 
+    // ── sign/verify usages are not valid for an AES key ───────────────────
+    rejected = false;
+    try {
+        await crypto.subtle.generateKey(
+            { name: 'AES-GCM', length: 128 }, true, ['sign', 'verify', 'encrypt', 'decrypt']
+        );
+    } catch (e) { rejected = e.name === 'SyntaxError'; }
+    assert(rejected, 'AES key with sign usage rejects with SyntaxError');
+
     // ── sign with an AES key + non-HMAC algo rejects ─────────────────────
     var aesSignable = await crypto.subtle.generateKey(
-        { name: 'AES-GCM', length: 128 }, true, ['sign', 'verify', 'encrypt', 'decrypt']
+        { name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt']
     );
     rejected = false;
     try {

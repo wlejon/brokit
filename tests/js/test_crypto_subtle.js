@@ -70,7 +70,8 @@ async function testGenerateKey() {
 
     var exported = await crypto.subtle.exportKey('raw', key);
     assert(exported instanceof ArrayBuffer, 'exportKey returns ArrayBuffer');
-    assertEqual(exported.byteLength, 32, 'HMAC-SHA256 key is 32 bytes');
+    // With no length, an HMAC key is the hash's block size (512 bits for SHA-256).
+    assertEqual(exported.byteLength, 64, 'HMAC-SHA256 key is 64 bytes');
 
     var sig = await crypto.subtle.sign({ name: 'HMAC' }, key, new TextEncoder().encode('test'));
     assertEqual(sig.byteLength, 32, 'can sign with generated key');

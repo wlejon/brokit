@@ -33,6 +33,16 @@ var sum = 0;
 for (var i = 0; i < arr.length; i++) sum += arr[i];
 assert(sum > 0, 'getRandomValues produces non-zero bytes');
 
+// Float arrays are refused (TypeMismatchError), and so is more than 64 KiB
+// (QuotaExceededError).
+var errName = null;
+try { crypto.getRandomValues(new Float32Array(4)); } catch (e) { errName = e.name; }
+assertEqual(errName, 'TypeMismatchError', 'getRandomValues refuses Float32Array');
+errName = null;
+try { crypto.getRandomValues(new Uint8Array(65537)); } catch (e) { errName = e.name; }
+assertEqual(errName, 'QuotaExceededError', 'getRandomValues quota');
+assertEqual(crypto.getRandomValues(new Uint8Array(65536)).length, 65536, 'getRandomValues at the quota');
+
 // Works with Uint32Array
 var arr32 = new Uint32Array(4);
 crypto.getRandomValues(arr32);
