@@ -100,8 +100,10 @@ Value blobSlice(Value thisVal, std::span<const Value> a) {
     BlobData* b = getBlobData(thisVal);
     if (!b) return ev::throwTypeError("Blob.slice: receiver is not a Blob");
     int64_t size = static_cast<int64_t>(b->bytes.size());
+    // An explicitly undefined end is the blob's size, as an omitted one is
+    // (File API: slice(start, end, contentType) with optional members).
     int64_t start = a.size() > 0 ? i64At(a, 0) : 0;
-    int64_t end = a.size() > 1 ? i64At(a, 1) : size;
+    int64_t end = a.size() > 1 && !ev::isUndefined(a[1]) ? i64At(a, 1) : size;
     std::string type = a.size() > 2 ? strAt(a, 2) : "";
 
     if (start < 0) start = std::max<int64_t>(0, size + start);

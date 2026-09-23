@@ -55,6 +55,10 @@ assertEqual(sliced2.type, 'text/plain', 'slice content type');
 var sliced3 = bs.slice(-6);
 assertEqual(sliced3.size, 6, 'negative start slice');
 
+assertEqual(bs.slice(2, undefined).size, 11, 'undefined end means the end');
+assertEqual(bs.slice(undefined, undefined, undefined).size, 13, 'all-undefined slice is the whole blob');
+assertEqual(bs.slice(undefined, undefined, undefined).type, '', 'undefined contentType is empty');
+
 // Slice beyond bounds
 var sliced4 = bs.slice(0, 100);
 assertEqual(sliced4.size, 13, 'slice clamped to size');
