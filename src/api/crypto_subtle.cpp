@@ -414,9 +414,142 @@ struct AesKey {
     explicit operator bool() const { return key != nullptr; }
 };
 
+// BCrypt's GCM mode takes only a 96-bit nonce and a 12-16 byte tag, where
+// WebCrypto allows any non-empty IV and tags down to 32 bits (OpenSSL takes
+// them all, so the other platforms need nothing extra). Outside BCrypt's
+// range GCM is computed per SP 800-38D over BCrypt's raw AES block cipher:
+// ECB for the counter blocks and E(0), GHASH in software.
+bool aesEcb(const Bytes& raw, const uint8_t* in, size_t len, uint8_t* out)
+{
+    AesKey k(BCRYPT_CHAIN_MODE_ECB, sizeof(BCRYPT_CHAIN_MODE_ECB), raw);
+    if (!k) return false;
+    ULONG outLen = 0;
+    return BCRYPT_SUCCESS(BCryptEncrypt(k.key, const_cast<PUCHAR>(in), static_cast<ULONG>(len), nullptr,
+                                        nullptr, 0, out, static_cast<ULONG>(len), &outLen, 0)) &&
+           outLen == len;
+}
+
+struct Block128 {
+    uint64_t hi = 0, lo = 0;
+};
+
+Block128 loadBlock(const uint8_t* p)
+{
+    Block128 b;
+    for (int i = 0; i < 8; ++i) b.hi = (b.hi << 8) | p[i];
+    for (int i = 8; i < 16; ++i) b.lo = (b.lo << 8) | p[i];
+    return b;
+}
+
+void storeBlock(Block128 b, uint8_t* p)
+{
+    for (int i = 7; i >= 0; --i, b.hi >>= 8) p[i] = static_cast<uint8_t>(b.hi);
+    for (int i = 15; i >= 8; --i, b.lo >>= 8) p[i] = static_cast<uint8_t>(b.lo);
+}
+
+// X * Y in GF(2^128) with GCM's bit order (SP 800-38D Algorithm 1).
+Block128 gfMul(Block128 x, Block128 y)
+{
+    Block128 z, v = y;
+    for (int i = 0; i < 128; ++i) {
+        const uint64_t bit = i < 64 ? (x.hi >> (63 - i)) & 1 : (x.lo >> (127 - i)) & 1;
+        const uint64_t mask = 0 - bit;
+        z.hi ^= v.hi & mask;
+        z.lo ^= v.lo & mask;
+        const uint64_t lsb = v.lo & 1;
+        v.lo = (v.lo >> 1) | (v.hi << 63);
+        v.hi = (v.hi >> 1) ^ (0xe100000000000000ull & (0 - lsb));
+    }
+    return z;
+}
+
+struct Ghash {
+    Block128 h, y;
+    void update(const uint8_t* p, size_t len)  // zero-pads the last partial block
+    {
+        for (size_t off = 0; off < len; off += 16) {
+            uint8_t blk[16] = {};
+            std::memcpy(blk, p + off, std::min<size_t>(16, len - off));
+            const Block128 b = loadBlock(blk);
+            y.hi ^= b.hi;
+            y.lo ^= b.lo;
+            y = gfMul(y, h);
+        }
+    }
+    void lengths(uint64_t aBytes, uint64_t cBytes)
+    {
+        y.hi ^= aBytes * 8;
+        y.lo ^= cBytes * 8;
+        y = gfMul(y, h);
+    }
+};
+
+bool aesGcmGeneric(Dir dir, const Bytes& raw, const Bytes& iv, const uint8_t* data, size_t len,
+                   const Bytes& aad, uint8_t* tag, size_t tagLen, Bytes& out)
+{
+    uint8_t zero[16] = {}, hBytes[16];
+    if (!aesEcb(raw, zero, 16, hBytes)) return false;
+    const Block128 h = loadBlock(hBytes);
+
+    uint8_t j0[16] = {};
+    if (iv.size() == 12) {
+        std::memcpy(j0, iv.data(), 12);
+        j0[15] = 1;
+    } else {
+        Ghash g{h, {}};
+        g.update(iv.data(), iv.size());
+        g.lengths(0, iv.size());
+        storeBlock(g.y, j0);
+    }
+
+    // Counter blocks: J0 (for the tag) then inc32(J0), inc32^2(J0), ...
+    const size_t nBlocks = (len + 15) / 16;
+    Bytes ctr((nBlocks + 1) * 16);
+    const uint32_t c0 = (uint32_t(j0[12]) << 24) | (uint32_t(j0[13]) << 16) | (uint32_t(j0[14]) << 8) | j0[15];
+    for (size_t i = 0; i <= nBlocks; ++i) {
+        uint8_t* b = ctr.data() + i * 16;
+        std::memcpy(b, j0, 12);
+        const uint32_t c = c0 + static_cast<uint32_t>(i);
+        b[12] = static_cast<uint8_t>(c >> 24);
+        b[13] = static_cast<uint8_t>(c >> 16);
+        b[14] = static_cast<uint8_t>(c >> 8);
+        b[15] = static_cast<uint8_t>(c);
+    }
+    Bytes ks(ctr.size());
+    if (!aesEcb(raw, ctr.data(), ctr.size(), ks.data())) return false;
+
+    const uint8_t* cipherText = data;
+    out.resize(len);
+    for (size_t i = 0; i < len; ++i) out[i] = data[i] ^ ks[16 + i];
+    if (dir == Dir::Encrypt) cipherText = out.data();
+
+    Ghash g{h, {}};
+    g.update(aad.data(), aad.size());
+    g.update(cipherText, len);
+    g.lengths(aad.size(), len);
+    uint8_t full[16];
+    storeBlock(g.y, full);
+    for (int i = 0; i < 16; ++i) full[i] ^= ks[i];
+
+    if (dir == Dir::Encrypt) {
+        std::memcpy(tag, full, tagLen);
+        return true;
+    }
+    uint8_t diff = 0;
+    for (size_t i = 0; i < tagLen; ++i) diff |= static_cast<uint8_t>(full[i] ^ tag[i]);
+    if (diff != 0) {
+        std::fill(out.begin(), out.end(), uint8_t(0));
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
 bool aesGcm(Dir dir, const Bytes& raw, const Bytes& iv, const uint8_t* data, size_t len,
             const Bytes& aad, uint8_t* tag, size_t tagLen, Bytes& out)
 {
+    if (iv.size() != 12 || tagLen < 12 || tagLen > 16)
+        return aesGcmGeneric(dir, raw, iv, data, len, aad, tag, tagLen, out);
     AesKey k(BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), raw);
     if (!k) return false;
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;

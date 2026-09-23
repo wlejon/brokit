@@ -212,6 +212,60 @@ async function testGcmTagLength() {
     assertEqual(ct.byteLength, 4 + 12, '96-bit tag');
     var pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv, tagLength: 96 }, key, ct);
     assertEqual(pt.byteLength, 4, '96-bit tag round trip');
+
+    // Every spec tag length round-trips, and a short tag still authenticates.
+    var msg = enc.encode('short tags authenticate too');
+    var tags = [32, 64, 96, 104, 112, 120, 128];
+    for (var i = 0; i < tags.length; i++) {
+        var c = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv, tagLength: tags[i] }, key, msg);
+        assertEqual(c.byteLength, msg.length + tags[i] / 8, 'tagLength ' + tags[i] + ' size');
+        var p = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv, tagLength: tags[i] }, key, c);
+        assertEqual(new TextDecoder().decode(p), 'short tags authenticate too', 'tagLength ' + tags[i] + ' round trip');
+        var bad = new Uint8Array(c);
+        bad[bad.length - 1] ^= 1;
+        await rejectsWith(crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv, tagLength: tags[i] }, key, bad),
+            'OperationError', 'tagLength ' + tags[i] + ' tamper');
+    }
+    // A 32-bit tag is the leading bytes of the 128-bit one.
+    var full = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, msg));
+    var tag32 = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv, tagLength: 32 }, key, msg));
+    assertEqual(hex(tag32), hex(full.subarray(0, msg.length + 4)), 'truncated tag is a prefix');
+}
+
+// IVs of 8 and 60 bytes, which take the GHASH-derived J0 rather than
+// IV || 0^31 || 1. The 8-byte case is McGrew & Viega test case 5; the 60-byte
+// expectation is OpenSSL's output for the same key/plaintext/AAD.
+async function testGcmIvLengths() {
+    var key = await crypto.subtle.importKey('raw', unhex('feffe9928665731c6d6a8f9467308308'),
+        'AES-GCM', false, ['encrypt', 'decrypt']);
+    var pt = unhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72' +
+                   '1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39');
+    var aad = unhex('feedfacedeadbeeffeedfacedeadbeefabaddad2');
+    var iv60 = unhex('9313225df88406e5a55909c5aff5269aa6a7a9538534f7da1e4c303d2a318a72' +
+                     '8c3c0c95156809539fcf0e2429a6b525416aedf9aa0de657ba637b39');
+    var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv60, additionalData: aad }, key, pt);
+    assertEqual(hex(ct),
+        '5b52133b0eeac3ddf640d04230452a941dbba658c55c04c774163626ef425a11' +
+        'd419091877f4f94ac4ac3062debf80652e26ae9edf280b4e48def1cc' +
+        '2b1e70367316110ad70ade0fc44d9418', 'GCM 60-byte IV');
+    var back = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv60, additionalData: aad }, key, ct);
+    assertEqual(hex(back), hex(pt), 'GCM 60-byte IV decrypt');
+
+    var iv8 = unhex('cafebabefacedbad');
+    var ct8 = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv8, additionalData: aad }, key, pt);
+    assertEqual(hex(ct8),
+        '61353b4c2806934a777ff51fa22a4755699b2a714fcdc6f83766e5f97b6c7423' +
+        '73806900e49f24b22b097544d4896b424989b5e1ebac0f07c23f4598' +
+        '3612d2e79e3b0785561be14aaca2fccb', 'GCM test case 5 (8-byte IV)');
+    var back8 = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv8, additionalData: aad, tagLength: 128 }, key, ct8);
+    assertEqual(hex(back8), hex(pt), 'GCM test case 5 decrypt');
+
+    var iv1 = new Uint8Array([7]);
+    var c1 = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv1, tagLength: 64 }, key, enc.encode('one'));
+    var p1 = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv1, tagLength: 64 }, key, c1);
+    assertEqual(new TextDecoder().decode(p1), 'one', '1-byte IV round trip');
+    await rejectsWith(crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array([8]), tagLength: 64 }, key, c1),
+        'OperationError', 'wrong IV fails authentication');
 }
 
 (async function() {
@@ -226,6 +280,7 @@ async function testGcmTagLength() {
     await testHkdf();
     await testWrapJwk();
     await testGcmTagLength();
+    await testGcmIvLengths();
 })().catch(function(e) {
     assert(false, 'test_crypto_subtle_kat failed: ' + (e && e.stack || e));
 });
