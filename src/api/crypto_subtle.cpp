@@ -46,6 +46,11 @@ namespace brokit::api {
 
 namespace {
 
+// The largest key or derived-bits length a script may ask for: 256 MiB, the
+// most bronze will hand back in one buffer. Past it the allocation fails (or
+// the double-to-size_t cast is undefined) instead of rejecting.
+constexpr double kMaxKeyBits = 2147483648.0;
+
 // ---------------------------------------------------------------------------
 // Random
 // ---------------------------------------------------------------------------
@@ -1185,7 +1190,9 @@ bool runCipher(Dir dir, Value params, const Algorithm& algo, const CryptoKeyData
         double tagBits = 128;
         getNumberProp(p.get(), "tagLength", tagBits);
         static const int kTagBits[] = {32, 64, 96, 104, 112, 120, 128};
-        if (std::find(std::begin(kTagBits), std::end(kTagBits), static_cast<int>(tagBits)) == std::end(kTagBits)) {
+        // Compared as doubles: NaN or a huge tagLength must not reach an int cast.
+        if (std::find_if(std::begin(kTagBits), std::end(kTagBits),
+                         [tagBits](int b) { return tagBits == b; }) == std::end(kTagBits)) {
             err = {"OperationError", "invalid AES-GCM tagLength"};
             return false;
         }
@@ -1231,7 +1238,7 @@ bool runCipher(Dir dir, Value params, const Algorithm& algo, const CryptoKeyData
         if (counter.size() != 16) { err = {"OperationError", "AES-CTR counter must be 16 bytes"}; return false; }
         double length = 0;
         if (!getNumberProp(p.get(), "length", length)) { err = {nullptr, "AES-CTR requires 'length'"}; return false; }
-        if (length < 1 || length > 128) { err = {"OperationError", "AES-CTR length must be 1..128"}; return false; }
+        if (!(length >= 1 && length <= 128)) { err = {"OperationError", "AES-CTR length must be 1..128"}; return false; }
         if (!aesCtr(key.raw, counter, static_cast<int>(length), data.data(), data.size(), out)) {
             err = {"OperationError", "AES-CTR failed (counter space exhausted?)"};
             return false;
@@ -1257,6 +1264,10 @@ bool deriveBitsCore(Value params, const Algorithm& algo, const CryptoKeyData& ba
         err = {"OperationError", "length must be a positive multiple of 8"};
         return false;
     }
+    if (lengthBits > kMaxKeyBits) {
+        err = {"OperationError", "length is too large"};
+        return false;
+    }
     const size_t outLen = static_cast<size_t>(lengthBits / 8);
     if (!isSha(algo.hash)) {
         err = {algo.hash.empty() ? nullptr : "NotSupportedError", algo.name + " needs a supported hash"};
@@ -1271,7 +1282,8 @@ bool deriveBitsCore(Value params, const Algorithm& algo, const CryptoKeyData& ba
             err = {nullptr, "PBKDF2 requires 'iterations'"};
             return false;
         }
-        if (iterations < 1) { err = {"OperationError", "PBKDF2 iterations must be at least 1"}; return false; }
+        if (!(iterations >= 1)) { err = {"OperationError", "PBKDF2 iterations must be at least 1"}; return false; }
+        if (iterations > 2147483647.0) { err = {"OperationError", "PBKDF2 iterations is too large"}; return false; }
         if (!pbkdf2(algo.hash, base.raw, salt, static_cast<uint64_t>(iterations), outLen, out)) {
             err = {"OperationError", "PBKDF2 failed"};
             return false;
@@ -1305,7 +1317,8 @@ bool derivedKeyLength(Value type, const Algorithm& algo, double& bits, Failure& 
     if (algo.name == "HMAC") {
         if (!isSha(algo.hash)) { err = {nullptr, "HMAC derivedKeyType needs a supported hash"}; return false; }
         if (!getNumberProp(type, "length", bits)) bits = static_cast<double>(hashBlockBits(algo.hash));
-        if (bits <= 0) { err = {nullptr, "HMAC length must be positive"}; return false; }
+        if (!(bits > 0)) { err = {nullptr, "HMAC length must be positive"}; return false; }
+        if (bits > kMaxKeyBits) { err = {"OperationError", "HMAC length is too large"}; return false; }
         return true;
     }
     err = {"NotSupportedError", "cannot derive a key for " + algo.name};
@@ -1388,7 +1401,8 @@ Value subtleGenerateKey(Value, std::span<const Value> a)
         if (!isSha(algo.hash))
             return rejected(algo.hash.empty() ? nullptr : "NotSupportedError", "generateKey: HMAC needs a supported hash");
         if (!getNumberProp(a[0], "length", bits)) bits = static_cast<double>(hashBlockBits(algo.hash));
-        if (bits <= 0) return rejected("OperationError", "generateKey: HMAC length must be positive");
+        if (!(bits > 0)) return rejected("OperationError", "generateKey: HMAC length must be positive");
+        if (bits > kMaxKeyBits) return rejected("OperationError", "generateKey: HMAC length is too large");
     } else if (isAes(algo.name)) {
         if (!getNumberProp(argOr(a, 0), "length", bits)) return rejected(nullptr, "generateKey: AES requires 'length'");
         if (bits != 128 && bits != 192 && bits != 256)

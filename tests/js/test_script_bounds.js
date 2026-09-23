@@ -82,6 +82,33 @@ fs.unlinkSync(path);
     assert(rejected, 'digest refuses a window that wraps');
     var ok = await crypto.subtle.digest('SHA-256', { byteOffset: 2, byteLength: 4, buffer: new ArrayBuffer(8) });
     assert(ok instanceof ArrayBuffer && ok.byteLength === 32, 'digest of an in-bounds window');
+
+    // Script numbers that sized an allocation or reached an int cast.
+    async function rejects(p, label) {
+        var threw = false;
+        try { await p; } catch (e) { threw = true; }
+        assert(threw, label);
+    }
+    var enc = new TextEncoder();
+    var base = await crypto.subtle.importKey('raw', enc.encode('pw'), 'PBKDF2', false, ['deriveBits']);
+    var pb = function (iterations) {
+        return { name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('salt'), iterations: iterations };
+    };
+    await rejects(crypto.subtle.deriveBits(pb(1), base, 8e300), 'deriveBits huge length');
+    await rejects(crypto.subtle.deriveBits(pb(NaN), base, 256), 'PBKDF2 NaN iterations');
+    await rejects(crypto.subtle.deriveBits(pb(1e300), base, 256), 'PBKDF2 huge iterations');
+    await rejects(crypto.subtle.generateKey({ name: 'HMAC', hash: 'SHA-256', length: 1e300 }, true, ['sign']),
+                  'HMAC generateKey huge length');
+    await rejects(crypto.subtle.generateKey({ name: 'HMAC', hash: 'SHA-256', length: NaN }, true, ['sign']),
+                  'HMAC generateKey NaN length');
+    var gcm = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 128 }, false, ['encrypt']);
+    await rejects(crypto.subtle.encrypt({ name: 'AES-GCM', iv: new Uint8Array(12), tagLength: NaN }, gcm, new Uint8Array(4)),
+                  'AES-GCM NaN tagLength');
+    await rejects(crypto.subtle.encrypt({ name: 'AES-GCM', iv: new Uint8Array(12), tagLength: 1e300 }, gcm, new Uint8Array(4)),
+                  'AES-GCM huge tagLength');
+    var ctr = await crypto.subtle.generateKey({ name: 'AES-CTR', length: 128 }, false, ['encrypt']);
+    await rejects(crypto.subtle.encrypt({ name: 'AES-CTR', counter: new Uint8Array(16), length: NaN }, ctr, new Uint8Array(4)),
+                  'AES-CTR NaN length');
 })().catch(function (e) {
     assert(false, 'crypto bounds failed: ' + (e && e.stack || e));
 });
