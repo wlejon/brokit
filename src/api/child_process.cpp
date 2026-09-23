@@ -690,13 +690,13 @@ static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
     else if (ev::isNull(encV)) opts.encoding = "buffer";
 
     bronze::Value toV = ev::getProperty(val, "timeout");
-    if (ev::isDouble(toV)) opts.timeout = static_cast<int>(ev::toDouble(toV));
+    if (ev::isDouble(toV)) opts.timeout = saturateI32(ev::toDouble(toV));
 
     bronze::Value shV = ev::getProperty(val, "shell");
     if (ev::isBool(shV)) opts.shell = ev::toBool(shV);
 
     bronze::Value mbV = ev::getProperty(val, "maxBuffer");
-    if (ev::isDouble(mbV)) opts.maxBuffer = static_cast<int>(ev::toDouble(mbV));
+    if (ev::isDouble(mbV)) opts.maxBuffer = saturateI32(ev::toDouble(mbV));
 
     bronze::Value inV = ev::getProperty(val, "input");
     if (ev::isString(inV)) opts.input = ev::toUtf8(inV);
@@ -711,7 +711,7 @@ static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
         if (ev::isObject(keys.get())) {
             bronze::Value lenV = ev::getProperty(keys.get(), "length");
             if (ev::isDouble(lenV)) {
-                uint32_t count = static_cast<uint32_t>(ev::toDouble(lenV));
+                uint32_t count = saturateU32(ev::toDouble(lenV));
                 for (uint32_t i = 0; i < count; ++i) {
                     bronze::Value k = ev::getElement(keys.get(), i);
                     if (ev::isString(k)) {
@@ -737,7 +737,7 @@ static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
 
     bronze::Value hwmV = ev::getProperty(val, "highWaterMark");
     if (ev::isDouble(hwmV)) {
-        opts.highWaterMark = static_cast<int>(ev::toDouble(hwmV));
+        opts.highWaterMark = saturateI32(ev::toDouble(hwmV));
         if (opts.highWaterMark < 4096) opts.highWaterMark = 4096;
     }
 
@@ -826,7 +826,7 @@ static bronze::Value js_spawnSync(bronze::Value, std::span<const bronze::Value> 
     if (a.size() >= 2 && ev::isObject(a[1])) {
         bronze::Value lenVal = ev::getProperty(a[1], "length");
         if (ev::isDouble(lenVal)) {
-            uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+            uint32_t len = saturateU32(ev::toDouble(lenVal));
             for (uint32_t i = 0; i < len; i++) {
                 bronze::Value elem = ev::getElement(a[1], i);
                 if (ev::isString(elem)) {
@@ -877,7 +877,7 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     if (a.size() >= 2 && ev::isObject(a[1])) {
         bronze::Value lenVal = ev::getProperty(a[1], "length");
         if (ev::isDouble(lenVal)) {
-            uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
+            uint32_t len = saturateU32(ev::toDouble(lenVal));
             for (uint32_t i = 0; i < len; i++) {
                 bronze::Value elem = ev::getElement(a[1], i);
                 if (ev::isString(elem)) {

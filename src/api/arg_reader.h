@@ -21,16 +21,60 @@ inline double numAt(std::span<const Value> args, size_t i) {
     return std::isnan(d) ? 0.0 : d;
 }
 
+// Script numbers into C++ integers. A double outside the target's range
+// (Infinity, 1e300) converted with a plain cast is undefined behaviour, so
+// these saturate; NaN is 0.
+inline int32_t saturateI32(double d) {
+    if (std::isnan(d)) return 0;
+    if (d <= static_cast<double>(INT32_MIN)) return INT32_MIN;
+    if (d >= static_cast<double>(INT32_MAX)) return INT32_MAX;
+    return static_cast<int32_t>(d);
+}
+
+// Negatives are 0.
+inline uint32_t saturateU32(double d) {
+    if (std::isnan(d) || d <= 0) return 0;
+    if (d >= static_cast<double>(UINT32_MAX)) return UINT32_MAX;
+    return static_cast<uint32_t>(d);
+}
+
+inline int64_t saturateI64(double d) {
+    if (std::isnan(d)) return 0;
+    // 2^63 is exactly representable; every double below it converts.
+    if (d <= -9223372036854775808.0) return INT64_MIN;
+    if (d >= 9223372036854775808.0) return INT64_MAX;
+    return static_cast<int64_t>(d);
+}
+
+// Longest array-like a binding walks when the script owns its `length`
+// (option lists, key lists, listener lists). Past it the walk would be a hang
+// or a huge allocation, not a real list.
+constexpr uint32_t kMaxScriptList = 1u << 20;
+
+// ECMAScript ToUint32 / ToInt32: modular, as `x >>> 0` / `x | 0` are, so a
+// uint32 seed of 0xFFFFFFFF still reads as -1 rather than colliding with
+// every other large value; non-finite is 0.
+inline uint32_t toUint32Modular(double d) {
+    if (!std::isfinite(d)) return 0;
+    double m = std::fmod(std::trunc(d), 4294967296.0);
+    if (m < 0) m += 4294967296.0;
+    return static_cast<uint32_t>(m);
+}
+
+inline int32_t toInt32Modular(double d) {
+    return static_cast<int32_t>(toUint32Modular(d));
+}
+
 inline int32_t i32At(std::span<const Value> args, size_t i) {
-    return static_cast<int32_t>(static_cast<int64_t>(numAt(args, i)));
+    return toInt32Modular(numAt(args, i));
 }
 
 inline uint32_t u32At(std::span<const Value> args, size_t i) {
-    return static_cast<uint32_t>(static_cast<int64_t>(numAt(args, i)));
+    return toUint32Modular(numAt(args, i));
 }
 
 inline int64_t i64At(std::span<const Value> args, size_t i) {
-    return static_cast<int64_t>(numAt(args, i));
+    return saturateI64(numAt(args, i));
 }
 
 inline bool boolAt(std::span<const Value> args, size_t i) {
@@ -148,7 +192,10 @@ inline bool plainArrayData(Value v, std::vector<T>& storage, Convert convert,
     ev::Persistent root(v);
     Value lenV = ev::getProperty(root.get(), "length");
     if (ev::isUndefined(lenV) || ev::isObject(lenV)) return false;
-    uint32_t n = static_cast<uint32_t>(ev::toDouble(lenV));
+    // `length` is the script's: an array-like claiming more than a list's
+    // worth is refused rather than sizing the allocation.
+    uint32_t n = saturateU32(ev::toDouble(lenV));
+    if (n > kMaxScriptList * 64u) return false;
     storage.resize(n);
     for (uint32_t i = 0; i < n; ++i) {
         Value e = ev::getElement(root.get(), i);
