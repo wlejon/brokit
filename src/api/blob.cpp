@@ -121,29 +121,29 @@ Value blobSlice(Value thisVal, std::span<const Value> a) {
 Value blobArrayBuffer(Value thisVal, std::span<const Value>) {
     BlobData* b = getBlobData(thisVal);
     if (!b) return ev::throwTypeError("Blob.arrayBuffer: receiver is not a Blob");
-    Value p = ev::createPromise();
+    ev::Persistent p{ev::createPromise()};
     Value ab = ev::createArrayBuffer(std::span<const uint8_t>(b->bytes.data(), b->bytes.size()));
-    ev::resolvePromise(p, ab);
-    return p;
+    ev::resolvePromise(p.get(), ab);
+    return p.get();
 }
 
 Value blobText(Value thisVal, std::span<const Value>) {
     BlobData* b = getBlobData(thisVal);
     if (!b) return ev::throwTypeError("Blob.text: receiver is not a Blob");
-    Value p = ev::createPromise();
+    ev::Persistent p{ev::createPromise()};
     Value s = ev::fromUtf8(std::string_view(reinterpret_cast<const char*>(b->bytes.data()), b->bytes.size()));
-    ev::resolvePromise(p, s);
-    return p;
+    ev::resolvePromise(p.get(), s);
+    return p.get();
 }
 
 Value blobBytesMethod(Value thisVal, std::span<const Value>) {
     BlobData* b = getBlobData(thisVal);
     if (!b) return ev::throwTypeError("Blob.bytes: receiver is not a Blob");
-    Value p = ev::createPromise();
+    ev::Persistent p{ev::createPromise()};
     Value u8 = ev::createTypedArray(ev::elements::Uint8, static_cast<uint32_t>(b->bytes.size()));
     ev::fillTypedArray(u8, std::span<const uint8_t>(b->bytes.data(), b->bytes.size()));
-    ev::resolvePromise(p, u8);
-    return p;
+    ev::resolvePromise(p.get(), u8);
+    return p.get();
 }
 
 std::string base64Encode(const std::vector<uint8_t>& in) {
@@ -186,20 +186,20 @@ void addReaderListener(Value target, const std::string& type, Value fn) {
     ev::Persistent targetP(target);
     ev::Persistent fnP(fn);
     const std::string key = readerListenerKey(type);
-    Value list = ev::getProperty(targetP.get(), key);
-    if (!ev::isObject(list)) {
-        list = ev::createObject();
-        ev::setProperty(list, "length", ev::fromDouble(0));
-        ev::setProperty(targetP.get(), key, list);
+    ev::Persistent list{ev::getProperty(targetP.get(), key)};
+    if (!ev::isObject(list.get())) {
+        list.set(ev::createObject());
+        list.set(ev::setProperty(list.get(), "length", ev::fromDouble(0)));
+        ev::setProperty(targetP.get(), key, list.get());
     }
-    Value lenV = ev::getProperty(list, "length");
+    Value lenV = ev::getProperty(list.get(), "length");
     uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
     for (uint32_t i = 0; i < len; ++i) {
-        Value existing = ev::getElement(list, i);
+        Value existing = ev::getElement(list.get(), i);
         if (ev::toBits(existing) == ev::toBits(fnP.get())) return;
     }
-    ev::setElement(list, len, fnP.get());
-    ev::setProperty(list, "length", ev::fromDouble(len + 1));
+    list.set(ev::setElement(list.get(), len, fnP.get()));
+    ev::setProperty(list.get(), "length", ev::fromDouble(len + 1));
 }
 
 void removeReaderListener(Value target, const std::string& type, Value fn) {
@@ -207,13 +207,13 @@ void removeReaderListener(Value target, const std::string& type, Value fn) {
     ev::Persistent targetP(target);
     ev::Persistent fnP(fn);
     const std::string key = readerListenerKey(type);
-    Value list = ev::getProperty(targetP.get(), key);
-    if (!ev::isObject(list)) return;
-    Value lenV = ev::getProperty(list, "length");
+    ev::Persistent list{ev::getProperty(targetP.get(), key)};
+    if (!ev::isObject(list.get())) return;
+    Value lenV = ev::getProperty(list.get(), "length");
     uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
     uint32_t found = len;
     for (uint32_t i = 0; i < len; ++i) {
-        Value existing = ev::getElement(list, i);
+        Value existing = ev::getElement(list.get(), i);
         if (ev::toBits(existing) == ev::toBits(fnP.get())) {
             found = i;
             break;
@@ -221,11 +221,11 @@ void removeReaderListener(Value target, const std::string& type, Value fn) {
     }
     if (found == len) return;
     for (uint32_t i = found + 1; i < len; ++i) {
-        Value moved = ev::getElement(list, i);
-        ev::setElement(list, i - 1, moved);
+        Value moved = ev::getElement(list.get(), i);
+        list.set(ev::setElement(list.get(), i - 1, moved));
     }
-    ev::setElement(list, len - 1, ev::undefined());
-    ev::setProperty(list, "length", ev::fromDouble(len - 1));
+    list.set(ev::setElement(list.get(), len - 1, ev::undefined()));
+    ev::setProperty(list.get(), "length", ev::fromDouble(len - 1));
 }
 
 void dispatchReaderEvent(Value target, const std::string& type) {
@@ -236,12 +236,12 @@ void dispatchReaderEvent(Value target, const std::string& type) {
         if (ev::isFunction(on)) handlers.emplace_back(on);
     }
     {
-        Value list = ev::getProperty(targetP.get(), readerListenerKey(type));
-        if (ev::isObject(list)) {
-            Value lenV = ev::getProperty(list, "length");
+        ev::Persistent list{ev::getProperty(targetP.get(), readerListenerKey(type))};
+        if (ev::isObject(list.get())) {
+            Value lenV = ev::getProperty(list.get(), "length");
             uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
             for (uint32_t i = 0; i < len; ++i) {
-                Value h = ev::getElement(list, i);
+                Value h = ev::getElement(list.get(), i);
                 if (ev::isFunction(h)) handlers.emplace_back(h);
             }
         }
@@ -250,7 +250,8 @@ void dispatchReaderEvent(Value target, const std::string& type) {
 
     for (ev::Persistent& handler : handlers) {
         ev::Persistent evt(ev::createObject());
-        evt.set(ev::setProperty(evt.get(), "type", ev::fromUtf8(type)));
+        ev::Persistent typeStr(ev::fromUtf8(type));
+        evt.set(ev::setProperty(evt.get(), "type", typeStr.get()));
         evt.set(ev::setProperty(evt.get(), "target", targetP.get()));
         Value arg = evt.get();
         ev::call(handler.get(), targetP.get(), std::span<const Value>(&arg, 1));
@@ -261,6 +262,7 @@ void startRead(Value self, Value blobValue,
                std::function<Value(const std::vector<uint8_t>&)> produce) {
     auto* r = static_cast<ReaderData*>(ev::handleData(self));
     if (!r) return;
+    ev::Persistent target(self);
     BlobData* blob = getBlobData(blobValue);
 
     r->readyState = 1; // LOADING
@@ -270,8 +272,6 @@ void startRead(Value self, Value blobValue,
     const uint64_t generation = ++r->generation;
     std::vector<uint8_t> bytes = blob ? blob->bytes : std::vector<uint8_t>();
     const bool haveBlob = blob != nullptr;
-
-    ev::Persistent target(self);
 
     auto task = [target, generation, bytes = std::move(bytes), haveBlob,
                  produce = std::move(produce)]() mutable {
@@ -303,16 +303,15 @@ void startRead(Value self, Value blobValue,
     if (g_hostTaskPoster) {
         g_hostTaskPoster(std::move(task));
     } else {
-        Value setTimeoutFn = ev::getProperty(ev::globalValue("globalThis").value, "setTimeout");
-        if (ev::isFunction(setTimeoutFn)) {
+        ev::Persistent setTimeoutFn{ev::getProperty(ev::globalValue("globalThis").value, "setTimeout")};
+        if (ev::isFunction(setTimeoutFn.get())) {
             auto sharedTask = std::make_shared<std::function<void()>>(std::move(task));
             Value cb = ev::makeFunction([sharedTask](Value, std::span<const Value>) {
                 (*sharedTask)();
                 return ev::undefined();
             }, 0, "fileReaderTask");
-            Value zero = ev::fromDouble(0);
-            Value args[2] = { cb, zero };
-            ev::call(setTimeoutFn, ev::undefined(), args);
+            Value args[2] = { cb, ev::fromDouble(0) };
+            ev::call(setTimeoutFn.get(), ev::undefined(), args);
         }
     }
 }
@@ -422,7 +421,7 @@ void installBlob() {
             Value obj = g_fileReaderClass.make(r, readerDtor);
             for (const char* slot : {"onload", "onerror", "onloadend", "onloadstart",
                                      "onprogress", "onabort"}) {
-                ev::setProperty(obj, slot, ev::null());
+                obj = ev::setProperty(obj, slot, ev::null());  // post-call address
             }
             return obj;
         },
@@ -490,8 +489,9 @@ void installBlob() {
                 ++r->generation;
                 r->readyState = 2; // DONE
                 r->result.set(ev::null());
-                dispatchReaderEvent(thisVal, "abort");
-                dispatchReaderEvent(thisVal, "loadend");
+                ev::Persistent self{thisVal};
+                dispatchReaderEvent(self.get(), "abort");
+                dispatchReaderEvent(self.get(), "loadend");
                 return ev::undefined();
             });
             proto.def("addEventListener", 2, [](Value thisVal, std::span<const Value> a) {

@@ -162,9 +162,11 @@ static bronze::Value js_ws_send(bronze::Value, std::span<const bronze::Value> ar
     CURLcode rc = CURLE_OK;
 
     if (binary) {
-        if (ev::isObject(dataVal)) {
-            bronze::Value u8 = ev::getProperty(dataVal, "_u8");
-            if (ev::isObject(u8)) dataVal = u8;
+        // The "_u8" read may allocate: re-read args[1] after it rather than
+        // trusting the earlier copy.
+        if (!ev::typedArrayInfo(args[1]) && !ev::arrayBufferInfo(args[1]) && ev::isObject(args[1])) {
+            bronze::Value u8 = ev::getProperty(args[1], "_u8");
+            dataVal = ev::isObject(u8) ? u8 : args[1];
         }
         const uint8_t* blobData = nullptr;
         size_t blobLen = 0;
@@ -353,9 +355,8 @@ static bronze::Value js_ws_tick(bronze::Value, std::span<const bronze::Value>)
                 conn->state = 3; // closed (failed)
                 conn->errorMsg = curl_easy_strerror(msg->data.result);
                 if (conn->promise.valid()) {
-                    auto errRes = ev::construct(ev::getGlobal("Error"),
-                        std::array<bronze::Value, 1>{ev::fromUtf8(conn->errorMsg)});
-                    ev::rejectPromise(conn->promise.get(), errRes.value);
+                    bronze::Value err = newError("Error", conn->errorMsg);
+                    ev::rejectPromise(conn->promise.get(), err);
                     conn->promise.reset();
                 }
             }

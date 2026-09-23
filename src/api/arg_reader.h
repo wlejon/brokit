@@ -126,8 +126,14 @@ inline Value hostArrayOf(size_t count, const std::function<Value(size_t)>& make)
     return arr.get();
 }
 
+// `items` must be current at the call (a rooted args span, or values produced
+// with no allocation since). They are rooted before the array allocates;
+// to COLLECT heap values in a loop, use ArrayBuilder instead.
 inline Value hostArrayOf(std::span<const Value> items) {
-    return hostArrayOf(items.size(), [&](size_t i) { return items[i]; });
+    std::vector<ev::Persistent> roots;
+    roots.reserve(items.size());
+    for (Value v : items) roots.emplace_back(v);
+    return hostArrayOf(roots.size(), [&](size_t i) { return roots[i].get(); });
 }
 
 inline Value hostArrayOf(const std::vector<Value>& items) {

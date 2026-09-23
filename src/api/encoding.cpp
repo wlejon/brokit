@@ -32,23 +32,20 @@ Value decoderDecode(Value, std::span<const Value> a) {
     if (len == 0 || !data) {
         return ev::fromUtf8("");
     }
-    return ev::fromUtf8(std::string_view(reinterpret_cast<const char*>(data), len));
+    // Copy out first: `data` points into the heap, and fromUtf8 allocates the
+    // result string before it reads its input, so a collection there would
+    // leave it reading the buffer's abandoned address.
+    const std::string bytes(reinterpret_cast<const char*>(data), len);
+    return ev::fromUtf8(bytes);
 }
 
 } // namespace
 
 void installEncoding() {
-    Value encFn = ev::makeFunction(encoderEncode, 1, "__brokit_textencoder_encode");
-    Value decFn = ev::makeFunction(decoderDecode, 1, "__brokit_textdecoder_decode");
-
-    ev::registerGlobal("__brokit_textencoder_encode", encFn);
-    ev::registerGlobal("__brokit_textdecoder_decode", decFn);
-
-    auto g = ev::globalValue("globalThis");
-    if (g.found && ev::isObject(g.value)) {
-        ev::setProperty(g.value, "__brokit_textencoder_encode", encFn);
-        ev::setProperty(g.value, "__brokit_textdecoder_decode", decFn);
-    }
+    ev::setGlobalValue("__brokit_textencoder_encode",
+                       ev::makeFunction(encoderEncode, 1, "__brokit_textencoder_encode"));
+    ev::setGlobalValue("__brokit_textdecoder_decode",
+                       ev::makeFunction(decoderDecode, 1, "__brokit_textdecoder_decode"));
 
     bronze::embed::runEntry(bronze_encoding_main);
 }

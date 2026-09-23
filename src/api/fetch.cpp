@@ -96,17 +96,26 @@ void addFetchBasePath(const std::string& path)
 // ---------------------------------------------------------------------------
 // Helpers backed by JS factories from fetch_helpers.js
 // ---------------------------------------------------------------------------
+// `args` must be current at the call; they are rooted before the lookups
+// below allocate.
 static bronze::Value callInternal(const char* fnName, std::span<const bronze::Value> args)
 {
-    bronze::Value internals = ev::getGlobal("__brokit_fetch_internals");
-    if (!ev::isObject(internals)) {
+    std::vector<ev::Persistent> roots;
+    roots.reserve(args.size());
+    for (bronze::Value v : args) roots.emplace_back(v);
+
+    ev::Persistent internals{ev::getGlobal("__brokit_fetch_internals")};
+    if (!ev::isObject(internals.get())) {
         return ev::throwError("fetch: internals not installed");
     }
-    bronze::Value fn = ev::getProperty(internals, fnName);
-    if (!ev::isFunction(fn)) {
+    ev::Persistent fn{ev::getProperty(internals.get(), fnName)};
+    if (!ev::isFunction(fn.get())) {
         return ev::throwError(std::string("fetch: missing internal helper '") + fnName + "'");
     }
-    auto ret = ev::call(fn, ev::undefined(), args);
+    std::vector<bronze::Value> current;
+    current.reserve(roots.size());
+    for (const ev::Persistent& r : roots) current.push_back(r.get());
+    auto ret = ev::call(fn.get(), ev::undefined(), current);
     return ret.value;
 }
 
@@ -315,9 +324,8 @@ static bronze::Value buildDataUrlResponse(const std::string& url)
     resp.set("headers", buildHeaders(headerLines));
     resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(data.data(), data.size())));
 
-    bronze::Value respVal = resp.build();
-    callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
-    return respVal;
+    callInternal("applyFileBody", std::array<bronze::Value, 1>{resp.build()});
+    return resp.build();  // re-read from the builder's root: the call allocated
 }
 
 // Build a Response for a blob: URL from the URL.createObjectURL registry.
@@ -334,9 +342,8 @@ static bronze::Value buildBlobUrlResponse(const std::string& url, bool* found)
         resp.set("url", url);
         resp.set("headers", buildHeaders({}));
         resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>()));
-        bronze::Value respVal = resp.build();
-        callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
-        return respVal;
+        callInternal("applyFileBody", std::array<bronze::Value, 1>{resp.build()});
+        return resp.build();
     }
     *found = true;
 
@@ -359,9 +366,8 @@ static bronze::Value buildBlobUrlResponse(const std::string& url, bool* found)
     resp.set("headers", buildHeaders(headerLines));
     resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(data, len)));
 
-    bronze::Value respVal = resp.build();
-    callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
-    return respVal;
+    callInternal("applyFileBody", std::array<bronze::Value, 1>{resp.build()});
+    return resp.build();  // re-read from the builder's root: the call allocated
 }
 
 // Build a Response for a local file read
@@ -376,9 +382,8 @@ static bronze::Value buildFileResponse(const std::string& url, const std::string
         resp.set("url", url);
         resp.set("headers", buildHeaders({}));
 
-        bronze::Value respVal = resp.build();
-        callInternal("applyNotFoundBody", std::array<bronze::Value, 1>{respVal});
-        return respVal;
+        callInternal("applyNotFoundBody", std::array<bronze::Value, 1>{resp.build()});
+        return resp.build();
     }
 
     auto size = file.tellg();
@@ -400,9 +405,8 @@ static bronze::Value buildFileResponse(const std::string& url, const std::string
     resp.set("headers", buildHeaders(headerLines));
     resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(data.data(), data.size())));
 
-    bronze::Value respVal = resp.build();
-    callInternal("applyFileBody", std::array<bronze::Value, 1>{respVal});
-    return respVal;
+    callInternal("applyFileBody", std::array<bronze::Value, 1>{resp.build()});
+    return resp.build();  // re-read from the builder's root: the call allocated
 }
 
 static size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
@@ -449,9 +453,8 @@ static bronze::Value buildStreamingResponse(FetchRequest* req)
     resp.set("headers", buildHeaders(req->headers));
     resp.set("__streamId", static_cast<double>(req->streamId));
 
-    bronze::Value respVal = resp.build();
-    callInternal("applyStreamingBody", std::array<bronze::Value, 1>{respVal});
-    return respVal;
+    callInternal("applyStreamingBody", std::array<bronze::Value, 1>{resp.build()});
+    return resp.build();
 }
 
 // Build a Response for a completed response
@@ -466,9 +469,8 @@ static bronze::Value buildCompleteResponse(FetchRequest* req)
     resp.set("__body", ev::createArrayBuffer(std::span<const uint8_t>(req->body.data(), req->body.size())));
     resp.set("__streamId", static_cast<double>(req->streamId));
 
-    bronze::Value respVal = resp.build();
-    callInternal("applyCompleteBody", std::array<bronze::Value, 1>{respVal});
-    return respVal;
+    callInternal("applyCompleteBody", std::array<bronze::Value, 1>{resp.build()});
+    return resp.build();
 }
 
 // ---------------------------------------------------------------------------
@@ -540,11 +542,10 @@ static bronze::Value js_fetch_stream_wait(bronze::Value, std::span<const bronze:
 // ---------------------------------------------------------------------------
 static bronze::Value makeAbortError()
 {
-    auto res = ev::construct(ev::getGlobal("Error"),
-        std::array<bronze::Value, 1>{ev::fromUtf8("The operation was aborted.")});
-    bronze::Value err = res.value;
-    ev::setProperty(err, "name", ev::fromUtf8("AbortError"));
-    return err;
+    ev::Persistent err{newError("Error", "The operation was aborted.")};
+    ev::Persistent name{ev::fromUtf8("AbortError")};
+    err.set(ev::setProperty(err.get(), "name", name.get()));
+    return err.get();
 }
 
 static bool signalIsAborted(bronze::Value signal)
@@ -598,10 +599,10 @@ static void attachAbortListener(bronze::Value signal, int streamId)
         return ev::undefined();
     }, 0, "abortHandler"));
 
-    bronze::Value addFn = ev::getProperty(signalRoot.get(), "addEventListener");
-    if (ev::isFunction(addFn)) {
+    ev::Persistent addFn{ev::getProperty(signalRoot.get(), "addEventListener")};
+    if (ev::isFunction(addFn.get())) {
         std::array<bronze::Value, 2> lArgs = { ev::fromUtf8("abort"), handler.get() };
-        ev::call(addFn, signalRoot.get(), lArgs);
+        ev::call(addFn.get(), signalRoot.get(), lArgs);
     }
 }
 
@@ -727,11 +728,12 @@ static bronze::Value js_fetch_tick(bronze::Value, std::span<const bronze::Value>
                     req->promise.reset();
                 }
             } else {
+                // A network error rejects fetch() with a TypeError (Fetch
+                // spec; the blob: path above does the same).
                 const char* errMsg = curl_easy_strerror(msg->data.result);
-                auto errRes = ev::construct(ev::getGlobal("Error"),
-                    std::array<bronze::Value, 1>{ev::fromUtf8(errMsg ? errMsg : "fetch failed")});
                 if (req->promise.valid()) {
-                    ev::rejectPromise(req->promise.get(), errRes.value);
+                    bronze::Value err = newError("TypeError", errMsg ? errMsg : "fetch failed");
+                    ev::rejectPromise(req->promise.get(), err);
                     req->promise.reset();
                 }
             }
@@ -773,14 +775,14 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
     // aborted rejects before any I/O, and a live one is subscribed to below.
     ev::Persistent signal;
     if (args.size() >= 2 && ev::isObject(args[1])) {
-        bronze::Value sig = ev::getProperty(args[1], "signal");
-        if (ev::isObject(sig)) {
-            if (signalIsAborted(sig)) {
-                bronze::Value p = ev::createPromise();
-                ev::rejectPromise(p, makeAbortError());
-                return p;
-            }
-            signal.set(sig);
+        signal.set(ev::getProperty(args[1], "signal"));
+        if (!ev::isObject(signal.get())) {
+            signal.set(ev::undefined());
+        } else if (signalIsAborted(signal.get())) {
+            ev::Persistent p{ev::createPromise()};
+            ev::Persistent err{makeAbortError()};
+            ev::rejectPromise(p.get(), err.get());
+            return p.get();
         }
     }
 
@@ -832,7 +834,9 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
     curl_easy_setopt(req->easy, CURLOPT_ACCEPT_ENCODING, "");
 
     if (args.size() >= 2 && ev::isObject(args[1])) {
-        bronze::Value opt = args[1];
+        // A reference into the rooted args span: it stays current across the
+        // allocating calls below, where a copy would go stale.
+        const bronze::Value& opt = args[1];
 
         bronze::Value mVal = ev::getProperty(opt, "mode");
         if (ev::isString(mVal)) {
@@ -886,20 +890,20 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
             }
         }
 
-        bronze::Value headersVal = ev::getProperty(opt, "headers");
-        if (ev::isObject(headersVal)) {
-            bronze::Value objCtor = ev::getGlobal("Object");
-            bronze::Value keysFn = ev::getProperty(objCtor, "keys");
-            auto keysRes = ev::call(keysFn, ev::undefined(), std::array<bronze::Value, 1>{headersVal});
+        ev::Persistent headersVal{ev::getProperty(opt, "headers")};
+        if (ev::isObject(headersVal.get())) {
+            ev::Persistent objCtor{ev::getGlobal("Object")};
+            ev::Persistent keysFn{ev::getProperty(objCtor.get(), "keys")};
+            auto keysRes = ev::call(keysFn.get(), ev::undefined(), std::array<bronze::Value, 1>{headersVal.get()});
             if (!keysRes.thrown) {
-                bronze::Value keysArr = keysRes.value;
-                bronze::Value lenVal = ev::getProperty(keysArr, "length");
+                ev::Persistent keysArr{keysRes.value};
+                bronze::Value lenVal = ev::getProperty(keysArr.get(), "length");
                 int len = ev::isDouble(lenVal) ? static_cast<int>(ev::toDouble(lenVal)) : 0;
                 for (int i = 0; i < len; ++i) {
-                    bronze::Value k = ev::getElement(keysArr, i);
+                    bronze::Value k = ev::getElement(keysArr.get(), i);
                     if (ev::isString(k)) {
                         std::string key = ev::toUtf8(k);
-                        bronze::Value val = ev::getProperty(headersVal, key);
+                        bronze::Value val = ev::getProperty(headersVal.get(), key);
                         if (ev::isString(val)) {
                             std::string line = key + ": " + ev::toUtf8(val);
                             req->requestHeaders = curl_slist_append(req->requestHeaders, line.c_str());

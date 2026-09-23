@@ -25,6 +25,19 @@ struct TestResult {
     std::vector<std::string> failures;
 };
 
+// The most recent console/runtime log line, readable from a test through
+// __test_lastLog() so console formatting can be asserted.
+static std::string g_lastLog;
+
+static void captureLog(brokit::Runtime::LogLevel level, const std::string& msg) {
+    g_lastLog = msg;
+    using L = brokit::Runtime::LogLevel;
+    FILE* out = (level == L::Error || level == L::Warn) ? stderr : stdout;
+    const char* prefix = level == L::Debug ? "[DEBUG] " : level == L::Info ? "[INFO]  "
+                       : level == L::Warn ? "[WARN]  " : "[ERROR] ";
+    fprintf(out, "%s%s\n", prefix, msg.c_str());
+}
+
 static TestResult runTestFile(const std::string& path) {
     TestResult result;
     result.name = fs::path(path).filename().string();
@@ -33,6 +46,10 @@ static TestResult runTestFile(const std::string& path) {
 
     // Install all APIs
     brokit::api::installAll();
+    brokit::Runtime::setLogCallback(captureLog);
+    bronze::embed::setGlobalFunction("__test_lastLog", 0, [](bronze::Value, std::span<const bronze::Value>) {
+        return bronze::embed::fromUtf8(g_lastLog);
+    });
 
     // Install test helpers: assert, test registration
     const char* testHarness = R"JS(
@@ -95,38 +112,29 @@ static TestResult runTestFile(const std::string& path) {
     // Pump async subsystems: tick curl_multi (fetch + websocket) until idle.
     namespace ev = bronze::embed;
 
-    auto fetchHasPending = ev::globalValue("__brokit_fetch_has_pending");
-    auto fetchTick = ev::globalValue("__brokit_fetch_tick");
-    auto wsHasPending = ev::globalValue("__brokit_ws_has_pending");
-    auto wsTick = ev::globalValue("__brokit_ws_tick");
-    auto fwHasPending = ev::globalValue("__brokit_fs_watch_has_pending");
-    auto fwTick = ev::globalValue("__brokit_fs_watch_tick");
-    auto netHasPending = ev::globalValue("__brokit_net_has_pending");
-    auto netTick = ev::globalValue("__brokit_net_tick");
-    auto cpHasPending = ev::globalValue("__brokit_cp_has_pending");
-    auto timersTick = ev::globalValue("__brokit_tick_timers");
+    // Each lookup may allocate, so each result is rooted before the next.
+    auto rootedFn = [](const char* name) {
+        auto g = ev::globalValue(name);
+        return ev::Persistent{g.found && ev::isFunction(g.value) ? g.value : ev::undefined()};
+    };
+    ev::Persistent pFetchHasPending = rootedFn("__brokit_fetch_has_pending");
+    ev::Persistent pFetchTick = rootedFn("__brokit_fetch_tick");
+    ev::Persistent pWsHasPending = rootedFn("__brokit_ws_has_pending");
+    ev::Persistent pWsTick = rootedFn("__brokit_ws_tick");
+    ev::Persistent pFwHasPending = rootedFn("__brokit_fs_watch_has_pending");
+    ev::Persistent pFwTick = rootedFn("__brokit_fs_watch_tick");
+    ev::Persistent pNetHasPending = rootedFn("__brokit_net_has_pending");
+    ev::Persistent pNetTick = rootedFn("__brokit_net_tick");
+    ev::Persistent pCpHasPending = rootedFn("__brokit_cp_has_pending");
+    ev::Persistent pTimersTick = rootedFn("__brokit_tick_timers");
 
-    bool haveFetch = fetchHasPending.found && ev::isFunction(fetchHasPending.value) &&
-                     fetchTick.found && ev::isFunction(fetchTick.value);
-    bool haveWs = wsHasPending.found && ev::isFunction(wsHasPending.value) &&
-                  wsTick.found && ev::isFunction(wsTick.value);
-    bool haveFw = fwHasPending.found && ev::isFunction(fwHasPending.value) &&
-                  fwTick.found && ev::isFunction(fwTick.value);
-    bool haveNet = netHasPending.found && ev::isFunction(netHasPending.value) &&
-                   netTick.found && ev::isFunction(netTick.value);
-    bool haveCp = cpHasPending.found && ev::isFunction(cpHasPending.value);
-    bool haveTimers = timersTick.found && ev::isFunction(timersTick.value);
-
-    ev::Persistent pFetchHasPending{haveFetch ? fetchHasPending.value : ev::undefined()};
-    ev::Persistent pFetchTick{haveFetch ? fetchTick.value : ev::undefined()};
-    ev::Persistent pWsHasPending{haveWs ? wsHasPending.value : ev::undefined()};
-    ev::Persistent pWsTick{haveWs ? wsTick.value : ev::undefined()};
-    ev::Persistent pFwHasPending{haveFw ? fwHasPending.value : ev::undefined()};
-    ev::Persistent pFwTick{haveFw ? fwTick.value : ev::undefined()};
-    ev::Persistent pNetHasPending{haveNet ? netHasPending.value : ev::undefined()};
-    ev::Persistent pNetTick{haveNet ? netTick.value : ev::undefined()};
-    ev::Persistent pCpHasPending{haveCp ? cpHasPending.value : ev::undefined()};
-    ev::Persistent pTimersTick{haveTimers ? timersTick.value : ev::undefined()};
+    auto isFn = [](const ev::Persistent& p) { return ev::isFunction(p.get()); };
+    bool haveFetch = isFn(pFetchHasPending) && isFn(pFetchTick);
+    bool haveWs = isFn(pWsHasPending) && isFn(pWsTick);
+    bool haveFw = isFn(pFwHasPending) && isFn(pFwTick);
+    bool haveNet = isFn(pNetHasPending) && isFn(pNetTick);
+    bool haveCp = isFn(pCpHasPending);
+    bool haveTimers = isFn(pTimersTick);
 
     if (haveFetch || haveWs || haveFw || haveNet || haveCp) {
         for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep

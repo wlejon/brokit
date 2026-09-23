@@ -57,4 +57,21 @@ struct ObjectBuilder {
     Value build() const { return obj.get(); }
 };
 
+/// Builds a JS Array element by element with the array rooted throughout.
+/// This is the way to collect heap values in a loop: a std::vector<Value>
+/// of fresh strings/objects goes stale as soon as the next one allocates.
+/// push() takes a FRESH value (nothing allocated since it was produced).
+struct ArrayBuilder {
+    ev::Persistent arr;
+    uint32_t length = 0;
+
+    ArrayBuilder() : arr(ev::makeArray(0)) {}
+
+    void push(Value v) {
+        arr.set(ev::setElement(arr.get(), length++, v));
+    }
+
+    Value get() const { return arr.get(); }
+};
+
 } // namespace brokit::api

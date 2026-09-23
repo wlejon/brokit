@@ -12,16 +12,6 @@ namespace brokit::api {
 
 namespace {
 
-Value throwDOMException(const std::string& message, const std::string& name) {
-    auto de = ev::globalValue("DOMException");
-    if (de.found && ev::isFunction(de.value)) {
-        Value args[2] = { ev::fromUtf8(message), ev::fromUtf8(name) };
-        ev::CallResult res = ev::construct(de.value, std::span<const Value>(args, 2));
-        if (!res.thrown) return ev::throwValue(res.value);
-    }
-    return ev::throwError(name + ": " + message);
-}
-
 Value nativeBtoa(Value, std::span<const Value> a) {
     std::string utf8 = ev::toUtf8(hasArg(a, 0) ? a[0] : ev::undefined());
     std::vector<uint8_t> latin1;
@@ -139,21 +129,24 @@ Value nativeAtob(Value, std::span<const Value> a) {
 } // namespace
 
 void installBase64() {
-    Value btoaFn = ev::makeFunction(nativeBtoa, 1, "btoa");
-    Value atobFn = ev::makeFunction(nativeAtob, 1, "atob");
+    ev::Persistent btoaFn{ev::makeFunction(nativeBtoa, 1, "btoa")};
+    ev::Persistent atobFn{ev::makeFunction(nativeAtob, 1, "atob")};
 
-    ev::registerGlobal("btoa", btoaFn);
-    ev::registerGlobal("atob", atobFn);
+    ev::registerGlobal("btoa", btoaFn.get());
+    ev::registerGlobal("atob", atobFn.get());
 
+    ev::Persistent global;
     auto g = ev::globalValue("globalThis");
     if (g.found && ev::isObject(g.value)) {
-        ev::setProperty(g.value, "btoa", btoaFn);
-        ev::setProperty(g.value, "atob", atobFn);
+        global.set(g.value);
+        global.set(ev::setProperty(global.get(), "btoa", btoaFn.get()));
+        global.set(ev::setProperty(global.get(), "atob", atobFn.get()));
     }
     auto w = ev::globalValue("window");
-    if (w.found && ev::isObject(w.value) && w.value != g.value) {
-        ev::setProperty(w.value, "btoa", btoaFn);
-        ev::setProperty(w.value, "atob", atobFn);
+    if (w.found && ev::isObject(w.value) && w.value != global.get()) {
+        ev::Persistent win{w.value};
+        win.set(ev::setProperty(win.get(), "btoa", btoaFn.get()));
+        win.set(ev::setProperty(win.get(), "atob", atobFn.get()));
     }
 
     bronze::embed::runEntry(bronze_base64_main);

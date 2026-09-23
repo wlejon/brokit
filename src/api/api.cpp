@@ -70,13 +70,13 @@ static bronze::Value load_file_module(const std::string& spec)
     const std::string file = found.string();
     const std::string dir = found.parent_path().string();
 
-    bronze::Value cache = ev::getGlobal("__brokit_module_cache");
-    if (!ev::isObject(cache)) {
-        cache = ev::createObject();
-        ev::setGlobalValue("__brokit_module_cache", cache);
+    ev::Persistent cache{ev::getGlobal("__brokit_module_cache")};
+    if (!ev::isObject(cache.get())) {
+        cache.set(ev::createObject());
+        ev::setGlobalValue("__brokit_module_cache", cache.get());
     }
 
-    bronze::Value hit = ev::getProperty(cache, file);
+    bronze::Value hit = ev::getProperty(cache.get(), file);
     if (!ev::isUndefined(hit)) {
         return hit;
     }
@@ -92,15 +92,18 @@ static bronze::Value load_file_module(const std::string& spec)
     if (found.extension() == ".json") {
         auto res = ev::parseJson(src);
         if (!res.thrown) {
-            ev::setProperty(cache, file, res.value);
-            return res.value;
+            ev::Persistent parsed{res.value};
+            cache.set(ev::setProperty(cache.get(), file, parsed.get()));
+            return parsed.get();
         }
         return ev::throwError("SyntaxError: failed to parse JSON module " + file);
     }
 
     // For .js files, execute in CommonJS envelope
-    bronze::Value exportsObj = ev::createObject();
-    ev::setProperty(cache, file, exportsObj);
+    {
+        ev::Persistent exportsObj{ev::createObject()};
+        cache.set(ev::setProperty(cache.get(), file, exportsObj.get()));
+    }
 
     RequireDirGuard guard{fs::path(dir)};
 

@@ -145,12 +145,12 @@ void installProcess() {
 
     process.def("nextTick", 1, [](Value, std::span<const Value> a) {
         if (a.empty() || !ev::isFunction(a[0])) return ev::undefined();
-        Value fn = a[0];
-        Value p = ev::createPromise();
-        ev::resolvePromise(p, ev::undefined());
-        Value thenFn = ev::getProperty(p, "then");
-        if (ev::isFunction(thenFn)) {
-            ev::call(thenFn, p, std::span<const Value>(&fn, 1));
+        ev::Persistent p{ev::createPromise()};
+        ev::resolvePromise(p.get(), ev::undefined());
+        ev::Persistent thenFn{ev::getProperty(p.get(), "then")};
+        if (ev::isFunction(thenFn.get())) {
+            // a[0] is read from the rooted args span, never a stale copy.
+            ev::call(thenFn.get(), p.get(), a.subspan(0, 1));
         }
         return ev::undefined();
     });

@@ -13,22 +13,19 @@
 
 namespace bronze::embed {
 inline bool isDouble(Value v) { return isNumber(v); }
+// `val` must be fresh (nothing allocated since it was produced); it is rooted
+// before the globalThis lookup, which may allocate.
 inline void setGlobalValue(std::string_view name, Value val) {
-    registerGlobal(name, val);
+    Persistent v{val};
+    registerGlobal(name, v.get());
     auto g = globalValue("globalThis");
-    if (g.found && isObject(g.value)) setProperty(g.value, name, val);
+    if (g.found && isObject(g.value)) setProperty(g.value, name, v.get());
 }
 inline void setGlobalFunction(std::string_view name, uint32_t arity, NativeFn fn) {
-    auto f = makeFunction(std::move(fn), arity, name);
-    registerGlobal(name, f);
-    auto g = globalValue("globalThis");
-    if (g.found && isObject(g.value)) setProperty(g.value, name, f);
+    setGlobalValue(name, makeFunction(std::move(fn), arity, name));
 }
 inline void registerFunction(std::string_view name, NativeFn fn, uint32_t arity = 0) {
-    auto f = makeFunction(std::move(fn), arity, name);
-    registerGlobal(name, f);
-    auto g = globalValue("globalThis");
-    if (g.found && isObject(g.value)) setProperty(g.value, name, f);
+    setGlobalValue(name, makeFunction(std::move(fn), arity, name));
 }
 inline Value getGlobal(std::string_view name) {
     auto gv = globalValue(name);
@@ -56,6 +53,37 @@ public:
 private:
     bronze::embed::Persistent p_;
 };
+
+/// `new <ctorName>(message)` for a global error constructor (Error,
+/// TypeError, ...), built GC-safely: the message is rooted before the
+/// constructor is looked up and called. Falls back to the message string.
+inline bronze::Value newError(std::string_view ctorName, std::string_view message) {
+    namespace ev = bronze::embed;
+    ev::Persistent msg{ev::fromUtf8(message)};
+    auto g = ev::globalValue(ctorName);
+    if (!g.found || !ev::isFunction(g.value)) return msg.get();
+    ev::Persistent ctor{g.value};
+    const bronze::Value args[1] = {msg.get()};
+    ev::CallResult r = ev::construct(ctor.get(), std::span<const bronze::Value>(args, 1));
+    return r.thrown ? msg.get() : r.value;
+}
+
+/// Throw `new DOMException(message, name)` into the running program (falls
+/// back to an Error whose message carries the name). Returns what the
+/// NativeFn should return.
+inline bronze::Value throwDOMException(const std::string& message, const std::string& name) {
+    namespace ev = bronze::embed;
+    auto de = ev::globalValue("DOMException");
+    if (de.found && ev::isFunction(de.value)) {
+        ev::Persistent ctor{de.value};
+        ev::Persistent msg{ev::fromUtf8(message)};
+        ev::Persistent nm{ev::fromUtf8(name)};
+        const bronze::Value args[2] = {msg.get(), nm.get()};
+        ev::CallResult res = ev::construct(ctor.get(), std::span<const bronze::Value>(args, 2));
+        if (!res.thrown) return ev::throwValue(res.value);
+    }
+    return ev::throwError(name + ": " + message);
+}
 
 void pushRequireDir(const std::filesystem::path& dir);
 void popRequireDir();

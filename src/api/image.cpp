@@ -31,10 +31,17 @@ namespace brokit::api {
 // Buffer extraction helpers
 // ---------------------------------------------------------------------------
 
+// `data` points into the MOVING heap (embed.h's pointer contract): it is dead
+// after any allocating embed call, and reading an options object with
+// getProperty allocates. Each kernel therefore calls refresh() on its views
+// after its last option read and before it touches the bytes.
 struct TypedArrayView {
-    uint8_t* data;
-    size_t   byte_len;
-    size_t   bpe;
+    uint8_t* data = nullptr;
+    size_t   byte_len = 0;
+    size_t   bpe = 0;
+    ev::Persistent root;
+
+    void refresh() { data = ev::typedArrayInfo(root.get()).data; }
 };
 
 static bool unpack_typed_array(bronze::Value val, const char* name, TypedArrayView* out)
@@ -47,6 +54,7 @@ static bool unpack_typed_array(bronze::Value val, const char* name, TypedArrayVi
     out->data = info.data;
     out->byte_len = info.byteLength;
     out->bpe = info.bytesPerElement;
+    out->root.set(val);  // may allocate a root slot; data is refreshed before use
     return true;
 }
 
@@ -131,30 +139,32 @@ static bronze::Value image_gradient(bronze::Value, std::span<const bronze::Value
     int32_t n = reader.getInt(1, 256);
     if (n < 2) return ev::throwRangeError("gradient: n must be >= 2");
 
-    bronze::Value stopsVal = args[0];
-    bronze::Value lenVal = ev::getProperty(stopsVal, "length");
+    // args[0] is read from the rooted span each time and each stop is rooted:
+    // the "length" reads may allocate (property-key interning).
+    bronze::Value lenVal = ev::getProperty(args[0], "length");
     if (!ev::isDouble(lenVal)) return ev::throwTypeError("gradient: stops must be an array");
     uint32_t stop_count = static_cast<uint32_t>(ev::toDouble(lenVal));
     if (stop_count < 2) return ev::throwTypeError("gradient: need at least 2 stops");
 
     std::vector<broimage::GradientStop> stops(stop_count);
     for (uint32_t i = 0; i < stop_count; i++) {
-        bronze::Value s = ev::getElement(stopsVal, i);
+        ev::Persistent stop{ev::getElement(args[0], i)};
+        const bronze::Value s = stop.get();
         if (!ev::isObject(s))
             return ev::throwTypeError("gradient: stop must be an array");
 
-        bronze::Value lv = ev::getProperty(s, "length");
+        bronze::Value lv = ev::getProperty(stop.get(), "length");
         uint32_t slen = ev::isDouble(lv) ? static_cast<uint32_t>(ev::toDouble(lv)) : 0;
         if (slen < 4)
             return ev::throwTypeError("gradient: stop must be [t, r, g, b, a?]");
 
-        double t = ev::toDouble(ev::getElement(s, 0));
-        double r = ev::toDouble(ev::getElement(s, 1));
-        double g = ev::toDouble(ev::getElement(s, 2));
-        double b = ev::toDouble(ev::getElement(s, 3));
+        double t = ev::toDouble(ev::getElement(stop.get(), 0));
+        double r = ev::toDouble(ev::getElement(stop.get(), 1));
+        double g = ev::toDouble(ev::getElement(stop.get(), 2));
+        double b = ev::toDouble(ev::getElement(stop.get(), 3));
         double a = -1.0;
         if (slen >= 5) {
-            a = ev::toDouble(ev::getElement(s, 4));
+            a = ev::toDouble(ev::getElement(stop.get(), 4));
         }
 
         stops[i].t = static_cast<float>(t);
@@ -237,6 +247,7 @@ static bronze::Value image_lookup(bronze::Value, std::span<const bronze::Value> 
     ScalarKind kind{};
     if (!probe_scalar_kind(args[1], &kind)) return ev::undefined();
 
+    dst.refresh(); src.refresh(); lut.refresh();
     if (kind.is_float && src.bpe == 4) {
         broimage::lookup_f32(
             reinterpret_cast<const float*>(src.data), static_cast<int>(n),
@@ -303,6 +314,7 @@ static bronze::Value image_reduce(bronze::Value, std::span<const bronze::Value> 
         if (!get_prop_i32(args[2], "stride", &stride, 1)) return ev::undefined();
         if (stride < 1) return ev::throwRangeError("reduce: stride must be >= 1");
     }
+    src.refresh();
     const size_t step = static_cast<size_t>(stride);
     const bool f32_path = (kind.is_float && src.bpe == 4);
     auto read_at = [&](size_t i) -> float {
@@ -355,6 +367,7 @@ static bronze::Value image_reduce(bronze::Value, std::span<const bronze::Value> 
         if (!get_prop_f64(args[2], "hi", &hi, 1)) return ev::undefined();
         if (bins < 1) return ev::throwRangeError("histogram: bins must be >= 1");
         if (hi <= lo) return ev::throwRangeError("histogram: hi must be > lo");
+        src.refresh();
 
         std::vector<uint32_t> counts(static_cast<size_t>(bins), 0);
         if (f32_path) {
@@ -399,8 +412,14 @@ static bronze::Value image_map(bronze::Value, std::span<const bronze::Value> arg
     if (!get_prop_str(args[2], "op", &op)) return ev::undefined();
     if (op.empty()) return ev::throwTypeError("map: opSpec.op required");
 
-    const float* sp = reinterpret_cast<const float*>(src.data);
-    float* dp = reinterpret_cast<float*>(dst.data);
+    const float* sp = nullptr;
+    float* dp = nullptr;
+    auto bytes = [&] {
+        src.refresh(); dst.refresh();
+        sp = reinterpret_cast<const float*>(src.data);
+        dp = reinterpret_cast<float*>(dst.data);
+    };
+    bytes();
 
     if (op == "affine") {
         double a = 1, b = 0;
@@ -412,8 +431,10 @@ static bronze::Value image_map(bronze::Value, std::span<const bronze::Value> arg
         if (clamp) {
             clo = static_cast<float>(ev::toDouble(ev::getElement(cv, 0)));
             chi = static_cast<float>(ev::toDouble(ev::getElement(cv, 1)));
+            bytes();
             broimage::map_affine_clamp_f32(sp, dp, n, static_cast<float>(a), static_cast<float>(b), clo, chi);
         } else {
+            bytes();
             broimage::map_affine_f32(sp, dp, n, static_cast<float>(a), static_cast<float>(b));
         }
         return ev::undefined();
@@ -425,6 +446,7 @@ static bronze::Value image_map(bronze::Value, std::span<const bronze::Value> arg
     if (op == "pow") {
         double e = 1;
         if (!get_prop_f64(args[2], "exp", &e, 1)) return ev::undefined();
+        bytes();
         broimage::map_pow_f32(sp, dp, n, static_cast<float>(e));
         return ev::undefined();
     }
@@ -454,9 +476,16 @@ static bronze::Value image_combine(bronze::Value, std::span<const bronze::Value>
     if (!get_prop_str(args[3], "op", &op)) return ev::undefined();
     if (op.empty()) return ev::throwTypeError("combine: opSpec.op required");
 
-    const float* ap = reinterpret_cast<const float*>(va.data);
-    const float* bp = reinterpret_cast<const float*>(vb.data);
-    float* dp = reinterpret_cast<float*>(dst.data);
+    const float* ap = nullptr;
+    const float* bp = nullptr;
+    float* dp = nullptr;
+    auto bytes = [&] {
+        va.refresh(); vb.refresh(); dst.refresh();
+        ap = reinterpret_cast<const float*>(va.data);
+        bp = reinterpret_cast<const float*>(vb.data);
+        dp = reinterpret_cast<float*>(dst.data);
+    };
+    bytes();
 
     if (op == "add") { broimage::combine_add_f32(ap, bp, dp, n); return ev::undefined(); }
     if (op == "sub") { broimage::combine_sub_f32(ap, bp, dp, n); return ev::undefined(); }
@@ -466,6 +495,7 @@ static bronze::Value image_combine(bronze::Value, std::span<const bronze::Value>
     if (op == "lerp") {
         double t = 0;
         if (!get_prop_f64(args[3], "t", &t, 0)) return ev::undefined();
+        bytes();
         broimage::combine_lerp_f32(ap, bp, dp, n, static_cast<float>(t));
         return ev::undefined();
     }
@@ -473,6 +503,7 @@ static bronze::Value image_combine(bronze::Value, std::span<const bronze::Value>
         double wa = 1, wb = 1;
         if (!get_prop_f64(args[3], "wa", &wa, 1)) return ev::undefined();
         if (!get_prop_f64(args[3], "wb", &wb, 1)) return ev::undefined();
+        bytes();
         broimage::combine_wsum_f32(ap, bp, dp, n, static_cast<float>(wa), static_cast<float>(wb));
         return ev::undefined();
     }
@@ -527,6 +558,7 @@ static bronze::Value image_stencil(bronze::Value, std::span<const bronze::Value>
     if (!get_prop_f64(args[3], "divisor", &divisor, 1)) return ev::undefined();
     if (!get_prop_f64(args[3], "bias",    &bias,    0)) return ev::undefined();
 
+    src.refresh(); dst.refresh(); kdata.refresh();
     broimage::stencil_f32(
         reinterpret_cast<const float*>(src.data),
         reinterpret_cast<float*>(dst.data),
@@ -571,6 +603,7 @@ static bronze::Value image_resample(bronze::Value, std::span<const bronze::Value
     else if (filter == "bilinear") f = broimage::Filter::Bilinear;
     else return ev::throwTypeError("resample: filter must be 'nearest'|'bilinear'");
 
+    src.refresh(); dst.refresh();
     broimage::resample_f32(
         reinterpret_cast<const float*>(src.data), srcW, srcH,
         reinterpret_cast<float*>(dst.data),       dstW, dstH,
@@ -584,13 +617,10 @@ static bronze::Value image_resample(bronze::Value, std::span<const bronze::Value
 
 void installImage()
 {
-    bronze::Value broVal = ev::getGlobal("bro");
-    bronze::Value bro;
-    if (ev::isObject(broVal)) {
-        bro = broVal;
-    } else {
-        bro = ev::createObject();
-        ev::setGlobalValue("bro", bro);
+    ev::Persistent bro{ev::getGlobal("bro")};
+    if (!ev::isObject(bro.get())) {
+        bro.set(ev::createObject());
+        ev::setGlobalValue("bro", bro.get());
     }
 
     ObjectBuilder img;
@@ -603,7 +633,7 @@ void installImage()
     img.def("stencil", 4, image_stencil);
     img.def("resample", 3, image_resample);
 
-    ev::setProperty(bro, "image", img.build());
+    bro.set(ev::setProperty(bro.get(), "image", img.build()));
 }
 
 } // namespace brokit::api

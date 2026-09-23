@@ -171,10 +171,12 @@ static bronze::Value codecPush(bronze::Value thisVal, std::span<const bronze::Va
     if (st->closed) return ev::throwTypeError("codec is closed");
 
     if (a.empty()) return ev::throwTypeError("push() expects a chunk");
+    // The "_u8" read may allocate (property-key interning), so the chunk is
+    // re-read from the rooted args span rather than held in a local copy.
     bronze::Value chunk = a[0];
-    if (ev::isObject(chunk)) {
-        bronze::Value u8 = ev::getProperty(chunk, "_u8");
-        if (ev::isObject(u8)) chunk = u8;
+    if (!ev::typedArrayInfo(a[0]) && ev::isObject(a[0])) {
+        bronze::Value u8 = ev::getProperty(a[0], "_u8");
+        chunk = ev::isObject(u8) ? u8 : a[0];
     }
     auto info = ev::typedArrayInfo(chunk);
     if (!info) return ev::throwTypeError("push() expects a TypedArray");

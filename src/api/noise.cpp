@@ -99,19 +99,19 @@ static bronze::Value fast_noise_create(bronze::Value, std::span<const bronze::Va
 
 static bronze::Value fast_noise_types(bronze::Value, std::span<const bronze::Value>)
 {
-    std::vector<bronze::Value> list;
+    ArrayBuilder list;
     for (const auto* meta : FastNoise::Metadata::GetAll()) {
         if (!meta) continue;
         ObjectBuilder entry;
         entry.set("name", meta->name);
-        std::vector<bronze::Value> groups;
+        ArrayBuilder groups;
         for (size_t gi = 0; gi < meta->groups.size(); gi++) {
-            groups.push_back(ev::fromUtf8(meta->groups[gi]));
+            groups.push(ev::fromUtf8(meta->groups[gi]));
         }
-        entry.set("groups", hostArrayOf(groups));
-        list.push_back(entry.build());
+        entry.set("groups", groups.get());
+        list.push(entry.build());
     }
-    return hostArrayOf(list);
+    return list.get();
 }
 
 static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronze::Value> args)
@@ -181,7 +181,7 @@ static bronze::Value fast_noise_get_members(bronze::Value thisVal, std::span<con
     ObjectBuilder result;
     result.set("type", meta.name);
 
-    std::vector<bronze::Value> vars;
+    ArrayBuilder vars;
     for (size_t i = 0; i < meta.memberVariables.size(); i++) {
         const auto& mv = meta.memberVariables[i];
         ObjectBuilder entry;
@@ -189,32 +189,32 @@ static bronze::Value fast_noise_get_members(bronze::Value thisVal, std::span<con
         entry.set("type", mv.type == FastNoise::Metadata::MemberVariable::EFloat ? "float" :
                           mv.type == FastNoise::Metadata::MemberVariable::EInt ? "int" : "enum");
         if (mv.type == FastNoise::Metadata::MemberVariable::EEnum) {
-            std::vector<bronze::Value> names;
+            ArrayBuilder names;
             for (size_t ei = 0; ei < mv.enumNames.size(); ei++) {
-                names.push_back(ev::fromUtf8(mv.enumNames[ei]));
+                names.push(ev::fromUtf8(mv.enumNames[ei]));
             }
-            entry.set("enumValues", hostArrayOf(names));
+            entry.set("enumValues", names.get());
         }
-        vars.push_back(entry.build());
+        vars.push(entry.build());
     }
-    result.set("variables", hostArrayOf(vars));
+    result.set("variables", vars.get());
 
-    std::vector<bronze::Value> nodes;
+    ArrayBuilder nodes;
     for (size_t i = 0; i < meta.memberNodeLookups.size(); i++) {
         ObjectBuilder entry;
         entry.set("name", meta.memberNodeLookups[i].name);
-        nodes.push_back(entry.build());
+        nodes.push(entry.build());
     }
-    result.set("nodes", hostArrayOf(nodes));
+    result.set("nodes", nodes.get());
 
-    std::vector<bronze::Value> hybrids;
+    ArrayBuilder hybrids;
     for (size_t i = 0; i < meta.memberHybrids.size(); i++) {
         ObjectBuilder entry;
         entry.set("name", meta.memberHybrids[i].name);
         entry.set("default", static_cast<double>(meta.memberHybrids[i].valueDefault));
-        hybrids.push_back(entry.build());
+        hybrids.push(entry.build());
     }
-    result.set("hybrids", hostArrayOf(hybrids));
+    result.set("hybrids", hybrids.get());
 
     return result.build();
 }
@@ -510,19 +510,23 @@ void installNoise()
         proto.def("genTileable2D", 4, fast_noise_gen_tileable2_d);
     });
 
-    bronze::Value ctor = g_fastNoiseClass.constructor();
-    ev::setProperty(ctor, "create", ev::makeFunction(fast_noise_create, 1, "create"));
-    ev::setProperty(ctor, "types", ev::makeFunction(fast_noise_types, 0, "types"));
-    ev::setProperty(ctor, "Simplex", ev::makeFunction(make_factory_node<FastNoise::Simplex>, 0, "Simplex"));
-    ev::setProperty(ctor, "SuperSimplex", ev::makeFunction(make_factory_node<FastNoise::SuperSimplex>, 0, "SuperSimplex"));
-    ev::setProperty(ctor, "Perlin", ev::makeFunction(make_factory_node<FastNoise::Perlin>, 0, "Perlin"));
-    ev::setProperty(ctor, "Value", ev::makeFunction(make_factory_node<FastNoise::Value>, 0, "Value"));
-    ev::setProperty(ctor, "CellularValue", ev::makeFunction(make_factory_node<FastNoise::CellularValue>, 0, "CellularValue"));
-    ev::setProperty(ctor, "CellularDistance", ev::makeFunction(make_factory_node<FastNoise::CellularDistance>, 0, "CellularDistance"));
-    ev::setProperty(ctor, "CellularLookup", ev::makeFunction(make_factory_node<FastNoise::CellularLookup>, 0, "CellularLookup"));
-    ev::setProperty(ctor, "FractalFBm", ev::makeFunction(make_factory_node<FastNoise::FractalFBm>, 0, "FractalFBm"));
-    ev::setProperty(ctor, "FractalRidged", ev::makeFunction(make_factory_node<FastNoise::FractalRidged>, 0, "FractalRidged"));
-    ev::setProperty(ctor, "DomainWarpGradient", ev::makeFunction(make_factory_node<FastNoise::DomainWarpGradient>, 0, "DomainWarpGradient"));
+    // setStatic re-reads the rooted constructor after each makeFunction; a raw
+    // `ctor` local would be stale after the first allocation.
+    auto stat = [](const char* name, uint32_t arity, ev::NativeFn fn) {
+        g_fastNoiseClass.setStatic(name, ev::makeFunction(std::move(fn), arity, name));
+    };
+    stat("create", 1, fast_noise_create);
+    stat("types", 0, fast_noise_types);
+    stat("Simplex", 0, make_factory_node<FastNoise::Simplex>);
+    stat("SuperSimplex", 0, make_factory_node<FastNoise::SuperSimplex>);
+    stat("Perlin", 0, make_factory_node<FastNoise::Perlin>);
+    stat("Value", 0, make_factory_node<FastNoise::Value>);
+    stat("CellularValue", 0, make_factory_node<FastNoise::CellularValue>);
+    stat("CellularDistance", 0, make_factory_node<FastNoise::CellularDistance>);
+    stat("CellularLookup", 0, make_factory_node<FastNoise::CellularLookup>);
+    stat("FractalFBm", 0, make_factory_node<FastNoise::FractalFBm>);
+    stat("FractalRidged", 0, make_factory_node<FastNoise::FractalRidged>);
+    stat("DomainWarpGradient", 0, make_factory_node<FastNoise::DomainWarpGradient>);
 }
 
 } // namespace brokit::api

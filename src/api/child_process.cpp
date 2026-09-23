@@ -678,7 +678,9 @@ static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
     ExecOptions opts;
     if (optIdx >= a.size() || !ev::isObject(a[optIdx])) return opts;
 
-    bronze::Value val = a[optIdx];
+    // A reference into the rooted args span: stays current across the
+    // allocating Object.keys call below, where a copy would go stale.
+    const bronze::Value& val = a[optIdx];
 
     bronze::Value cwdV = ev::getProperty(val, "cwd");
     if (ev::isString(cwdV)) opts.cwd = ev::toUtf8(cwdV);
@@ -699,21 +701,22 @@ static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
     bronze::Value inV = ev::getProperty(val, "input");
     if (ev::isString(inV)) opts.input = ev::toUtf8(inV);
 
-    bronze::Value envV = ev::getProperty(val, "env");
-    if (ev::isObject(envV)) {
+    ev::Persistent envV{ev::getProperty(val, "env")};
+    if (ev::isObject(envV.get())) {
         opts.hasEnv = true;
-        bronze::Value objCtor = ev::getGlobal("Object");
-        bronze::Value keysFn = ev::getProperty(objCtor, "keys");
-        auto r = ev::call(keysFn, objCtor, std::array<bronze::Value, 1>{envV});
-        if (!r.thrown && ev::isObject(r.value)) {
-            bronze::Value lenV = ev::getProperty(r.value, "length");
+        ev::Persistent objCtor{ev::getGlobal("Object")};
+        ev::Persistent keysFn{ev::getProperty(objCtor.get(), "keys")};
+        auto r = ev::call(keysFn.get(), objCtor.get(), std::array<bronze::Value, 1>{envV.get()});
+        ev::Persistent keys{r.thrown ? ev::undefined() : r.value};
+        if (ev::isObject(keys.get())) {
+            bronze::Value lenV = ev::getProperty(keys.get(), "length");
             if (ev::isDouble(lenV)) {
                 uint32_t count = static_cast<uint32_t>(ev::toDouble(lenV));
                 for (uint32_t i = 0; i < count; ++i) {
-                    bronze::Value k = ev::getElement(r.value, i);
+                    bronze::Value k = ev::getElement(keys.get(), i);
                     if (ev::isString(k)) {
                         std::string kStr = ev::toUtf8(k);
-                        bronze::Value v = ev::getProperty(envV, kStr);
+                        bronze::Value v = ev::getProperty(envV.get(), kStr);
                         if (!ev::isUndefined(v) && !ev::isNull(v)) {
                             opts.env.emplace_back(kStr, ev::toUtf8(v));
                         }
@@ -856,7 +859,8 @@ static bronze::Value js_spawnSync(bronze::Value, std::span<const bronze::Value> 
     obj.set("signal", res.timedOut ? ev::fromUtf8("SIGKILL") : ev::null());
 
     if (!res.error.empty()) {
-        obj.set("error", ev::throwTypeError(res.error.c_str()));
+        // Node reports a spawn failure on the result rather than throwing.
+        obj.set("error", newError("Error", res.error));
     }
 
     return obj.get();
@@ -1193,7 +1197,10 @@ static bronze::Value js_childRead(bronze::Value, std::span<const bronze::Value> 
     if (!h->piped)
         return ev::throwTypeError(("childRead: child " + std::to_string(id) + " was not spawned with stdio:'pipe'").c_str());
 
-    auto take = [&](PipeBuf& buf, bronze::Value& outVal, bool& eofOut) {
+    // Each chunk is stored on the rooted result the moment it is made: a raw
+    // Value held while the next one allocates would go stale.
+    ObjectBuilder obj;
+    auto take = [&](PipeBuf& buf, std::string_view key, bool& eofOut) {
         std::vector<uint8_t> drained;
         {
             std::lock_guard<std::mutex> lock(buf.m);
@@ -1201,19 +1208,15 @@ static bronze::Value js_childRead(bronze::Value, std::span<const bronze::Value> 
             eofOut = buf.eof;
         }
         if (!drained.empty()) buf.cv.notify_all();
-        outVal = drained.empty()
+        obj.set(key, drained.empty()
             ? ev::null()
-            : stringToOutput(std::string(reinterpret_cast<const char*>(drained.data()), drained.size()), "buffer");
+            : stringToOutput(std::string(reinterpret_cast<const char*>(drained.data()), drained.size()), "buffer"));
     };
 
-    bronze::Value outVal = ev::null(), errVal = ev::null();
     bool outEof = false, errEof = false;
-    take(h->out, outVal, outEof);
-    take(h->err, errVal, errEof);
+    take(h->out, "stdout", outEof);
+    take(h->err, "stderr", errEof);
 
-    ObjectBuilder obj;
-    obj.set("stdout", outVal);
-    obj.set("stderr", errVal);
     obj.set("stdoutEof", ev::fromBool(outEof));
     obj.set("stderrEof", ev::fromBool(errEof));
     return obj.get();

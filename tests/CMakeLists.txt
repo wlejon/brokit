@@ -44,4 +44,13 @@ foreach(js ${BROKIT_JS_TESTS})
     add_test(NAME ${name} COMMAND brokit_test "${js}")
     set_tests_properties(${name} PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    # The same script with a collection at every allocation and freed space
+    # poisoned: a binding that holds a raw Value across an allocating call
+    # reads garbage here instead of passing by luck. `ctest -LE gcstress`
+    # skips these.
+    add_test(NAME ${name}_gcstress COMMAND brokit_test "${js}")
+    set_tests_properties(${name}_gcstress PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+        ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1"
+        LABELS gcstress)
 endforeach()
