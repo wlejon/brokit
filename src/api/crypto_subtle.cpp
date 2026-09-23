@@ -30,7 +30,6 @@
 #include <cmath>
 #include <cstring>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -959,26 +958,17 @@ struct CryptoKeyData {
 HostClass g_cryptoKeyClass;
 HostClass g_subtleClass;
 
-// handleData answers for ANY host handle, so a Blob passed where a key is
-// expected would otherwise be reinterpreted as a CryptoKeyData. The live set
-// is the brand check. Keys are made and finalized on their runtime's thread.
-std::unordered_set<const CryptoKeyData*>& liveKeys()
-{
-    static thread_local auto* s = new std::unordered_set<const CryptoKeyData*>();
-    return *s;
-}
-
 void cryptoKeyDtor(void* p)
 {
-    auto* k = static_cast<CryptoKeyData*>(p);
-    liveKeys().erase(k);
-    delete k;
+    delete static_cast<CryptoKeyData*>(p);
 }
 
+// handleData answers for ANY host handle, so a Blob passed where a key is
+// expected would otherwise be reinterpreted as a CryptoKeyData; the class
+// brand (host_class.cpp) answers only for a key.
 CryptoKeyData* keyOf(Value v)
 {
-    auto* k = static_cast<CryptoKeyData*>(ev::handleData(v));
-    return (k && liveKeys().count(k)) ? k : nullptr;
+    return static_cast<CryptoKeyData*>(g_cryptoKeyClass.unwrap(v));
 }
 
 Value makeAlgorithmObject(const CryptoKeyData& k)
@@ -1006,7 +996,6 @@ Value makeUsagesArray(uint32_t usages)
 
 Value makeCryptoKey(CryptoKeyData* key)
 {
-    liveKeys().insert(key);
     ObjectBuilder obj(g_cryptoKeyClass.make(key, cryptoKeyDtor));
     obj.set("type", "secret");
     obj.set("extractable", key->extractable);

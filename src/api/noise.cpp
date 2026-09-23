@@ -27,7 +27,9 @@ static void fastNoiseDtor(void* p)
 
 static NoiseWrapper* getNoise(bronze::Value v)
 {
-    return static_cast<NoiseWrapper*>(ev::handleData(v));
+    // Brand-checked (host_class.cpp): a Blob or CryptoKey passed as a
+    // FastNoise is refused, not reinterpreted.
+    return static_cast<NoiseWrapper*>(g_fastNoiseClass.unwrap(v));
 }
 
 static bronze::Value wrapNode(FastNoise::SmartNode<> node)

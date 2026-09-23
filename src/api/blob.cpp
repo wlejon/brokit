@@ -51,18 +51,22 @@ void blobDtor(void* p) { delete static_cast<BlobData*>(p); }
 void fileDtor(void* p) { delete static_cast<FileData*>(p); }
 void readerDtor(void* p) { delete static_cast<ReaderData*>(p); }
 
-BlobData* getBlobData(Value v) {
-    auto* b = static_cast<BlobData*>(ev::handleData(v));
-    if (!b) return nullptr;
-    if (b->tag == kBlobTag) return b;
-    if (b->tag == kFileTag) return &reinterpret_cast<FileData*>(b)->blob;
-    return nullptr;
-}
-
+// Brand first (host_class.cpp): a payload's own tag is read only once the
+// handle is known to be one this class made.
 FileData* getFileData(Value v) {
-    auto* f = static_cast<FileData*>(ev::handleData(v));
+    auto* f = static_cast<FileData*>(g_fileClass.unwrap(v));
     if (!f || f->tag != kFileTag) return nullptr;
     return f;
+}
+
+BlobData* getBlobData(Value v) {
+    if (FileData* f = getFileData(v)) return &f->blob;
+    auto* b = static_cast<BlobData*>(g_blobClass.unwrap(v));
+    return (b && b->tag == kBlobTag) ? b : nullptr;
+}
+
+static ReaderData* getReaderData(Value v) {
+    return static_cast<ReaderData*>(g_fileReaderClass.unwrap(v));
 }
 
 void appendPart(std::vector<uint8_t>& out, Value part) {
@@ -262,7 +266,7 @@ void dispatchReaderEvent(Value target, const std::string& type) {
 
 void startRead(Value self, Value blobValue,
                std::function<Value(const std::vector<uint8_t>&)> produce) {
-    auto* r = static_cast<ReaderData*>(ev::handleData(self));
+    auto* r = getReaderData(self);
     if (!r) return;
     ev::Persistent target(self);
     BlobData* blob = getBlobData(blobValue);
@@ -278,7 +282,7 @@ void startRead(Value self, Value blobValue,
     auto task = [target, generation, bytes = std::move(bytes), haveBlob,
                  produce = std::move(produce)]() mutable {
         Value selfVal = target.get();
-        auto* reader = static_cast<ReaderData*>(ev::handleData(selfVal));
+        auto* reader = getReaderData(selfVal);
         if (!reader || reader->generation != generation) return;
 
         reader->generation = generation;
@@ -433,19 +437,20 @@ void installBlob() {
             proto.set("DONE", ev::fromDouble(2));
 
             proto.accessor("readyState", [](Value thisVal, std::span<const Value>) {
-                auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
+                auto* r = getReaderData(thisVal);
                 return ev::fromDouble(r ? static_cast<double>(r->readyState) : 0.0);
             });
             proto.accessor("result", [](Value thisVal, std::span<const Value>) {
-                auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
+                auto* r = getReaderData(thisVal);
                 return (r && !ev::isUndefined(r->result.get())) ? r->result.get() : ev::null();
             });
             proto.accessor("error", [](Value thisVal, std::span<const Value>) {
-                auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
+                auto* r = getReaderData(thisVal);
                 return (r && !ev::isUndefined(r->error.get())) ? r->error.get() : ev::null();
             });
 
             proto.def("readAsArrayBuffer", 1, [](Value thisVal, std::span<const Value> a) {
+                if (!getReaderData(thisVal)) return ev::throwTypeError("FileReader.readAsArrayBuffer: receiver is not a FileReader");
                 if (a.empty()) return ev::undefined();
                 startRead(thisVal, a[0], [](const std::vector<uint8_t>& bytes) {
                     return ev::createArrayBuffer(std::span<const uint8_t>(bytes.data(), bytes.size()));
@@ -453,6 +458,7 @@ void installBlob() {
                 return ev::undefined();
             });
             proto.def("readAsText", 1, [](Value thisVal, std::span<const Value> a) {
+                if (!getReaderData(thisVal)) return ev::throwTypeError("FileReader.readAsText: receiver is not a FileReader");
                 if (a.empty()) return ev::undefined();
                 startRead(thisVal, a[0], [](const std::vector<uint8_t>& bytes) {
                     return ev::fromUtf8(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
@@ -460,6 +466,7 @@ void installBlob() {
                 return ev::undefined();
             });
             proto.def("readAsBinaryString", 1, [](Value thisVal, std::span<const Value> a) {
+                if (!getReaderData(thisVal)) return ev::throwTypeError("FileReader.readAsBinaryString: receiver is not a FileReader");
                 if (a.empty()) return ev::undefined();
                 startRead(thisVal, a[0], [](const std::vector<uint8_t>& bytes) {
                     std::string utf8;
@@ -477,6 +484,7 @@ void installBlob() {
                 return ev::undefined();
             });
             proto.def("readAsDataURL", 1, [](Value thisVal, std::span<const Value> a) {
+                if (!getReaderData(thisVal)) return ev::throwTypeError("FileReader.readAsDataURL: receiver is not a FileReader");
                 if (a.empty()) return ev::undefined();
                 BlobData* b = getBlobData(a[0]);
                 std::string mime = b && !b->type.empty() ? b->type : "application/octet-stream";
@@ -486,8 +494,8 @@ void installBlob() {
                 return ev::undefined();
             });
             proto.def("abort", 0, [](Value thisVal, std::span<const Value>) {
-                auto* r = static_cast<ReaderData*>(ev::handleData(thisVal));
-                if (!r) return ev::undefined();
+                auto* r = getReaderData(thisVal);
+                if (!r) return ev::throwTypeError("FileReader.abort: receiver is not a FileReader");
                 ++r->generation;
                 r->readyState = 2; // DONE
                 r->result.set(ev::null());
