@@ -69,21 +69,24 @@ static ReaderData* getReaderData(Value v) {
     return static_cast<ReaderData*>(g_fileReaderClass.unwrap(v));
 }
 
-void appendPart(std::vector<uint8_t>& out, Value part) {
-    if (const BlobData* b = getBlobData(part)) {
+void appendPart(std::vector<uint8_t>& out, Value partIn) {
+    if (const BlobData* b = getBlobData(partIn)) {
         out.insert(out.end(), b->bytes.begin(), b->bytes.end());
         return;
     }
+    // Rooted: bufferBytes reads `_u8` off an object part, which allocates,
+    // and the string conversion below still needs the part.
+    ev::Persistent part(partIn);
     const uint8_t* data = nullptr;
     size_t len = 0;
-    if (bufferBytes(part, &data, &len)) {
+    if (bufferBytes(part.get(), &data, &len)) {
         if (len > 0 && data) {
             out.insert(out.end(), data, data + len);
         }
         return;
     }
-    if (ev::isUndefined(part) || ev::isNull(part)) return;
-    std::string s = ev::toUtf8(part);
+    if (ev::isUndefined(part.get()) || ev::isNull(part.get())) return;
+    std::string s = ev::toUtf8(part.get());
     out.insert(out.end(), s.begin(), s.end());
 }
 
@@ -93,7 +96,7 @@ std::vector<uint8_t> collectParts(Value partsValue) {
     ev::Persistent parts(partsValue);
     Value lenV = ev::getProperty(parts.get(), "length");
     if (ev::isUndefined(lenV) || ev::isObject(lenV)) return out;
-    uint32_t len = static_cast<uint32_t>(ev::toDouble(lenV));
+    uint32_t len = saturateU32(ev::toDouble(lenV));
     for (uint32_t i = 0; i < len; ++i) {
         appendPart(out, ev::getElement(parts.get(), i));
     }
@@ -187,6 +190,14 @@ std::string readerListenerKey(const std::string& type) {
     return "__brokitListeners_" + type;
 }
 
+// The list's `length` is an ordinary property a script can overwrite: read
+// it saturated, and treat an absurd one as an empty list.
+static uint32_t listenerCount(Value lenV) {
+    if (!ev::isNumber(lenV)) return 0;
+    uint32_t n = saturateU32(ev::toDouble(lenV));
+    return n > kMaxScriptList ? 0 : n;
+}
+
 void addReaderListener(Value target, const std::string& type, Value fn) {
     if (!ev::isFunction(fn)) return;
     ev::Persistent targetP(target);
@@ -199,7 +210,7 @@ void addReaderListener(Value target, const std::string& type, Value fn) {
         ev::setProperty(targetP.get(), key, list.get());
     }
     Value lenV = ev::getProperty(list.get(), "length");
-    uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
+    uint32_t len = listenerCount(lenV);
     for (uint32_t i = 0; i < len; ++i) {
         Value existing = ev::getElement(list.get(), i);
         if (ev::toBits(existing) == ev::toBits(fnP.get())) return;
@@ -216,7 +227,7 @@ void removeReaderListener(Value target, const std::string& type, Value fn) {
     ev::Persistent list{ev::getProperty(targetP.get(), key)};
     if (!ev::isObject(list.get())) return;
     Value lenV = ev::getProperty(list.get(), "length");
-    uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
+    uint32_t len = listenerCount(lenV);
     uint32_t found = len;
     for (uint32_t i = 0; i < len; ++i) {
         Value existing = ev::getElement(list.get(), i);
@@ -245,7 +256,7 @@ void dispatchReaderEvent(Value target, const std::string& type) {
         ev::Persistent list{ev::getProperty(targetP.get(), readerListenerKey(type))};
         if (ev::isObject(list.get())) {
             Value lenV = ev::getProperty(list.get(), "length");
-            uint32_t len = ev::isNumber(lenV) ? static_cast<uint32_t>(ev::toDouble(lenV)) : 0;
+            uint32_t len = listenerCount(lenV);
             for (uint32_t i = 0; i < len; ++i) {
                 Value h = ev::getElement(list.get(), i);
                 if (ev::isFunction(h)) handlers.emplace_back(h);

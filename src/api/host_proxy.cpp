@@ -2,6 +2,8 @@
 #include "api/object_builder.h"
 #include "api/arg_reader.h"
 
+#include <algorithm>
+
 namespace brokit::api {
 
 namespace {
@@ -11,12 +13,38 @@ struct TrapPack {
     ev::Persistent methods;
 };
 
+// An apply/construct trap's argumentsList, element by element. Every element
+// read allocates, so each is rooted as it arrives; `current` is filled from
+// the roots only once nothing else will allocate before the call.
+struct RootedArgs {
+    std::vector<ev::Persistent> roots;
+    std::vector<Value> current;
+
+    explicit RootedArgs(const Value& list) {
+        if (!ev::isObject(list)) return;
+        ev::Persistent listP(list);
+        Value lenV = ev::getProperty(listP.get(), "length");
+        const uint32_t n = ev::isNumber(lenV) ? (std::min)(saturateU32(ev::toDouble(lenV)), kMaxScriptList) : 0;
+        roots.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) roots.emplace_back(ev::getElement(listP.get(), i));
+    }
+
+    std::span<const Value> span() {
+        current.clear();
+        current.reserve(roots.size());
+        for (const ev::Persistent& r : roots) current.push_back(r.get());
+        return std::span<const Value>(current);
+    }
+};
+
 }  // namespace
 
 Value makeHostProxy(HostProxyTraps traps) {
     auto pack = std::make_shared<TrapPack>();
     pack->t = std::move(traps);
     pack->methods.set(pack->t.methods);
+    // Rooted before the handler below allocates: t.target is a raw Value.
+    ev::Persistent target(pack->t.target);
 
     ObjectBuilder h;
 
@@ -76,8 +104,9 @@ Value makeHostProxy(HostProxyTraps traps) {
         if (!(pack->t.has && pack->t.has(k))) return ev::undefined();
         Value out = ev::undefined();
         if (pack->t.get) pack->t.get(k, out);
+        ev::Persistent outP(out);  // the descriptor object allocates first
         ObjectBuilder d;
-        d.set("value", out);
+        d.set("value", outP.get());
         d.set("writable", ev::fromBool(true));
         d.set("enumerable", ev::fromBool(true));
         d.set("configurable", ev::fromBool(true));
@@ -86,34 +115,20 @@ Value makeHostProxy(HostProxyTraps traps) {
 
     if (pack->t.apply) {
         h.def("apply", 3, [pack](Value, std::span<const Value> a) -> Value {
-            Value list = argAt(a, 2);
-            const uint32_t n = ev::isObject(list)
-                                   ? static_cast<uint32_t>(
-                                         ev::toDouble(ev::getProperty(list, "length")))
-                                   : 0;
-            std::vector<Value> args;
-            args.reserve(n);
-            for (uint32_t i = 0; i < n; ++i) args.push_back(ev::getElement(list, i));
-            return pack->t.apply(argAt(a, 1), std::span<const Value>(args));
+            RootedArgs args(a.size() > 2 ? a[2] : ev::undefined());
+            std::span<const Value> cur = args.span();
+            return pack->t.apply(argAt(a, 1), cur);
         });
     }
     if (pack->t.construct) {
         h.def("construct", 3, [pack](Value, std::span<const Value> a) -> Value {
-            Value list = argAt(a, 1);
-            const uint32_t n = ev::isObject(list)
-                                   ? static_cast<uint32_t>(
-                                         ev::toDouble(ev::getProperty(list, "length")))
-                                   : 0;
-            std::vector<Value> args;
-            args.reserve(n);
-            for (uint32_t i = 0; i < n; ++i) args.push_back(ev::getElement(list, i));
-            return pack->t.construct(std::span<const Value>(args));
+            RootedArgs args(a.size() > 1 ? a[1] : ev::undefined());
+            return pack->t.construct(args.span());
         });
     }
 
     ev::Persistent handler(h.get());
-    ev::Persistent target(ev::isUndefined(pack->t.target) ? ev::createObject()
-                                                          : pack->t.target);
+    if (ev::isUndefined(target.get())) target.set(ev::createObject());
 
     ev::GlobalValue proxyCtor = ev::globalValue("Proxy");
     if (!proxyCtor.found) {

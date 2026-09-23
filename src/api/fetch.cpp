@@ -185,12 +185,16 @@ static std::string resolveLocalPath(const std::string& url)
 
     auto g = ev::globalValue("globalThis");
     if (g.found && ev::isObject(g.value)) {
-        auto arr = ev::getProperty(g.value, "__brokit_fetch_base_paths");
-        if (ev::isObject(arr)) {
-            auto lenVal = ev::getProperty(arr, "length");
-            int32_t len = static_cast<int32_t>(ev::toDouble(lenVal));
+        // Rooted: the length read and every element read below allocate.
+        ev::Persistent arr{ev::getProperty(g.value, "__brokit_fetch_base_paths")};
+        if (ev::isObject(arr.get())) {
+            auto lenVal = ev::getProperty(arr.get(), "length");
+            // A script-writable global: bound the walk.
+            int32_t len = ev::isNumber(lenVal)
+                              ? static_cast<int32_t>((std::min)(saturateU32(ev::toDouble(lenVal)), kMaxScriptList))
+                              : 0;
             for (int32_t i = len - 1; i >= 0; --i) {
-                auto elem = ev::getElement(arr, static_cast<uint32_t>(i));
+                auto elem = ev::getElement(arr.get(), static_cast<uint32_t>(i));
                 if (ev::isString(elem)) {
                     std::string candidate = ev::toUtf8(elem);
                     if (!candidate.empty() && candidate.back() != '/' && candidate.back() != '\\')
@@ -898,7 +902,7 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
             if (!keysRes.thrown) {
                 ev::Persistent keysArr{keysRes.value};
                 bronze::Value lenVal = ev::getProperty(keysArr.get(), "length");
-                int len = ev::isDouble(lenVal) ? static_cast<int>(ev::toDouble(lenVal)) : 0;
+                int len = ev::isDouble(lenVal) ? saturateI32(ev::toDouble(lenVal)) : 0;
                 for (int i = 0; i < len; ++i) {
                     bronze::Value k = ev::getElement(keysArr.get(), i);
                     if (ev::isString(k)) {
