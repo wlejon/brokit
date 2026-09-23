@@ -28,6 +28,16 @@ extern "C" void bronze_fs_main();
 
 namespace brokit::api {
 
+// Paths are UTF-8 strings on the JS side. A std::string handed straight to
+// std::filesystem or an fstream is read in the ANSI code page on Windows,
+// which mangles every non-ASCII name, so each crossing goes through these.
+static fs::path u8p(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
+static std::string u8s(const fs::path& p)
+{
+    std::u8string u = p.u8string();
+    return std::string(u.begin(), u.end());
+}
+
 static thread_local std::map<std::string, std::string> g_pathMounts;
 
 std::string resolveBrokitPrefixMount(const std::string& path)
@@ -38,20 +48,24 @@ std::string resolveBrokitPrefixMount(const std::string& path)
 
     auto g = ev::globalValue("globalThis");
     if (g.found && ev::isObject(g.value)) {
-        auto mountsVal = ev::getProperty(g.value, "__brokit_path_mounts");
-        if (ev::isObject(mountsVal)) {
+        // Every Value below outlives an allocating call, so each is rooted.
+        ev::Persistent mounts{ev::getProperty(g.value, "__brokit_path_mounts")};
+        if (ev::isObject(mounts.get())) {
             auto objCtor = ev::globalValue("Object");
             if (objCtor.found) {
-                auto keysFn = ev::getProperty(objCtor.value, "keys");
-                if (ev::isFunction(keysFn)) {
-                    auto res = ev::call(keysFn, objCtor.value, std::span(&mountsVal, 1));
-                    if (!res.thrown && ev::isObject(res.value)) {
-                        auto lenVal = ev::getProperty(res.value, "length");
+                ev::Persistent ctor{objCtor.value};
+                ev::Persistent keysFn{ev::getProperty(ctor.get(), "keys")};
+                if (ev::isFunction(keysFn.get())) {
+                    bronze::Value arg = mounts.get();
+                    auto res = ev::call(keysFn.get(), ctor.get(), std::span(&arg, 1));
+                    ev::Persistent keys{res.value};
+                    if (!res.thrown && ev::isObject(keys.get())) {
+                        auto lenVal = ev::getProperty(keys.get(), "length");
                         uint32_t len = static_cast<uint32_t>(ev::toDouble(lenVal));
                         for (uint32_t i = 0; i < len; ++i) {
-                            auto k = ev::getElement(res.value, i);
+                            auto k = ev::getElement(keys.get(), i);
                             std::string prefix = ev::toUtf8(k);
-                            auto targetVal = ev::getProperty(mountsVal, prefix);
+                            auto targetVal = ev::getProperty(mounts.get(), prefix);
                             if (ev::isString(targetVal)) {
                                 std::string target = ev::toUtf8(targetVal);
                                 if (path.size() >= prefix.size() &&
@@ -94,27 +108,28 @@ std::string resolveFsPath(const char* path, bool forCreate = false)
     std::string mounted = resolveBrokitPrefixMount(std::string(path));
     if (!mounted.empty()) return mounted;
 
-    fs::path p(path);
-    if (p.is_absolute()) return path;
+    const std::string pathStr(path);
+    const fs::path rel = u8p(pathStr);
+    if (rel.is_absolute()) return pathStr;
 
     std::string topBase;
 
     auto g = ev::globalValue("globalThis");
     if (g.found && ev::isObject(g.value)) {
-        auto arr = ev::getProperty(g.value, "__brokit_fs_base_paths");
-        if (ev::isObject(arr)) {
-            auto lenVal = ev::getProperty(arr, "length");
+        ev::Persistent arr{ev::getProperty(g.value, "__brokit_fs_base_paths")};
+        if (ev::isObject(arr.get())) {
+            auto lenVal = ev::getProperty(arr.get(), "length");
             int32_t len = static_cast<int32_t>(ev::toDouble(lenVal));
             for (int32_t i = len - 1; i >= 0; --i) {
-                auto elem = ev::getElement(arr, static_cast<uint32_t>(i));
+                auto elem = ev::getElement(arr.get(), static_cast<uint32_t>(i));
                 if (ev::isString(elem)) {
                     std::string base = ev::toUtf8(elem);
-                    fs::path candidate = fs::path(base) / path;
+                    fs::path candidate = u8p(base) / rel;
                     if (topBase.empty()) topBase = base;
 
                     std::error_code ec;
                     if (fs::exists(candidate, ec)) {
-                        return candidate.string();
+                        return u8s(candidate);
                     }
                 }
             }
@@ -123,20 +138,20 @@ std::string resolveFsPath(const char* path, bool forCreate = false)
 
     for (int i = static_cast<int>(g_fsBasePaths.size()) - 1; i >= 0; --i) {
         const auto& base = g_fsBasePaths[i];
-        fs::path candidate = fs::path(base) / path;
+        fs::path candidate = u8p(base) / rel;
         if (topBase.empty()) topBase = base;
 
         std::error_code ec;
         if (fs::exists(candidate, ec)) {
-            return candidate.string();
+            return u8s(candidate);
         }
     }
 
     if (forCreate && !topBase.empty()) {
-        return (fs::path(topBase) / path).string();
+        return u8s(u8p(topBase) / rel);
     }
 
-    return path;
+    return pathStr;
 }
 
 std::string getEncoding(std::span<const bronze::Value> a, size_t idx)
@@ -241,7 +256,7 @@ static bronze::Value js_readFileSync(bronze::Value, std::span<const bronze::Valu
     std::string resolved = resolveFsPath(rawPath.c_str());
     std::string encoding = getEncoding(a, 1);
 
-    std::ifstream f(resolved, std::ios::in | std::ios::binary);
+    std::ifstream f(u8p(resolved), std::ios::in | std::ios::binary);
     if (!f) {
         return throwErrno("open", resolved.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
@@ -293,13 +308,14 @@ static bronze::Value js_openSync(bronze::Value, std::span<const bronze::Value> a
         return ev::throwTypeError(("openSync: unsupported flags '" + flags + "'").c_str());
     }
 
-    if (flags == "r+" && !fs::exists(resolved)) {
+    std::error_code existsEc;
+    if (flags == "r+" && !fs::exists(u8p(resolved), existsEc)) {
         return throwErrno("open", resolved.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
     }
 
     auto file = std::make_unique<OpenFile>();
-    file->stream.open(resolved, mode);
+    file->stream.open(u8p(resolved), mode);
     if (!file->stream.is_open()) {
         return throwErrno("open", resolved.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
@@ -353,6 +369,13 @@ static bronze::Value js_readSync(bronze::Value, std::span<const bronze::Value> a
         if (position >= 0) seek = true;
     }
 
+    // The option reads above can run user code (valueOf) and allocate, so
+    // the buffer's address is taken again, and its bounds rechecked, here.
+    info = getBufferOrTypedArrayInfo(a[1]);
+    if (!info || offset + length > static_cast<int64_t>(info->byteLength))
+        return ev::throwRangeError("readSync: buffer changed size during the call");
+    base = info->data;
+
     std::lock_guard<std::mutex> lock(g_fdMutex);
     OpenFile* file = lookupFd(fd);
     if (!file) return throwErrno("read", nullptr, "EBADF", "EBADF: bad file descriptor, read");
@@ -400,6 +423,11 @@ static bronze::Value js_writeSync(bronze::Value, std::span<const bronze::Value> 
         if (position >= 0) seek = true;
     }
 
+    info = getBufferOrTypedArrayInfo(a[1]);
+    if (!info || offset + length > static_cast<int64_t>(info->byteLength))
+        return ev::throwRangeError("writeSync: buffer changed size during the call");
+    base = info->data;
+
     std::lock_guard<std::mutex> lock(g_fdMutex);
     OpenFile* file = lookupFd(fd);
     if (!file) return throwErrno("write", nullptr, "EBADF", "EBADF: bad file descriptor, write");
@@ -433,7 +461,7 @@ static bronze::Value js_fstatSync(bronze::Value, std::span<const bronze::Value> 
     }
 
     std::error_code ec;
-    auto size = fs::file_size(path, ec);
+    auto size = fs::file_size(u8p(path), ec);
     if (ec) return throwFsError("fstat", path.c_str(), ec);
 
     ObjectBuilder obj;
@@ -479,7 +507,7 @@ static bronze::Value js_writeFileSync(bronze::Value, std::span<const bronze::Val
         data = ev::toUtf8(a[1]);
     }
 
-    std::ofstream f(pathStr, std::ios::out | std::ios::binary | std::ios::trunc);
+    std::ofstream f(u8p(pathStr), std::ios::out | std::ios::binary | std::ios::trunc);
     if (!f) {
         return throwErrno("open", pathStr.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + pathStr + "'").c_str());
@@ -513,7 +541,7 @@ static bronze::Value js_appendFileSync(bronze::Value, std::span<const bronze::Va
         data = ev::toUtf8(a[1]);
     }
 
-    std::ofstream f(pathStr, std::ios::out | std::ios::binary | std::ios::app);
+    std::ofstream f(u8p(pathStr), std::ios::out | std::ios::binary | std::ios::app);
     if (!f) {
         return throwErrno("open", pathStr.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + pathStr + "'").c_str());
@@ -532,16 +560,17 @@ static bronze::Value js_statSync(bronze::Value, std::span<const bronze::Value> a
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
 
+    const fs::path p = u8p(resolved);
     std::error_code ec;
-    auto status = fs::status(resolved, ec);
+    auto status = fs::status(p, ec);
     if (ec) {
         return throwFsError("stat", resolved.c_str(), ec);
     }
 
-    auto fileSize = fs::file_size(resolved, ec);
+    auto fileSize = fs::file_size(p, ec);
     if (ec) fileSize = 0;
 
-    auto mtime = fs::last_write_time(resolved, ec);
+    auto mtime = fs::last_write_time(p, ec);
     double mtimeMs = 0;
     if (!ec) {
         auto sctp = std::chrono::time_point_cast<std::chrono::milliseconds>(
@@ -553,13 +582,13 @@ static bronze::Value js_statSync(bronze::Value, std::span<const bronze::Value> a
     bool isDir = fs::is_directory(status);
     bool isSymlink = false;
     {
-        auto lstatus = fs::symlink_status(resolved, ec);
+        auto lstatus = fs::symlink_status(p, ec);
         if (!ec) isSymlink = fs::is_symlink(lstatus);
     }
 
     int mode = 0;
 #ifdef _WIN32
-    DWORD attrs = GetFileAttributesA(resolved.c_str());
+    DWORD attrs = GetFileAttributesW(p.c_str());
     if (attrs != INVALID_FILE_ATTRIBUTES) {
         mode = 0444;
         if (!(attrs & FILE_ATTRIBUTE_READONLY)) mode |= 0222;
@@ -591,13 +620,14 @@ static bronze::Value js_lstatSync(bronze::Value, std::span<const bronze::Value> 
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
 
+    const fs::path p = u8p(resolved);
     std::error_code ec;
-    auto status = fs::symlink_status(resolved, ec);
+    auto status = fs::symlink_status(p, ec);
     if (ec) {
         return throwFsError("lstat", resolved.c_str(), ec);
     }
 
-    auto fileSize = fs::file_size(resolved, ec);
+    auto fileSize = fs::file_size(p, ec);
     if (ec) fileSize = 0;
 
     bool isFile = fs::is_regular_file(status);
@@ -629,27 +659,27 @@ static bronze::Value js_readdirSync(bronze::Value, std::span<const bronze::Value
     }
 
     std::error_code ec;
-    auto iter = fs::directory_iterator(resolved, ec);
+    auto iter = fs::directory_iterator(u8p(resolved), ec);
     if (ec) {
         return throwFsError("scandir", resolved.c_str(), ec);
     }
 
-    std::vector<bronze::Value> items;
+    ArrayBuilder items;
     for (auto& entry : iter) {
-        std::string name = entry.path().filename().string();
+        std::string name = u8s(entry.path().filename());
         if (withFileTypes) {
             ObjectBuilder dirent;
             dirent.set("name", ev::fromUtf8(name));
             dirent.set("_isFile", ev::fromBool(entry.is_regular_file()));
             dirent.set("_isDirectory", ev::fromBool(entry.is_directory()));
             dirent.set("_isSymbolicLink", ev::fromBool(entry.is_symlink()));
-            items.push_back(dirent.get());
+            items.push(dirent.get());
         } else {
-            items.push_back(ev::fromUtf8(name));
+            items.push(ev::fromUtf8(name));
         }
     }
 
-    return hostArrayOf(items);
+    return items.get();
 }
 
 // existsSync(path)
@@ -659,7 +689,7 @@ static bronze::Value js_existsSync(bronze::Value, std::span<const bronze::Value>
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
     std::error_code ec;
-    return ev::fromBool(fs::exists(resolved, ec));
+    return ev::fromBool(fs::exists(u8p(resolved), ec));
 }
 
 // mkdirSync(path[, options])
@@ -678,9 +708,9 @@ static bronze::Value js_mkdirSync(bronze::Value, std::span<const bronze::Value> 
 
     std::error_code ec;
     if (recursive) {
-        fs::create_directories(resolved, ec);
+        fs::create_directories(u8p(resolved), ec);
     } else {
-        fs::create_directory(resolved, ec);
+        fs::create_directory(u8p(resolved), ec);
     }
 
     if (ec) {
@@ -699,7 +729,7 @@ static bronze::Value js_rmdirSync(bronze::Value, std::span<const bronze::Value> 
     std::string resolved = resolveFsPath(rawPath.c_str());
 
     std::error_code ec;
-    fs::remove(resolved, ec);
+    fs::remove(u8p(resolved), ec);
     if (ec) {
         return throwFsError("rmdir", resolved.c_str(), ec);
     }
@@ -724,14 +754,15 @@ static bronze::Value js_rmSync(bronze::Value, std::span<const bronze::Value> a)
     }
 
     std::error_code ec;
-    if (!fs::exists(resolved, ec) && force) {
+    const fs::path p = u8p(resolved);
+    if (!fs::exists(p, ec) && force) {
         return ev::undefined();
     }
 
     if (recursive) {
-        fs::remove_all(resolved, ec);
+        fs::remove_all(p, ec);
     } else {
-        fs::remove(resolved, ec);
+        fs::remove(p, ec);
     }
 
     if (ec && !force) {
@@ -749,7 +780,7 @@ static bronze::Value js_unlinkSync(bronze::Value, std::span<const bronze::Value>
     std::string resolved = resolveFsPath(rawPath.c_str());
 
     std::error_code ec;
-    fs::remove(resolved, ec);
+    fs::remove(u8p(resolved), ec);
     if (ec) {
         return throwFsError("unlink", resolved.c_str(), ec);
     }
@@ -765,7 +796,7 @@ static bronze::Value js_renameSync(bronze::Value, std::span<const bronze::Value>
     std::string newResolved = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
 
     std::error_code ec;
-    fs::rename(oldResolved, newResolved, ec);
+    fs::rename(u8p(oldResolved), u8p(newResolved), ec);
     if (ec) {
         return throwFsError("rename", oldResolved.c_str(), ec);
     }
@@ -781,7 +812,7 @@ static bronze::Value js_copyFileSync(bronze::Value, std::span<const bronze::Valu
     std::string destResolved = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
 
     std::error_code ec;
-    fs::copy_file(srcResolved, destResolved, fs::copy_options::overwrite_existing, ec);
+    fs::copy_file(u8p(srcResolved), u8p(destResolved), fs::copy_options::overwrite_existing, ec);
     if (ec) {
         return throwFsError("copyfile", srcResolved.c_str(), ec);
     }
@@ -800,7 +831,7 @@ static bronze::Value js_chmodSync(bronze::Value, std::span<const bronze::Value> 
     int wmode = 0;
     if (mode & 0444) wmode |= 0x100;
     if (mode & 0222) wmode |= 0x080;
-    int result = _chmod(resolved.c_str(), wmode);
+    int result = _wchmod(u8p(resolved).c_str(), wmode);
 #else
     int result = chmod(resolved.c_str(), static_cast<mode_t>(mode));
 #endif
@@ -819,12 +850,12 @@ static bronze::Value js_realpathSync(bronze::Value, std::span<const bronze::Valu
 
     std::string resolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
     std::error_code ec;
-    auto canonical = fs::canonical(resolved, ec);
+    auto canonical = fs::canonical(u8p(resolved), ec);
     if (ec) {
         return throwFsError("realpath", resolved.c_str(), ec);
     }
 
-    return ev::fromUtf8(canonical.string());
+    return ev::fromUtf8(u8s(canonical));
 }
 
 void installFS()
