@@ -200,6 +200,12 @@ rawBad.on('close', () => {
 });
 
 // Watchdog: only reachable if a flow hangs (open sockets keep the pump alive).
+// It is a wall-clock budget, not part of what the test checks: under
+// BRONZE_GC_STRESS every allocation runs a full collection, and one handshake
+// alone takes seconds (a single raw-socket flow measured ~8 s against ~80 ms
+// unstressed), so the budget grows by a fixed factor there. A passing run
+// finishes as soon as the flows do either way.
+const GC_STRESS = !!(process.env.BRONZE_GC_STRESS && process.env.BRONZE_GC_STRESS !== '0');
 setTimeout(() => {
     if (!finished) {
         assert(false, 'ws flows did not complete (client=' + clientFlowDone +
@@ -210,4 +216,4 @@ setTimeout(() => {
         rawBad.destroy();
         wss.close();
     }
-}, 15000);
+}, 15000 * (GC_STRESS ? 8 : 1));

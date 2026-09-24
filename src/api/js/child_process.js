@@ -255,7 +255,10 @@
 
     // Grace period after exit for both pipes to reach EOF. A grandchild that
     // inherited a write end can hold one open indefinitely; rather than leak
-    // the handle we give up and close out.
+    // the handle we give up and close out. The clock restarts on every chunk:
+    // a child that exits with its output still queued in the pipe (the kernel
+    // buffer plus the reader's highWaterMark) is still delivering, and a slow
+    // consumer must not cut that tail off. Only a quiet, un-EOF'd pipe counts.
     var EOF_GRACE_MS = 2000;
 
     // Liveness hook, mirroring __brokit_net_has_pending and friends. Embedders
@@ -438,6 +441,7 @@
         }
 
         if (this._piped && this._exited) {
+            if (gotData) this._exitAt = Date.now();
             var drained = this._outEof && this._errEof;
             if (drained || (Date.now() - this._exitAt) > EOF_GRACE_MS) {
                 this._finish();
