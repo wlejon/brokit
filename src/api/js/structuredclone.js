@@ -17,11 +17,14 @@
         'BigInt64Array', 'BigUint64Array'
     ];
 
+    // Detach a transferred buffer once the value has been cloned (its bytes
+    // already live in the clone), so views of it in the payload were still
+    // readable while cloning.
     function detachArrayBuffer(ab) {
         if (typeof ab.transfer === 'function') {
-            return ab.transfer();
+            ab.transfer(0);
+            return;
         }
-        var copy = ab.slice(0);
         try {
             new Uint8Array(ab).fill(0);
         } catch (e) {}
@@ -29,7 +32,13 @@
             Object.defineProperty(ab, 'byteLength', { value: 0 });
             Object.defineProperty(ab, 'detached', { value: true });
         } catch (e) {}
-        return copy;
+    }
+
+    function seenTarget(seen, src) {
+        for (var i = 0; i < seen.length; i++) {
+            if (seen[i].src === src) return seen[i].dst;
+        }
+        return null;
     }
 
     function cloneValue(value, seen) {
@@ -88,15 +97,11 @@
         for (var ti = 0; ti < TypedArrayTypes.length; ti++) {
             var TACtor = globalThis[TypedArrayTypes[ti]];
             if (TACtor && value instanceof TACtor) {
-                if (value.buffer && value.buffer.detached) {
+                // A view whose buffer is cloned (or transferred) elsewhere in
+                // the payload shares that buffer's clone.
+                var abTarget = seenTarget(seen, value.buffer);
+                if (!abTarget && value.buffer && value.buffer.detached) {
                     throw new globalThis.DOMException('Cannot clone TypedArray with detached buffer', 'DataCloneError');
-                }
-                var abTarget = null;
-                for (var si = 0; si < seen.length; si++) {
-                    if (seen[si].src === value.buffer) {
-                        abTarget = seen[si].dst;
-                        break;
-                    }
                 }
                 var abClone = abTarget ? abTarget : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
                 var taClone = abTarget ? new TACtor(abClone, value.byteOffset, value.length) : new TACtor(abClone);
@@ -107,15 +112,9 @@
 
         // DataView
         if (typeof DataView !== 'undefined' && value instanceof DataView) {
-            if (value.buffer && value.buffer.detached) {
+            var abTargetDv = seenTarget(seen, value.buffer);
+            if (!abTargetDv && value.buffer && value.buffer.detached) {
                 throw new globalThis.DOMException('Cannot clone DataView with detached buffer', 'DataCloneError');
-            }
-            var abTargetDv = null;
-            for (var sdi = 0; sdi < seen.length; sdi++) {
-                if (seen[sdi].src === value.buffer) {
-                    abTargetDv = seen[sdi].dst;
-                    break;
-                }
             }
             var dvBuf = abTargetDv ? abTargetDv : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
             var dvClone = new DataView(dvBuf, abTargetDv ? value.byteOffset : 0, value.byteLength);
@@ -202,6 +201,7 @@
             }
         }
         var seen = [];
+        var toDetach = [];
         if (transferList.length > 0) {
             for (var ti = 0; ti < transferList.length; ti++) {
                 for (var tj = ti + 1; tj < transferList.length; tj++) {
@@ -216,8 +216,8 @@
                     if (item.detached) {
                         throw new globalThis.DOMException('Cannot transfer detached ArrayBuffer', 'DataCloneError');
                     }
-                    var transferred = detachArrayBuffer(item);
-                    seen.push({ src: item, dst: transferred });
+                    seen.push({ src: item, dst: item.slice(0) });
+                    toDetach.push(item);
                 } else if (typeof MessagePort !== 'undefined' && item instanceof MessagePort) {
                     seen.push({ src: item, dst: item });
                 } else {
@@ -225,6 +225,11 @@
                 }
             }
         }
-        return cloneValue(value, seen);
+        // Serialize first, detach after (HTML StructuredSerializeWithTransfer):
+        // a view of a transferred buffer in the payload reads its offset and
+        // length from the live buffer. A clone error leaves nothing detached.
+        var result = cloneValue(value, seen);
+        for (var di = 0; di < toDetach.length; di++) detachArrayBuffer(toDetach[di]);
+        return result;
     };
 })();

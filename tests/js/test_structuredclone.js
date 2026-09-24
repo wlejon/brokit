@@ -132,3 +132,27 @@ try {
 }
 assertEqual(threwOnDup, true, 'throws on duplicate transfer');
 
+// --- Transfer: a view of a transferred buffer in the payload ---
+// Serialized before the buffer is detached, so the view keeps its offset,
+// length and bytes, and shares the transferred buffer's clone.
+var abView = new ArrayBuffer(8);
+var view = new Uint8Array(abView, 2, 4);
+view.set([1, 2, 3, 4]);
+var outView = structuredClone({ v: view, ab: abView }, { transfer: [abView] });
+assertEqual(abView.byteLength, 0, 'view payload: buffer detached');
+assertEqual(view.length, 0, 'view payload: sender view detached');
+assertEqual(outView.v.byteOffset, 2, 'view payload: offset kept');
+assertEqual(Array.from(outView.v).join(), '1,2,3,4', 'view payload: bytes kept');
+assert(outView.v.buffer === outView.ab, 'view payload: view shares the transferred buffer');
+
+var abOnly = new ArrayBuffer(4);
+var dv = new DataView(abOnly);
+dv.setInt16(0, -7);
+var outDv = structuredClone({ d: dv }, { transfer: [abOnly] });
+assertEqual(abOnly.byteLength, 0, 'buffer reached only through a DataView is detached');
+assertEqual(outDv.d.getInt16(0), -7, 'DataView of a transferred buffer arrives');
+
+var abFail = new ArrayBuffer(4);
+try { structuredClone({ v: new Uint8Array(abFail), f: function() {} }, { transfer: [abFail] }); } catch (e) {}
+assertEqual(abFail.byteLength, 4, 'a failed clone detaches nothing');
+
