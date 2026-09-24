@@ -17,11 +17,33 @@ extern "C" void bronze_process_main();
 #else
 #include <unistd.h>
 extern "C" char** environ;
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
 #endif
+#endif
+#include <string>
 
 namespace brokit::api {
 
 namespace {
+
+// The running executable's absolute path (Node's process.execPath), so an
+// app can start another instance of its own runtime.
+std::string executablePath() {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    return (len > 0 && len < MAX_PATH) ? std::string(buf, len) : std::string("bro");
+#elif defined(__APPLE__)
+    char buf[4096];
+    uint32_t size = sizeof(buf);
+    return _NSGetExecutablePath(buf, &size) == 0 ? std::string(buf) : std::string("bro");
+#else
+    char buf[4096];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    return len > 0 ? std::string(buf, static_cast<size_t>(len)) : std::string("bro");
+#endif
+}
 
 Value js_process_cwd(Value, std::span<const Value>) {
 #ifdef _WIN32
@@ -140,8 +162,12 @@ void installProcess() {
         process.set("versions", versions.get());
     }
 
-    process.set("pid", ev::fromDouble(1.0));
-    process.set("execPath", ev::fromUtf8("bro"));
+#ifdef _WIN32
+    process.set("pid", ev::fromDouble(static_cast<double>(GetCurrentProcessId())));
+#else
+    process.set("pid", ev::fromDouble(static_cast<double>(getpid())));
+#endif
+    process.set("execPath", ev::fromUtf8(executablePath()));
 
     process.def("nextTick", 1, [](Value, std::span<const Value> a) {
         if (a.empty() || !ev::isFunction(a[0])) return ev::undefined();

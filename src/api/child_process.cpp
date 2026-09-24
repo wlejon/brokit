@@ -26,6 +26,9 @@ extern "C" void bronze_child_process_main();
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #endif
 
 namespace brokit::api {
@@ -111,6 +114,64 @@ struct ChildHandle {
 static std::mutex g_childMutex;
 static std::unordered_map<int, std::unique_ptr<ChildHandle>> g_children;
 static std::atomic<int> g_nextChildId{1};
+
+// ---------------------------------------------------------------------------
+// Children end with the app
+//
+// Windows leaves a child running when its parent exits, and a long-running
+// child whose stdout reader is gone can loop forever writing into a dead pipe
+// (a PowerShell script with ErrorAction SilentlyContinue, typeperf, ...). So
+// every child that is not `detached` goes into one job object created with
+// KILL_ON_JOB_CLOSE. The job handle is never closed: the OS closes it when
+// this process exits however it exits (clean quit, crash, TerminateProcess),
+// which ends the children and every descendant they started. The child is
+// created suspended and resumed only once it is in the job, so it cannot
+// start a grandchild outside it. Linux gets the same through
+// PR_SET_PDEATHSIG in the forked child.
+// ---------------------------------------------------------------------------
+#ifdef _WIN32
+static HANDLE appJob()
+{
+    static HANDLE job = [] {
+        HANDLE j = CreateJobObjectW(nullptr, nullptr);
+        if (!j) return HANDLE(nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = {};
+        // BREAKAWAY_OK: a child that is itself bro can still start a
+        // detached process that outlives both.
+        info.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        if (!SetInformationJobObject(j, JobObjectExtendedLimitInformation, &info, sizeof(info))) {
+            CloseHandle(j);
+            return HANDLE(nullptr);
+        }
+        return j;
+    }();
+    return job;
+}
+
+// Start a child created with CREATE_SUSPENDED: into the app job unless
+// detached, then running. A failed assignment (no job) still runs the child.
+static void startChild(const PROCESS_INFORMATION& pi, bool detached)
+{
+    if (!detached) {
+        if (HANDLE job = appJob()) AssignProcessToJobObject(job, pi.hProcess);
+    }
+    ResumeThread(pi.hThread);
+}
+#else
+// In the forked child, before exec: die with the parent. PDEATHSIG is Linux
+// only (and fires when the forking thread exits); the getppid() check catches
+// a parent that exited between fork and prctl.
+static void dieWithParent(pid_t parent)
+{
+#ifdef __linux__
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (getppid() != parent) _exit(127);
+#else
+    (void)parent;
+#endif
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Helper: run a command and capture stdout/stderr
@@ -287,7 +348,7 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
         cmdLine.data(),
         nullptr, nullptr,
         TRUE, // inherit handles (limited by the attribute list when present)
-        CREATE_NO_WINDOW | (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0),
+        CREATE_NO_WINDOW | CREATE_SUSPENDED | (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0),
         env ? const_cast<char*>(envBlock.data()) : nullptr,
         cwd.empty() ? nullptr : cwd.c_str(),
         &six.StartupInfo, &pi
@@ -310,6 +371,7 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
         CloseHandle(hStdinWrite);
         return result;
     }
+    startChild(pi, false);
 
     // Write input if provided
     if (!input.empty()) {
@@ -399,6 +461,7 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
         return result;
     }
 
+    const pid_t parent = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         result.error = "Failed to fork";
@@ -407,6 +470,7 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 
     if (pid == 0) {
         // Child
+        dieWithParent(parent);
         close(stdoutPipe[0]);
         close(stderrPipe[0]);
         close(stdinPipe[1]);
@@ -671,6 +735,7 @@ struct ExecOptions {
     std::string stderrFile; // spawn only: redirect child stderr (may equal stdoutFile)
     bool pipeStdio = false; // spawn only: stdio:'pipe' — stream stdout/stderr, writable stdin
     int highWaterMark = 8 * 1024 * 1024; // spawn only: per-stream backpressure threshold
+    bool detached = false;  // spawn only: outlive the app (no job / PDEATHSIG, own session)
 };
 
 static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
@@ -694,6 +759,9 @@ static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
 
     bronze::Value shV = ev::getProperty(val, "shell");
     if (ev::isBool(shV)) opts.shell = ev::toBool(shV);
+
+    bronze::Value detV = ev::getProperty(val, "detached");
+    if (ev::isBool(detV)) opts.detached = ev::toBool(detV);
 
     bronze::Value mbV = ev::getProperty(val, "maxBuffer");
     if (ev::isDouble(mbV)) opts.maxBuffer = saturateI32(ev::toDouble(mbV));
@@ -948,21 +1016,28 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
         }
     }
 
-    DWORD creationFlags = CREATE_NO_WINDOW;
+    DWORD creationFlags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+    if (opts.detached) creationFlags |= CREATE_NEW_PROCESS_GROUP;
     if (opts.hasEnv) creationFlags |= CREATE_UNICODE_ENVIRONMENT;
     if (haveAttrList) creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
 
     std::vector<char> cmdBuf(cmdLine.begin(), cmdLine.end());
     cmdBuf.push_back('\0');
 
-    BOOL ok = CreateProcessA(
-        nullptr, cmdBuf.data(),
-        nullptr, nullptr, inheritHandles,
-        creationFlags,
-        opts.hasEnv ? const_cast<char*>(envBlock.data()) : nullptr,
-        opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
-        haveAttrList ? reinterpret_cast<STARTUPINFOA*>(&six) : &six.StartupInfo,
-        &pi);
+    auto create = [&](DWORD flags) {
+        return CreateProcessA(
+            nullptr, cmdBuf.data(),
+            nullptr, nullptr, inheritHandles,
+            flags,
+            opts.hasEnv ? const_cast<char*>(envBlock.data()) : nullptr,
+            opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
+            haveAttrList ? reinterpret_cast<STARTUPINFOA*>(&six) : &six.StartupInfo,
+            &pi);
+    };
+    // A detached child also leaves any job this process runs in (a parent
+    // bro's, a terminal's), when that job allows it; otherwise it stays there.
+    BOOL ok = opts.detached ? create(creationFlags | CREATE_BREAKAWAY_FROM_JOB) : FALSE;
+    if (!ok) ok = create(creationFlags);
 
     DWORD createErr = ok ? 0 : GetLastError();
     if (haveAttrList) DeleteProcThreadAttributeList(six.lpAttributeList);
@@ -975,6 +1050,7 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
         snprintf(errBuf, sizeof(errBuf), "spawn failed: CreateProcess error %lu", createErr);
         return ev::throwTypeError(errBuf);
     }
+    startChild(pi, opts.detached);
     CloseHandle(pi.hThread);
     handle->process = pi.hProcess;
     handle->pid = pi.dwProcessId;
@@ -1010,6 +1086,7 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     }
     fcntl(execPipe[1], F_SETFD, fcntl(execPipe[1], F_GETFD) | FD_CLOEXEC);
 
+    const pid_t parent = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         close(execPipe[0]);
@@ -1019,6 +1096,8 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     }
     if (pid == 0) {
         close(execPipe[0]);
+        if (opts.detached) setsid();
+        else dieWithParent(parent);
         if (opts.pipeStdio) {
             ::close(outPipe[0]);
             ::close(errPipe[0]);
