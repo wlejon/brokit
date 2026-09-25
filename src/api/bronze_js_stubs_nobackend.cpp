@@ -1,8 +1,9 @@
-// Native arm64 entry stubs for Bronze compiled JS polyfills on Apple Silicon.
-// Bronze/Brass code generator is x86_64; on Apple Silicon (arm64), these stubs
-// satisfy the static entry points required by brokit_api. When BRASS_HOST_BACKEND
-// is disabled, they fall back to evaluating the polyfill scripts dynamically
-// so the runtime polyfills still initialize instead of becoming inert no-ops.
+// Entry stubs for the Bronze-compiled JS polyfills, linked only on a target
+// brass has no code generator for (BRASS_HOST_BACKEND OFF; x86_64 and AArch64,
+// Apple Silicon included, compile the polyfills natively and never use this
+// file). They satisfy the static entry points required by brokit_api and fall
+// back to evaluating the polyfill scripts dynamically, so the runtime
+// polyfills still initialize instead of becoming inert no-ops.
 
 #include "embed/embed.h"
 #include "eval/eval.h"

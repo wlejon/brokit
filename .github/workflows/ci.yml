@@ -15,15 +15,22 @@ concurrency:
 # the broimage sibling (which itself needs the header-only bromath). broimage's
 # brotensor adapter is switched off (BROIMAGE_WITH_TENSOR=OFF) — brokit's image
 # glue only uses the host-pointer kernels — so the heavy tensor stack is not
-# pulled in. Bronze AOT JavaScript compiler and Brass codegen are checked out
-# as siblings.
+# pulled in.
 #
 #   $GITHUB_WORKSPACE/
 #     brokit/     <- this repo; curl/FastNoise2 submodules initialised
-#     bronze/     <- sibling, AOT compiler
-#     brass/      <- sibling, codegen backend
+#     bronze/     <- the JavaScript runtime brokit_api binds, and the
+#                    compiler that builds src/api/js/*.js
+#     brass/      <- bronze's code generator
 #     broimage/   <- sibling, image kernels
 #     bromath/    <- sibling, header-only
+#
+# bronze and brass are laid out by bronze's checkout-toolchain action and
+# compiled inside this build tree (bronze add_subdirectory()s brass), with
+# the job's own compiler and CRT — the api is bound across bronze's C++ embed
+# boundary, so a prebuilt bronze would be an unverifiable ABI hazard. brass
+# has native x86_64 and AArch64 code generators, so the JS tests run on every
+# row, macos-arm64 included.
 #
 # The broimage submodule is pinned to an ssh:// URL for push access, so it is
 # NOT initialised here (it would need a deploy key); brokit prefers the sibling
@@ -57,30 +64,7 @@ jobs:
           git -C brokit submodule update --init --recursive \
             third_party/curl third_party/FastNoise2
 
-      - name: Checkout brass
-        uses: actions/checkout@v7
-        with:
-          repository: wlejon/brass
-          path: brass
-
-      - name: Build brass
-        shell: bash
-        run: |
-          EXTRA_BRASS=""
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            EXTRA_BRASS="-DCMAKE_OSX_ARCHITECTURES=x86_64"
-          elif [ "$RUNNER_OS" = "Windows" ]; then
-            EXTRA_BRASS='-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>'
-          fi
-          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release $EXTRA_BRASS
-          cmake --build brass/build --config Release --target brass --parallel 4
-          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
-
-      - name: Checkout bronze
-        uses: actions/checkout@v7
-        with:
-          repository: wlejon/bronze
-          path: bronze
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - uses: actions/checkout@v7
         with:
@@ -124,24 +108,7 @@ jobs:
           git -C brokit submodule update --init --recursive \
             third_party/curl third_party/FastNoise2
 
-      - name: Checkout brass
-        uses: actions/checkout@v7
-        with:
-          repository: wlejon/brass
-          path: brass
-
-      - name: Build brass
-        shell: bash
-        run: |
-          cmake -B brass/build -S brass -DCMAKE_BUILD_TYPE=Release
-          cmake --build brass/build --config Release --target brass --parallel 4
-          echo "BRASS_ROOT=$GITHUB_WORKSPACE/brass" >> "$GITHUB_ENV"
-
-      - name: Checkout bronze
-        uses: actions/checkout@v7
-        with:
-          repository: wlejon/bronze
-          path: bronze
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
 
       - uses: actions/checkout@v7
         with:

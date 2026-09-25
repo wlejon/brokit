@@ -27,7 +27,7 @@ endif()
 #
 # Every one of these runs JavaScript, which brass compiles to machine code for
 # the target — and on a target it has no code generator for (BRASS_HOST_BACKEND,
-# decided in brass's CMakeLists; Apple Silicon today) that code cannot run.
+# decided in brass's CMakeLists; x86_64 and AArch64 have one) that code cannot run.
 # brokit_test still builds there, which is the check that the embed links; the
 # tests are not registered rather than registered to bus-error.
 if(NOT BRASS_HOST_BACKEND)

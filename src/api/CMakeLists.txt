@@ -2,12 +2,12 @@
 # Each .js file in js/ is compiled directly to an object file (.o) with its
 # unique entry symbol and linked into brokit_api.
 # On a target brass has no code generator for (BRASS_HOST_BACKEND, decided in
-# brass's CMakeLists — Apple Silicon today) nothing is compiled and native
+# brass's CMakeLists; x86_64 and AArch64 have one) nothing is compiled and native
 # no-op stubs are linked instead; tests/CMakeLists.txt reads the same
 # variable to know there is no JavaScript to run there.
 
 if(NOT BRASS_HOST_BACKEND)
-    set(BROKIT_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_arm64.cpp")
+    set(BROKIT_COMPILED_JS_OBJECTS "${CMAKE_CURRENT_SOURCE_DIR}/bronze_js_stubs_nobackend.cpp")
     message(STATUS "brokit: api built with the no-op JS entries (brass has no code generator for this target)")
 else()
     set(GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
