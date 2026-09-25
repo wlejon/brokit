@@ -1096,8 +1096,20 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     }
     if (pid == 0) {
         close(execPipe[0]);
-        if (opts.detached) setsid();
-        else dieWithParent(parent);
+        if (opts.detached) {
+            setsid();
+            if (!opts.pipeStdio) {
+                int devnull = open("/dev/null", O_RDWR);
+                if (devnull >= 0) {
+                    dup2(devnull, STDIN_FILENO);
+                    if (opts.stdoutFile.empty()) dup2(devnull, STDOUT_FILENO);
+                    if (opts.stderrFile.empty()) dup2(devnull, STDERR_FILENO);
+                    if (devnull > 2) close(devnull);
+                }
+            }
+        } else {
+            dieWithParent(parent);
+        }
         if (opts.pipeStdio) {
             ::close(outPipe[0]);
             ::close(errPipe[0]);
