@@ -983,6 +983,8 @@ void installFetch()
     bronze::embed::runEntry(bronze_fetch_helpers_main);
 }
 
+int settleLocalFetches() { return settleLocalResponses(g_fetchState); }
+
 void uninstallFetch()
 {
     auto& s = g_fetchState;

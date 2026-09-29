@@ -126,6 +126,12 @@ void installReadableStream();
 void installFetch();
 /// Tear down per-context fetch state. Cancels in-flight requests and frees curl handles.
 void uninstallFetch();
+/// Settle the file:, data: and blob: fetches on this thread whose responses
+/// are already built, as the task that follows the current one. Runs no JS
+/// (settling only queues reaction jobs); returns how many it settled. A host
+/// calls it after a microtask checkpoint so local fetches resolve in the same
+/// turn rather than waiting for the next __brokit_fetch_tick pump.
+int settleLocalFetches();
 void installFS();
 void installFSWatch();
 void installChildProcess();
