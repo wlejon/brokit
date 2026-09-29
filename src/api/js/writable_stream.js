@@ -358,10 +358,13 @@
             write: function(chunk) {
                 try {
                     var result = transformFn(chunk, transformController);
-                    return Promise.resolve(result);
+                    return Promise.resolve(result).catch(function(e) {
+                        transformController.error(e);
+                        throw e;
+                    });
                 } catch (e) {
                     transformController.error(e);
-                    return Promise.reject(e);
+                    throw e;
                 }
             },
             close: function() {
@@ -370,10 +373,13 @@
                         var result = flushFn(transformController);
                         return Promise.resolve(result).then(function() {
                             transformController.terminate();
+                        }).catch(function(e) {
+                            transformController.error(e);
+                            throw e;
                         });
                     } catch (e) {
                         transformController.error(e);
-                        return Promise.reject(e);
+                        throw e;
                     }
                 }
                 transformController.terminate();
