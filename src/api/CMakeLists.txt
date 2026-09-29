@@ -91,6 +91,7 @@ set(BROKIT_API_SOURCES
     indexeddb_js.cpp
     readable_stream.cpp
     fetch.cpp
+    fetch_response.cpp
     fs.cpp
     fs_watch.cpp
     fs_watch_linux.cpp
