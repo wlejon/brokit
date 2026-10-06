@@ -69,6 +69,13 @@ assert(threw, 'send while CONNECTING throws');
 // Close the test socket to prevent it hanging in curl_multi
 ws.close();
 
+// ── Secure WebSocket (wss://) instance properties ────────────────────────
+var wss = new WebSocket('wss://127.0.0.1:1/nope');
+assertEqual(wss.url, 'wss://127.0.0.1:1/nope', 'wss url property');
+assertEqual(wss.readyState, WebSocket.CONNECTING, 'wss initial readyState');
+wss.close();
+
+
 // ── close() validation ──────────────────────────────────────────────────
 threw = false;
 var _ws1 = new WebSocket('ws://127.0.0.1:1/x');

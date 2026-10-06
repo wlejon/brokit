@@ -324,6 +324,12 @@ bodyTests = bodyTests.then(function() {
         assertEqual(v1[1], 20, 'resp byte 1');
         assertEqual(v2[1], 20, 'clonedResp byte 1');
     });
+}).then(function() {
+    // ── TLS Backend verification ──
+    assert(typeof __brokit_fetch_tls_backend === 'function', '__brokit_fetch_tls_backend exists');
+    var tlsBackendName = __brokit_fetch_tls_backend();
+    assert(typeof tlsBackendName === 'string' && tlsBackendName.length > 0, 'TLS backend is active: ' + tlsBackendName);
 }).catch(function(e) {
     assert(false, 'test_fetch_classes failed: ' + (e && e.stack || e));
 });
+

@@ -2,6 +2,10 @@
 assert(typeof fetch === 'function', 'fetch exists');
 assert(typeof __brokit_fetch_tick === 'function', 'fetch tick exists');
 assert(typeof __brokit_fetch_has_pending === 'function', 'fetch has_pending exists');
+assert(typeof __brokit_fetch_tls_backend === 'function', 'fetch tls_backend exists');
+
+var tlsBackend = __brokit_fetch_tls_backend();
+assert(typeof tlsBackend === 'string' && tlsBackend.length > 0, 'TLS backend is available: ' + tlsBackend);
 
 // Basic GET request to a public API
 var fetchPassed = 0;
