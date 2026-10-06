@@ -32,9 +32,11 @@ concurrency:
 # has native x86_64 and AArch64 code generators, so the JS tests run on every
 # row, macos-arm64 included.
 #
-# The broimage submodule is pinned to an ssh:// URL for push access, so it is
-# NOT initialised here (it would need a deploy key); brokit prefers the sibling
-# checkout at ../broimage anyway. Only the https submodules are fetched.
+# The test and coverage jobs initialise only the curl and FastNoise2
+# submodules: broimage and bromath come from the sibling checkouts on main,
+# which brokit prefers over its third_party/ copies. The `submodule` job builds
+# the other way, from a recursive clone with no siblings beside it, so the
+# fallback a fresh `git clone --recursive` relies on cannot rot.
 jobs:
   test:
     name: ${{ matrix.name }}
@@ -58,7 +60,7 @@ jobs:
         with:
           arch: x64
 
-      - name: Initialise the https submodules (skip the ssh broimage submodule)
+      - name: Initialise the curl and FastNoise2 submodules (broimage and bromath are siblings)
         shell: bash
         run: |
           git -C brokit submodule update --init --recursive \
@@ -89,6 +91,42 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure --timeout 120
 
+  # ── Submodule fallback ────────────────────────────────────────────────────
+  #
+  # No sibling checkouts: broimage and bromath come from the flat third_party/
+  # submodules at the commits this repo pins, as they do for a fresh
+  # `git clone --recursive`, and with brokit's own defaults (no
+  # BROIMAGE_WITH_TENSOR on the command line). bronze and brass are the
+  # documented exception (no submodule; the api has to compile against the
+  # bronze of the program that loads it) and are laid out beside the repo as
+  # in the other jobs. The configure step checks each sibling really took the
+  # submodule path.
+  submodule:
+    name: Submodule fallback · ubuntu-24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: brokit
+          submodules: recursive
+
+      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
+
+      - name: Configure
+        shell: bash
+        run: |
+          test ! -e broimage && test ! -e bromath
+          cmake -S brokit -B build -DCMAKE_BUILD_TYPE=Release | tee configure.log
+          for s in bromath broimage; do
+            grep -q "brokit: $s from .*third_party/$s (submodule)" configure.log
+          done
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
   # Debug + --coverage on Linux. --filter scopes the numbers to brokit's own
@@ -102,7 +140,7 @@ jobs:
         with:
           path: brokit
 
-      - name: Initialise the https submodules (skip the ssh broimage submodule)
+      - name: Initialise the curl and FastNoise2 submodules (broimage and bromath are siblings)
         shell: bash
         run: |
           git -C brokit submodule update --init --recursive \

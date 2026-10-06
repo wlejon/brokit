@@ -125,24 +125,41 @@ endif()
 option(BROKIT_ENABLE_IMAGE "Build bro.image typed-array kernels" ON)
 if(BROKIT_ENABLE_IMAGE)
     list(APPEND BROKIT_API_SOURCES image.cpp)
-    if(NOT TARGET broimage)
-        set(BROIMAGE_DIR "${brokit_SOURCE_DIR}/../broimage" CACHE PATH
-            "Path to standalone broimage repo")
-        if(EXISTS "${BROIMAGE_DIR}/CMakeLists.txt")
-            message(STATUS "broimage: using standalone repo at ${BROIMAGE_DIR}")
-            add_subdirectory("${BROIMAGE_DIR}" "${CMAKE_BINARY_DIR}/broimage"
-                             EXCLUDE_FROM_ALL)
-        elseif(EXISTS "${brokit_SOURCE_DIR}/third_party/broimage/CMakeLists.txt")
-            message(STATUS "broimage: using submodule at third_party/broimage")
-            add_subdirectory("${brokit_SOURCE_DIR}/third_party/broimage"
-                             "${CMAKE_BINARY_DIR}/broimage" EXCLUDE_FROM_ALL)
+    # broimage and the bromath headers it needs resolve like every repo in the
+    # bro ecosystem: an existing target (bro adds both first) wins; otherwise a
+    # checkout beside the top-level project (../<name>, overridable with
+    # -D<NAME>_DIR=<path>); otherwise the top-level project's
+    # third_party/<name> submodule. third_party/ is flat: it carries bromath
+    # beside broimage. bromath is resolved first so broimage finds the target.
+    #
+    # brokit's image glue uses only broimage's host-pointer kernels, so the
+    # brotensor adapter is off unless the surrounding build already chose.
+    if(NOT DEFINED BROIMAGE_WITH_TENSOR)
+        set(BROIMAGE_WITH_TENSOR OFF CACHE BOOL
+            "Build the brotensor adapter (image preprocessing to/from tensors)")
+    endif()
+    foreach(_sib bromath broimage)
+        if(TARGET ${_sib})
+            continue()
+        endif()
+        string(TOUPPER "${_sib}" _upper)
+        set(${_upper}_DIR "${CMAKE_SOURCE_DIR}/../${_sib}" CACHE PATH
+            "Path to standalone ${_sib} repo (set to a missing path to force submodule fallback)")
+        if(EXISTS "${${_upper}_DIR}/CMakeLists.txt")
+            message(STATUS "brokit: ${_sib} from ${${_upper}_DIR}")
+            add_subdirectory("${${_upper}_DIR}" "${CMAKE_BINARY_DIR}/${_sib}" EXCLUDE_FROM_ALL)
+        elseif(EXISTS "${CMAKE_SOURCE_DIR}/third_party/${_sib}/CMakeLists.txt")
+            message(STATUS "brokit: ${_sib} from ${CMAKE_SOURCE_DIR}/third_party/${_sib} (submodule)")
+            add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/${_sib}"
+                             "${CMAKE_BINARY_DIR}/${_sib}" EXCLUDE_FROM_ALL)
         else()
             message(FATAL_ERROR
-                "BROKIT_ENABLE_IMAGE=ON requires broimage at ${BROIMAGE_DIR} "
-                "or ${brokit_SOURCE_DIR}/third_party/broimage. Clone broimage "
-                "next to brokit, or override with -DBROIMAGE_DIR=...")
+                "BROKIT_ENABLE_IMAGE=ON requires ${_sib}: not found at ${${_upper}_DIR} or "
+                "${CMAKE_SOURCE_DIR}/third_party/${_sib}. Clone https://github.com/wlejon/${_sib} "
+                "next to brokit, run `git submodule update --init --recursive`, or override "
+                "with -D${_upper}_DIR=...")
         endif()
-    endif()
+    endforeach()
 endif()
 
 add_library(brokit_api STATIC
