@@ -326,8 +326,8 @@ bodyTests = bodyTests.then(function() {
     });
 }).then(function() {
     // ── TLS Backend verification ──
-    assert(typeof __brokit_fetch_tls_backend === 'function', '__brokit_fetch_tls_backend exists');
-    var tlsBackendName = __brokit_fetch_tls_backend();
+    assert(typeof __test_fetch_tls_backend === 'function', '__test_fetch_tls_backend exists');
+    var tlsBackendName = __test_fetch_tls_backend();
     assert(typeof tlsBackendName === 'string' && tlsBackendName.length > 0, 'TLS backend is active: ' + tlsBackendName);
 }).catch(function(e) {
     assert(false, 'test_fetch_classes failed: ' + (e && e.stack || e));

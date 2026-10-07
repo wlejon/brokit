@@ -1,5 +1,6 @@
 #include "runtime/runtime.h"
 #include "api/api.h"
+#include <curl/curl.h>
 
 #include <chrono>
 #include <filesystem>
@@ -49,6 +50,13 @@ static TestResult runTestFile(const std::string& path) {
     brokit::Runtime::setLogCallback(captureLog);
     bronze::embed::setGlobalFunction("__test_lastLog", 0, [](bronze::Value, std::span<const bronze::Value>) {
         return bronze::embed::fromUtf8(g_lastLog);
+    });
+    bronze::embed::setGlobalFunction("__test_fetch_tls_backend", 0, [](bronze::Value, std::span<const bronze::Value>) {
+        curl_version_info_data* info = curl_version_info(CURLVERSION_NOW);
+        if (!info || !(info->features & CURL_VERSION_SSL) || !info->ssl_version) {
+            return bronze::embed::null();
+        }
+        return bronze::embed::fromUtf8(info->ssl_version);
     });
 
     // Install test helpers: assert, test registration

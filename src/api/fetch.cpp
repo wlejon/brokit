@@ -643,15 +643,6 @@ static bronze::Value js_fetch_has_pending(bronze::Value, std::span<const bronze:
     return ev::fromBool(false);
 }
 
-static bronze::Value js_fetch_tls_backend(bronze::Value, std::span<const bronze::Value>)
-{
-    curl_version_info_data* info = curl_version_info(CURLVERSION_NOW);
-    if (!info || !(info->features & CURL_VERSION_SSL) || !info->ssl_version) {
-        return ev::null();
-    }
-    return ev::fromUtf8(info->ssl_version);
-}
-
 void installFetch()
 {
     static bool curlInited = false;
@@ -663,7 +654,6 @@ void installFetch()
     ev::registerFunction("fetch", js_fetch);
     ev::registerFunction("__brokit_fetch_tick", js_fetch_tick);
     ev::registerFunction("__brokit_fetch_has_pending", js_fetch_has_pending);
-    ev::registerFunction("__brokit_fetch_tls_backend", js_fetch_tls_backend);
     ev::registerFunction("__brokit_fetch_stream_read", js_fetch_stream_read);
     ev::registerFunction("__brokit_fetch_stream_wait", js_fetch_stream_wait);
 
