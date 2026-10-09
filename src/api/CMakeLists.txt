@@ -137,8 +137,8 @@ if(BROKIT_ENABLE_IMAGE)
         set(BROIMAGE_WITH_TENSOR OFF CACHE BOOL
             "Build the brotensor adapter (image preprocessing to/from tensors)")
     endif()
-    bro_dependency(bromath GITHUB wlejon/bromath REF 8b511fbd69c014bf0584d2b42e6c96a8cf720f6a TARGET bromath::bromath)
-    bro_dependency(broimage GITHUB wlejon/broimage REF 9346cd5e97cb2fba0bae15e9f15fc0d9e37349ee)
+    bro_dependency(bromath GITHUB wlejon/bromath TARGET bromath::bromath)
+    bro_dependency(broimage GITHUB wlejon/broimage)
 endif()
 
 add_library(brokit_api STATIC
