@@ -22,6 +22,20 @@ var home = os.homedir();
 assert(typeof home === 'string', 'homedir returns string');
 assert(home.length > 0, 'homedir not empty');
 
+// userInfo: Node's shape
+assert(typeof os.userInfo === 'function', 'os.userInfo is function');
+var ui = os.userInfo();
+assert(typeof ui.username === 'string' && ui.username.length > 0, 'userInfo.username: ' + ui.username);
+assert(ui.homedir === home || ui.homedir.length > 0, 'userInfo.homedir');
+assert(typeof ui.uid === 'number' && typeof ui.gid === 'number', 'userInfo.uid / gid are numbers');
+if (plat === 'win32') {
+    assert(ui.shell === null, 'userInfo.shell is null on Windows');
+    assert(ui.uid === -1, 'userInfo.uid is -1 on Windows');
+} else {
+    assert(ui.shell === null || (typeof ui.shell === 'string' && ui.shell.charAt(0) === '/'),
+           'userInfo.shell is the passwd login shell: ' + ui.shell);
+}
+
 // tmpdir
 var tmp = os.tmpdir();
 assert(typeof tmp === 'string', 'tmpdir returns string');
