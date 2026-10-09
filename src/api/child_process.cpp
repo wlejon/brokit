@@ -188,17 +188,29 @@ struct ExecResult {
 using EnvList = std::vector<std::pair<std::string, std::string>>;
 
 #ifdef _WIN32
-// Double-NUL-terminated "KEY=VALUE\0" block for CreateProcessA.
-static std::string buildEnvBlock(const EnvList& env)
+// Script strings are UTF-8; the process APIs take UTF-16 (the W functions), so
+// a non-ASCII path, argument or variable reaches the child intact rather than
+// through the ANSI code page.
+static std::wstring widen(const std::string& s)
 {
-    std::string block;
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n > 0 ? n : 0), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+
+// Double-NUL-terminated "KEY=VALUE\0" block (UTF-16, CREATE_UNICODE_ENVIRONMENT).
+static std::wstring buildEnvBlock(const EnvList& env)
+{
+    std::wstring block;
     for (const auto& [k, v] : env) {
-        block += k;
-        block += '=';
-        block += v;
-        block += '\0';
+        block += widen(k);
+        block += L'=';
+        block += widen(v);
+        block += L'\0';
     }
-    block += '\0';
+    block += L'\0';
     return block;
 }
 #else
@@ -216,18 +228,30 @@ static std::vector<std::string> buildEnvStrings(const EnvList& env)
 
 #ifdef _WIN32
 
-// Quote one argv entry for a CreateProcess command line. Only spaces, tabs and
-// embedded quotes need it; anything else passes through so a plain path stays
+// Quote one argv entry for a CreateProcess command line so the child's
+// CommandLineToArgvW / C runtime reads back exactly `s`. An empty argument is
+// "" (left bare it would vanish); backslashes are literal except before a
+// quote, where they are doubled, as they are before the closing quote. An
+// argument with no space, tab or quote passes through, so a plain path stays
 // readable in a process listing.
 static std::string quoteArg(const std::string& s)
 {
-    if (s.find_first_of(" \t\"") == std::string::npos) return s;
+    if (!s.empty() && s.find_first_of(" \t\n\v\"") == std::string::npos) return s;
     std::string out = "\"";
+    size_t backslashes = 0;
     for (char c : s) {
-        if (c == '"') out += "\\\"";
-        else out += c;
+        if (c == '\\') { ++backslashes; continue; }
+        if (c == '"') {
+            out.append(backslashes * 2 + 1, '\\');
+            out += '"';
+        } else {
+            out.append(backslashes, '\\');
+            out += c;
+        }
+        backslashes = 0;
     }
-    out += "\"";
+    out.append(backslashes * 2, '\\');
+    out += '"';
     return out;
 }
 
@@ -311,7 +335,7 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
     }
     SetHandleInformation(hStdinWrite, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOEXA six = {};
+    STARTUPINFOEXW six = {};
     six.StartupInfo.cb = sizeof(six);
     six.StartupInfo.hStdOutput = hStdoutWrite;
     six.StartupInfo.hStdError = hStderrWrite;
@@ -340,17 +364,21 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
         cmdLine = "cmd /c " + command;
     }
 
-    std::string envBlock;
+    std::wstring envBlock;
     if (env) envBlock = buildEnvBlock(*env);
+    std::wstring wCmdLine = widen(cmdLine);
+    wCmdLine.push_back(L'\0');
+    const std::wstring wCwd = widen(cwd);
 
-    BOOL ok = CreateProcessA(
+    BOOL ok = CreateProcessW(
         nullptr,
-        cmdLine.data(),
+        wCmdLine.data(),
         nullptr, nullptr,
         TRUE, // inherit handles (limited by the attribute list when present)
-        CREATE_NO_WINDOW | CREATE_SUSPENDED | (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0),
-        env ? const_cast<char*>(envBlock.data()) : nullptr,
-        cwd.empty() ? nullptr : cwd.c_str(),
+        CREATE_NO_WINDOW | CREATE_SUSPENDED | (haveAttrList ? EXTENDED_STARTUPINFO_PRESENT : 0) |
+            (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+        env ? const_cast<wchar_t*>(envBlock.data()) : nullptr,
+        wCwd.empty() ? nullptr : wCwd.c_str(),
         &six.StartupInfo, &pi
     );
 
@@ -970,10 +998,10 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
         for (auto& arg : args) { cmdLine += " "; cmdLine += quoteArg(arg); }
     }
 
-    std::string envBlock;
+    std::wstring envBlock;
     if (opts.hasEnv) envBlock = buildEnvBlock(opts.env);
 
-    STARTUPINFOEXA six = {};
+    STARTUPINFOEXW six = {};
     six.StartupInfo.cb = sizeof(six);
     PROCESS_INFORMATION pi = {};
 
@@ -1021,17 +1049,18 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     if (opts.hasEnv) creationFlags |= CREATE_UNICODE_ENVIRONMENT;
     if (haveAttrList) creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
 
-    std::vector<char> cmdBuf(cmdLine.begin(), cmdLine.end());
-    cmdBuf.push_back('\0');
+    std::wstring cmdBuf = widen(cmdLine);
+    cmdBuf.push_back(L'\0');
+    const std::wstring wCwd = widen(opts.cwd);
 
     auto create = [&](DWORD flags) {
-        return CreateProcessA(
+        return CreateProcessW(
             nullptr, cmdBuf.data(),
             nullptr, nullptr, inheritHandles,
             flags,
-            opts.hasEnv ? const_cast<char*>(envBlock.data()) : nullptr,
-            opts.cwd.empty() ? nullptr : opts.cwd.c_str(),
-            haveAttrList ? reinterpret_cast<STARTUPINFOA*>(&six) : &six.StartupInfo,
+            opts.hasEnv ? const_cast<wchar_t*>(envBlock.data()) : nullptr,
+            wCwd.empty() ? nullptr : wCwd.c_str(),
+            haveAttrList ? reinterpret_cast<STARTUPINFOW*>(&six) : &six.StartupInfo,
             &pi);
     };
     // A detached child also leaves any job this process runs in (a parent
