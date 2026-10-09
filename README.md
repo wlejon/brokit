@@ -85,7 +85,7 @@ Every dependency that is not vendored is pinned to a commit in `CMakeLists.txt`
 (`bro_dependency()`, `cmake/bro_deps.cmake`). It resolves the way every repo in
 the ecosystem resolves one: an existing target wins (bro adds them first), then
 a working tree beside the top-level project (`../bronze`, `../broimage`, ...;
-not for the third-party curl and FastNoise2), then the pinned commit, fetched at
+not for the third-party curl and FastNoise2), then the head of its main branch (curl and FastNoise2: a pinned commit), fetched at
 configure. `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<path>` points one dependency
 anywhere else.
 

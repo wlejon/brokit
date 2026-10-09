@@ -15,10 +15,11 @@ if(MSVC)
 endif()
 
 # Dependencies resolve through cmake/bro_deps.cmake, like every repo in the bro
-# ecosystem: an existing target (bro adds these before brokit, and its pins
-# win) first; otherwise the ../<name> working tree beside the top-level project
+# ecosystem: an existing target (bro adds these before brokit, and its choice
+# wins) first; otherwise the ../<name> working tree beside the top-level project
 # (the third-party ones, curl and FastNoise2, skip this step); otherwise the
-# commit pinned here, fetched at configure.
+# head of the sibling's main (curl and FastNoise2: the commits pinned here),
+# fetched at configure.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
 
 # bronze, the JavaScript runtime the api binds (it brings brass, its code

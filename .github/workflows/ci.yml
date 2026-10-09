@@ -19,7 +19,7 @@ concurrency:
 # Every job builds a plain clone, checked out under brokit/ with the build tree
 # beside it. curl, FastNoise2, broimage, bromath, and bronze (the JavaScript
 # runtime brokit_api binds and the compiler that builds src/api/js/*.js, with
-# brass, its code generator) come from the commits CMakeLists.txt pins
+# brass, its code generator) come from the heads of their main branches (curl and FastNoise2 at pinned commits)
 # (cmake/bro_deps.cmake), fetched at configure. There are no submodules and no
 # sibling checkouts.
 #

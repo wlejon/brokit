@@ -127,9 +127,9 @@ if(BROKIT_ENABLE_IMAGE)
     list(APPEND BROKIT_API_SOURCES image.cpp)
     # broimage and the bromath headers it needs resolve through
     # cmake/bro_deps.cmake like every repo in the bro ecosystem: an existing
-    # target (bro adds both first, and its pins win); otherwise the ../<name>
-    # working tree beside the top-level project; otherwise the commit pinned
-    # here, fetched at configure. bromath first so broimage finds the target.
+    # target (bro adds both first, and its choice wins); otherwise the ../<name>
+    # working tree beside the top-level project; otherwise the head of its
+    # main, fetched at configure. bromath first so broimage finds the target.
     #
     # brokit's image glue uses only broimage's host-pointer kernels, so the
     # brotensor adapter is off unless the surrounding build already chose.

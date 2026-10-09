@@ -42,8 +42,9 @@ src/api/js/    — JS polyfills compiled AOT into object files via bronze_compil
 tests/         — C++ test harness (tests/main.cpp)
 tests/js/      — JavaScript test files (one per API, 56 suites)
 third_party/   — SQLite, miniz (vendored). libcurl, FastNoise2, bronze (+ brass), broimage,
-                 bromath are pinned by bro_dependency() (cmake/bro_deps.cmake): ../<name>
-                 working tree wins for the siblings, else the pinned commit is fetched
+                 bromath are bro_dependency() calls (cmake/bro_deps.cmake): ../<name>
+                 working tree wins for the siblings, else the sibling's main (curl and
+                 FastNoise2: their pinned commits) is fetched
 ```
 
 Optional, both default ON: `BROKIT_ENABLE_NOISE` (FastNoise2 → `BROKIT_HAS_NOISE`) and
@@ -76,8 +77,8 @@ installers are guarded by those `BROKIT_HAS_*` defines in `api.h` and `installAl
 
 ## Integration with bro
 
-bro's `third_party/CMakeLists.txt` adds brokit (pinned in bro's `cmake/bro_pins.cmake`;
-`../brokit` wins when present):
+bro's `third_party/CMakeLists.txt` adds brokit (declared in bro's `cmake/bro_pins.cmake`,
+tracking brokit's main; `../brokit` wins when present):
 
 ```cmake
 bro_dependency(brokit)
