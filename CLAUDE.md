@@ -41,8 +41,9 @@ src/api/       — Web/system API implementations (console, timers, URL, crypto 
 src/api/js/    — JS polyfills compiled AOT into object files via bronze_compile_js
 tests/         — C++ test harness (tests/main.cpp)
 tests/js/      — JavaScript test files (one per API, 56 suites)
-third_party/   — libcurl, SQLite, FastNoise2 (bundled); bronze (at ../bronze), brass (at ../brass),
-                 broimage links from ../broimage
+third_party/   — SQLite, miniz (vendored). libcurl, FastNoise2, bronze (+ brass), broimage,
+                 bromath are pinned by bro_dependency() (cmake/bro_deps.cmake): ../<name>
+                 working tree wins for the siblings, else the pinned commit is fetched
 ```
 
 Optional, both default ON: `BROKIT_ENABLE_NOISE` (FastNoise2 → `BROKIT_HAS_NOISE`) and
@@ -75,13 +76,11 @@ installers are guarded by those `BROKIT_HAS_*` defines in `api.h` and `installAl
 
 ## Integration with bro
 
-bro's `third_party/CMakeLists.txt` adds brokit:
+bro's `third_party/CMakeLists.txt` adds brokit (pinned in bro's `cmake/bro_pins.cmake`;
+`../brokit` wins when present):
 
 ```cmake
-set(BROKIT_DIR "${CMAKE_SOURCE_DIR}/../brokit" CACHE PATH "Path to standalone brokit repo")
-if(EXISTS "${BROKIT_DIR}/CMakeLists.txt")
-    add_subdirectory("${BROKIT_DIR}" "${CMAKE_BINARY_DIR}/brokit" EXCLUDE_FROM_ALL)
-endif()
+bro_dependency(brokit)
 ```
 
 Then link with `target_link_libraries(bro_js PUBLIC brokit)` and call `brokit::api::installAll()` during engine initialization.

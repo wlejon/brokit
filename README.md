@@ -75,22 +75,28 @@ brokit is one of the engine libraries of the [bro ecosystem](https://github.com/
 Requires CMake 3.24+ and a C++20 compiler (MSVC on Windows, GCC/Clang on Linux and macOS).
 
 ```bash
-# bronze and brass beside brokit; the submodules supply everything else
-git clone https://github.com/wlejon/bronze.git
-git clone https://github.com/wlejon/brass.git
-git clone --recursive https://github.com/wlejon/brokit.git
+# a plain clone; dependencies are fetched at configure
+git clone https://github.com/wlejon/brokit.git
 cmake -S brokit -B brokit/build
 cmake --build brokit/build --config Release    # or Debug
 ```
 
+Every dependency that is not vendored is pinned to a commit in `CMakeLists.txt`
+(`bro_dependency()`, `cmake/bro_deps.cmake`). It resolves the way every repo in
+the ecosystem resolves one: an existing target wins (bro adds them first), then
+a working tree beside the top-level project (`../bronze`, `../broimage`, ...;
+not for the third-party curl and FastNoise2), then the pinned commit, fetched at
+configure. `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<path>` points one dependency
+anywhere else.
+
 Dependencies:
-- **bronze** — JavaScript compiler & runtime, at `../bronze` (or `-DBRONZE_DIR=<path>`). No submodule: the APIs are bound across bronze's C++ embed boundary, so brokit has to compile against the same bronze as the program that loads it.
-- **brass** — bronze's code generator, at `../brass` beside bronze.
-- **libcurl** — HTTP/WebSocket (bundled git submodule, static, Schannel TLS on Windows)
+- **bronze** — JavaScript compiler & runtime. The APIs are bound across bronze's C++ embed boundary, so brokit compiles bronze in its own build tree, against the same bronze as the program that loads it.
+- **brass** — bronze's code generator, brought in by bronze.
+- **libcurl** — HTTP/WebSocket (pinned, static, Schannel TLS on Windows)
 - **SQLite** — IndexedDB persistence (bundled amalgamation)
 - **miniz** — CompressionStream codecs (bundled)
-- **FastNoise2** — SIMD noise generation (bundled git submodule, gated by `BROKIT_ENABLE_NOISE`)
-- **broimage** and **bromath** — typed-array image kernels backing `bro.image` (gated by `BROKIT_ENABLE_IMAGE`). They resolve the way every repo in the ecosystem resolves a sibling: an existing target wins (bro adds both first), then a checkout beside the top-level project (`../broimage`, `../bromath`; override with `-DBROIMAGE_DIR` / `-DBROMATH_DIR`), then the `third_party/` submodules, which carry both. broimage's brotensor adapter is off by default here (`BROIMAGE_WITH_TENSOR`), since brokit uses only its host-pointer kernels.
+- **FastNoise2** — SIMD noise generation (pinned, gated by `BROKIT_ENABLE_NOISE`)
+- **broimage** and **bromath** — typed-array image kernels backing `bro.image` (gated by `BROKIT_ENABLE_IMAGE`). broimage's brotensor adapter is off by default here (`BROIMAGE_WITH_TENSOR`), since brokit uses only its host-pointer kernels.
 
 Optional features are gated by CMake options (both default ON): `BROKIT_ENABLE_NOISE` compiles `noise.cpp` and defines `BROKIT_HAS_NOISE`; `BROKIT_ENABLE_IMAGE` compiles `image.cpp`, links broimage, and defines `BROKIT_HAS_IMAGE`.
 
@@ -103,7 +109,7 @@ ctest --test-dir build -C Release --output-on-failure    # -LE gcstress skips th
 ./build/tests/Release/brokit_test.exe tests/js/test_url.js   # one file (Windows path)
 ```
 
-CI runs the suite on Linux (GCC and Clang), Windows (MSVC) and macOS/arm64 against broimage and bromath from main, builds once more from the `third_party/` submodules alone (the fresh-clone path), and reports coverage of `src/`.
+CI runs the suite on a plain clone on Linux (GCC and Clang), Windows (MSVC) and macOS/arm64 against the pinned dependencies, and reports coverage of `src/`.
 
 ## Usage
 
@@ -142,7 +148,7 @@ src/api/       Modular API installers (one .cpp per API, HostClass / HostProxy /
 src/api/js/    JS polyfills compiled ahead of time with Bronze (bronze_compile_js)
 tests/         C++ test harness (tests/main.cpp) that builds & runs JS test files and pumps async subsystems
 tests/js/      JavaScript test files (one per API)
-third_party/   libcurl, FastNoise2, broimage, bromath (submodules); SQLite, miniz (vendored)
+third_party/   SQLite, miniz (vendored); libcurl, FastNoise2, broimage, bromath are pinned in CMakeLists.txt
 ```
 
 **Design principles:**

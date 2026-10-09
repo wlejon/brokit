@@ -1,8 +1,9 @@
 version: 2
 
-# Two things carry pinned versions: the actions in .github/workflows/ and the
-# git submodules (curl, FastNoise2, broimage). The SQLite amalgamation
-# is a vendored source drop with no manifest.
+# The actions in .github/workflows/ carry pinned versions Dependabot can bump.
+# The dependencies (curl, FastNoise2, broimage, bromath, bronze) are pinned to
+# commits with bro_dependency() in CMakeLists.txt, and the SQLite amalgamation
+# is a vendored source drop; neither has a manifest.
 updates:
   - package-ecosystem: github-actions
     directory: /
@@ -24,12 +25,3 @@ updates:
         update-types:
           - "version-update:semver-patch"
           - "version-update:semver-minor"
-
-  - package-ecosystem: gitsubmodule
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    labels: [dependencies]
-    commit-message:
-      prefix: "deps"

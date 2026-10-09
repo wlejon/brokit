@@ -10,33 +10,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# brokit bundles curl and FastNoise2 as submodules and builds them from
-# source, vendors a SQLite amalgamation, and delegates its bro.image kernels to
-# the broimage sibling (which itself needs the header-only bromath). broimage's
-# brotensor adapter is switched off (BROIMAGE_WITH_TENSOR=OFF) — brokit's image
-# glue only uses the host-pointer kernels — so the heavy tensor stack is not
-# pulled in.
+# brokit builds curl and FastNoise2 from source, vendors a SQLite amalgamation,
+# and delegates its bro.image kernels to the broimage sibling (which itself
+# needs the header-only bromath). broimage's brotensor adapter is switched off
+# (BROIMAGE_WITH_TENSOR=OFF) — brokit's image glue only uses the host-pointer
+# kernels — so the heavy tensor stack is not pulled in.
 #
-#   $GITHUB_WORKSPACE/
-#     brokit/     <- this repo; curl/FastNoise2 submodules initialised
-#     bronze/     <- the JavaScript runtime brokit_api binds, and the
-#                    compiler that builds src/api/js/*.js
-#     brass/      <- bronze's code generator
-#     broimage/   <- sibling, image kernels
-#     bromath/    <- sibling, header-only
+# Every job builds a plain clone, checked out under brokit/ with the build tree
+# beside it. curl, FastNoise2, broimage, bromath, and bronze (the JavaScript
+# runtime brokit_api binds and the compiler that builds src/api/js/*.js, with
+# brass, its code generator) come from the commits CMakeLists.txt pins
+# (cmake/bro_deps.cmake), fetched at configure. There are no submodules and no
+# sibling checkouts.
 #
-# bronze and brass are laid out by bronze's checkout-toolchain action and
-# compiled inside this build tree (bronze add_subdirectory()s brass), with
-# the job's own compiler and CRT — the api is bound across bronze's C++ embed
-# boundary, so a prebuilt bronze would be an unverifiable ABI hazard. brass
-# has native x86_64 and AArch64 code generators, so the JS tests run on every
-# row, macos-arm64 included.
-#
-# The test and coverage jobs initialise only the curl and FastNoise2
-# submodules: broimage and bromath come from the sibling checkouts on main,
-# which brokit prefers over its third_party/ copies. The `submodule` job builds
-# the other way, from a recursive clone with no siblings beside it, so the
-# fallback a fresh `git clone --recursive` relies on cannot rot.
+# bronze and brass compile inside this build tree with the job's own compiler
+# and CRT — the api is bound across bronze's C++ embed boundary, so a prebuilt
+# bronze would be an unverifiable ABI hazard. brass has native x86_64 and
+# AArch64 code generators, so the JS tests run on every row, macos-arm64
+# included.
 jobs:
   test:
     name: ${{ matrix.name }}
@@ -60,24 +51,6 @@ jobs:
         with:
           arch: x64
 
-      - name: Initialise the curl and FastNoise2 submodules (broimage and bromath are siblings)
-        shell: bash
-        run: |
-          git -C brokit submodule update --init --recursive \
-            third_party/curl third_party/FastNoise2
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/broimage
-          path: broimage
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/bromath
-          path: bromath
-
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
@@ -91,42 +64,6 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure --timeout 120
 
-  # ── Submodule fallback ────────────────────────────────────────────────────
-  #
-  # No sibling checkouts: broimage and bromath come from the flat third_party/
-  # submodules at the commits this repo pins, as they do for a fresh
-  # `git clone --recursive`, and with brokit's own defaults (no
-  # BROIMAGE_WITH_TENSOR on the command line). bronze and brass are the
-  # documented exception (no submodule; the api has to compile against the
-  # bronze of the program that loads it) and are laid out beside the repo as
-  # in the other jobs. The configure step checks each sibling really took the
-  # submodule path.
-  submodule:
-    name: Submodule fallback · ubuntu-24.04
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: brokit
-          submodules: recursive
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
-
-      - name: Configure
-        shell: bash
-        run: |
-          test ! -e broimage && test ! -e bromath
-          cmake -S brokit -B build -DCMAKE_BUILD_TYPE=Release | tee configure.log
-          for s in bromath broimage; do
-            grep -q "brokit: $s from .*third_party/$s (submodule)" configure.log
-          done
-
-      - name: Build
-        run: cmake --build build --parallel 4
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 120
-
   # ── Coverage ──────────────────────────────────────────────────────────────
   #
   # Debug + --coverage on Linux. --filter scopes the numbers to brokit's own
@@ -139,24 +76,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: brokit
-
-      - name: Initialise the curl and FastNoise2 submodules (broimage and bromath are siblings)
-        shell: bash
-        run: |
-          git -C brokit submodule update --init --recursive \
-            third_party/curl third_party/FastNoise2
-
-      - uses: wlejon/bronze/.github/actions/checkout-toolchain@main
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/broimage
-          path: broimage
-
-      - uses: actions/checkout@v7
-        with:
-          repository: wlejon/bromath
-          path: bromath
 
       - name: Install gcovr
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcovr
@@ -197,7 +116,7 @@ jobs:
           {
             echo '## Coverage — `src/`'
             echo
-            echo 'The bundled curl/FastNoise2/sqlite and siblings are filtered out.'
+            echo 'curl/FastNoise2/sqlite and the siblings are filtered out.'
             echo
             echo '```'
             if [ -f coverage-summary.txt ]; then
