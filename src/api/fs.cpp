@@ -592,11 +592,7 @@ static bronze::Value js_statSync(bronze::Value, std::span<const bronze::Value> a
 
     auto mtime = fs::last_write_time(p, ec);
     double mtimeMs = 0;
-    if (!ec) {
-        auto sctp = std::chrono::time_point_cast<std::chrono::milliseconds>(
-            mtime - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-        mtimeMs = static_cast<double>(sctp.time_since_epoch().count());
-    }
+    if (!ec) mtimeMs = fileTimeToUnixMs(mtime);
 
     bool isFile = fs::is_regular_file(status);
     bool isDir = fs::is_directory(status);

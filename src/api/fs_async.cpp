@@ -37,6 +37,23 @@ namespace fs = std::filesystem;
 
 namespace brokit::api {
 
+// Converted by the clock's own epoch, never by reading file_clock::now() and
+// system_clock::now() a moment apart: that difference wanders, and a time
+// near a millisecond boundary came back 1 ms off from one call to the next.
+// libc++'s file_clock counts from the Unix epoch already; MSVC's (1601)
+// converts with clock_cast, libstdc++'s (2174) with to_sys.
+double fileTimeToUnixMs(fs::file_time_type t)
+{
+#if defined(_LIBCPP_VERSION)
+    const auto sinceUnix = t.time_since_epoch();
+#elif defined(_MSVC_STL_VERSION)
+    const auto sinceUnix = std::chrono::clock_cast<std::chrono::system_clock>(t).time_since_epoch();
+#else
+    const auto sinceUnix = fs::file_time_type::clock::to_sys(t).time_since_epoch();
+#endif
+    return static_cast<double>(std::chrono::floor<std::chrono::milliseconds>(sinceUnix).count());
+}
+
 namespace {
 
 fs::path u8p(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
@@ -96,9 +113,7 @@ double mtimeMsOf(const fs::path& p)
     std::error_code ec;
     auto t = fs::last_write_time(p, ec);
     if (ec) return 0;
-    auto sys = std::chrono::time_point_cast<std::chrono::milliseconds>(
-        t - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-    return static_cast<double>(sys.time_since_epoch().count());
+    return fileTimeToUnixMs(t);
 }
 
 // stat (follow = true) or lstat, as the synchronous pair report them.
