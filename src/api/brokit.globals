@@ -115,3 +115,4 @@ __brokit_env_keys
 __brokit_os
 __brokit_fs_base_paths
 __brokit_path_mounts
+__brokit_path_native

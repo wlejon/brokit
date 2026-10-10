@@ -1,23 +1,9 @@
 (function() {
     var isWindows = (typeof process !== 'undefined' && process.platform === 'win32');
-
-    function normalizeArray(parts, allowAboveRoot) {
-        var res = [];
-        for (var i = 0; i < parts.length; i++) {
-            var p = parts[i];
-            if (!p || p === '.') continue;
-            if (p === '..') {
-                if (res.length && res[res.length - 1] !== '..') {
-                    res.pop();
-                } else if (allowAboveRoot) {
-                    res.push('..');
-                }
-            } else {
-                res.push(p);
-            }
-        }
-        return res;
-    }
+    // normalize / join / resolve / dirname / basename / extname are native
+    // (path.cpp): the string work is a few hundred nanoseconds there, several
+    // microseconds here.
+    var N = globalThis.__brokit_path_native;
 
     function splitPath(filename) {
         // Returns [root, dir, basename, ext]
@@ -51,69 +37,14 @@
     path.sep = isWindows ? '\\' : '/';
     path.delimiter = isWindows ? ';' : ':';
 
-    path.normalize = function(p) {
-        if (typeof p !== 'string') p = String(p);
-        if (p.length === 0) return '.';
-
-        var isAbsolute = false;
-        var root = '';
-
-        if (isWindows && p.length >= 2 && p[1] === ':') {
-            root = p.substring(0, 2);
-            p = p.substring(2);
-        }
-        if (p.charAt(0) === '/' || p.charAt(0) === '\\') {
-            isAbsolute = true;
-            root += path.sep;   // Windows spells the root '\' however it was written
-            p = p.substring(1);
-        }
-
-        var parts = p.split(/[/\\]/);
-        var normalized = normalizeArray(parts, !isAbsolute);
-        var result = root + normalized.join(path.sep);
-
-        if (!result) return isAbsolute ? path.sep : '.';
-        return result;
-    };
-
-    path.join = function() {
-        var paths = [];
-        for (var i = 0; i < arguments.length; i++) {
-            if (typeof arguments[i] !== 'string') continue;
-            if (arguments[i].length > 0) paths.push(arguments[i]);
-        }
-        if (paths.length === 0) return '.';
-        return path.normalize(paths.join(path.sep));
-    };
-
-    path.resolve = function() {
-        var resolved = '';
-        var resolvedAbsolute = false;
-
-        for (var i = arguments.length - 1; i >= 0 && !resolvedAbsolute; i--) {
-            var p = arguments[i];
-            if (typeof p !== 'string' || p.length === 0) continue;
-
-            resolved = p + path.sep + resolved;
-
-            // Check if absolute
-            if (isWindows) {
-                if (p.length >= 3 && p[1] === ':' && (p[2] === '/' || p[2] === '\\')) {
-                    resolvedAbsolute = true;
-                }
-            } else {
-                if (p.charAt(0) === '/') {
-                    resolvedAbsolute = true;
-                }
-            }
-        }
-
-        if (!resolvedAbsolute && typeof process !== 'undefined' && typeof process.cwd === 'function') {
-            resolved = process.cwd() + path.sep + resolved;
-        }
-
-        return path.normalize(resolved);
-    };
+    // Windows spells the root '\' however it was written; both separators
+    // are read on every platform, the platform's own is written.
+    path.normalize = N.normalize;
+    // The string arguments, empty ones left out, normalized ('.' for none).
+    path.join = N.join;
+    // Right to left until a part is absolute, under the working directory
+    // when none is.
+    path.resolve = N.resolve;
 
     path.isAbsolute = function(p) {
         if (typeof p !== 'string') return false;
@@ -143,56 +74,14 @@
         return out.concat(toParts.slice(common)).join(path.sep);
     };
 
-    path.dirname = function(p) {
-        if (typeof p !== 'string' || p.length === 0) return '.';
-
-        var root = '';
-        var idx = 0;
-        if (isWindows && p.length >= 2 && p[1] === ':') {
-            root = p.substring(0, 2);
-            idx = 2;
-        }
-
-        var lastSep = -1;
-        for (var i = p.length - 1; i >= idx; i--) {
-            if (p[i] === '/' || p[i] === '\\') {
-                if (i !== p.length - 1) {
-                    lastSep = i;
-                    break;
-                }
-            }
-        }
-
-        if (lastSep === -1) {
-            if (root) return root;
-            return '.';
-        }
-        if (lastSep === idx) return root + p[idx];
-        return p.substring(0, lastSep);
-    };
-
-    path.basename = function(p, ext) {
-        if (typeof p !== 'string') return '';
-        // Strip trailing separators
-        while (p.length > 0 && (p[p.length - 1] === '/' || p[p.length - 1] === '\\')) {
-            p = p.substring(0, p.length - 1);
-        }
-        if (isWindows && /^[A-Za-z]:$/.test(p)) return '';   // a drive root has no name, as in Node
-        var lastSep = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
-        var base = p.substring(lastSep + 1);
-        if (ext && base.length >= ext.length && base.substring(base.length - ext.length) === ext) {
-            base = base.substring(0, base.length - ext.length);
-        }
-        return base;
-    };
-
-    path.extname = function(p) {
-        if (typeof p !== 'string') return '';
-        var base = path.basename(p);
-        var idx = base.lastIndexOf('.');
-        if (idx <= 0) return '';
-        return base.substring(idx);
-    };
+    // The part before the last separator (a trailing one aside); a drive
+    // root keeps its drive.
+    path.dirname = N.dirname;
+    // The last part, trailing separators aside, less `ext` when it ends so;
+    // a drive root has no name, as in Node.
+    path.basename = N.basename;
+    // From the last '.' of the base name; '' for none or a dotfile.
+    path.extname = N.extname;
 
     path.parse = function(p) {
         var parts = splitPath(p || '');

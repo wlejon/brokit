@@ -48,3 +48,62 @@ assert(typeof host === 'string', 'hostname returns string');
 // EOL
 assert(typeof os.EOL === 'string', 'EOL is string');
 assert(os.EOL === '\n' || os.EOL === '\r\n', 'EOL is valid');
+
+// System information, Node's shapes
+var cpus = os.cpus();
+assert(Array.isArray(cpus) && cpus.length > 0, 'cpus() lists the processors: ' + cpus.length);
+assertEqual(cpus.length, os.availableParallelism(), 'one entry per logical processor');
+var c0 = cpus[0];
+assert(typeof c0.model === 'string', 'cpu model is a string: ' + c0.model);
+assert(typeof c0.speed === 'number' && c0.speed >= 0, 'cpu speed in MHz: ' + c0.speed);
+['user', 'nice', 'sys', 'idle', 'irq'].forEach(function(k) {
+    assert(typeof c0.times[k] === 'number' && c0.times[k] >= 0, 'cpu times.' + k + ': ' + c0.times[k]);
+});
+assert(c0.times.user + c0.times.sys + c0.times.idle > 0, 'the processor has run');
+
+var total = os.totalmem(), free = os.freemem();
+assert(total > 64 * 1024 * 1024, 'totalmem in bytes: ' + total);
+assert(free > 0 && free <= total, 'freemem in bytes, under totalmem: ' + free);
+
+var up = os.uptime();
+assert(typeof up === 'number' && up > 0, 'uptime in seconds: ' + up);
+
+var load = os.loadavg();
+assert(Array.isArray(load) && load.length === 3, 'loadavg is three numbers');
+load.forEach(function(v) { assert(typeof v === 'number' && v >= 0, 'load average: ' + v); });
+if (plat === 'win32') assertEqual(load.join(','), '0,0,0', 'loadavg is zeros on Windows, as Node');
+
+var ifaces = os.networkInterfaces();
+assert(ifaces && typeof ifaces === 'object', 'networkInterfaces is an object');
+var sawInternal = false, entries = 0;
+Object.keys(ifaces).forEach(function(name) {
+    ifaces[name].forEach(function(e) {
+        entries++;
+        assert(e.family === 'IPv4' || e.family === 'IPv6', name + ' family: ' + e.family);
+        assert(typeof e.address === 'string' && e.address.length > 0, name + ' address');
+        assert(typeof e.netmask === 'string' && e.netmask.length > 0, name + ' netmask');
+        assert(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(e.mac), name + ' mac: ' + e.mac);
+        assert(e.cidr === e.address + '/' + e.cidr.split('/')[1], name + ' cidr: ' + e.cidr);
+        assert(typeof e.internal === 'boolean', name + ' internal');
+        if (e.family === 'IPv6') assert(typeof e.scopeid === 'number', name + ' scopeid');
+        if (e.internal && e.family === 'IPv4') {
+            sawInternal = true;
+            assertEqual(e.address, '127.0.0.1', 'the loopback address');
+            assertEqual(e.netmask, '255.0.0.0', 'the loopback netmask');
+        }
+    });
+});
+assert(entries > 0, 'at least one interface is up');
+assert(sawInternal, 'the IPv4 loopback is listed and internal');
+
+var rel = os.release();
+assert(/^\d+\.\d+/.test(rel), 'release is the kernel version: ' + rel);
+var ver = os.version();
+assert(typeof ver === 'string' && ver.length > 0, 'version: ' + ver);
+if (plat === 'win32') assert(/^Windows/.test(ver), 'version names the Windows product: ' + ver);
+var mach = os.machine();
+assert(['x86_64', 'arm64', 'aarch64', 'i686', 'arm', 'armv7l'].indexOf(mach) !== -1, 'machine: ' + mach);
+assertEqual(os.endianness(), 'LE', 'endianness');
+assertEqual(os.constants.signals.SIGTERM, 15, 'os.constants.signals.SIGTERM');
+assertEqual(os.constants.signals.SIGKILL, 9, 'os.constants.signals.SIGKILL');
+assert(typeof os.devNull === 'string' && os.devNull.length > 0, 'devNull');

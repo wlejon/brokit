@@ -2,6 +2,7 @@
 #include "api/object_builder.h"
 #include "api/arg_reader.h"
 #include "api/host_proxy.h"
+#include "api/signals.h"
 #include "runtime/runtime.h"
 #include "embed/embed.h"
 
@@ -15,6 +16,8 @@ extern "C" void bronze_process_main();
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <cerrno>
+#include <csignal>
 #include <unistd.h>
 extern "C" char** environ;
 #ifdef __APPLE__
@@ -55,6 +58,89 @@ Value js_process_cwd(Value, std::span<const Value>) {
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) return ev::throwError("process.cwd: failed");
     return ev::fromUtf8(buf);
+#endif
+}
+
+// An Error as Node's process.kill throws it: { code, errno, syscall: 'kill' }.
+[[noreturn]] Value throwKillError(const char* code, int errnoValue, const char* what) {
+    std::string message = std::string(what) + " " + code;
+    ev::Persistent err;
+    auto ctor = ev::globalValue("Error");
+    if (ctor.found && ev::isFunction(ctor.value)) {
+        ev::Persistent c(ctor.value);
+        ev::Persistent text(ev::fromUtf8(message));
+        const Value arg = text.get();
+        auto r = ev::construct(c.get(), std::span<const Value>(&arg, 1));
+        if (!r.thrown) err.set(r.value);
+    }
+    if (!ev::isObject(err.get())) {
+        err.set(ev::createObject());
+        ObjectBuilder(err.get()).set("message", ev::fromUtf8(message));
+    }
+    ObjectBuilder e(err.get());
+    e.set("code", ev::fromUtf8(code));
+    e.set("errno", ev::fromDouble(double(-errnoValue)));
+    e.set("syscall", ev::fromUtf8("kill"));
+    ev::throwValue(e.get());
+}
+
+// process.kill(pid, signal = 'SIGTERM') -> true, as Node: the signal by name
+// or number, 0 asking only whether the process exists (ESRCH when it does
+// not, EPERM when it is not ours to signal). On Windows SIGINT, SIGQUIT,
+// SIGTERM and SIGKILL end the process (TerminateProcess, exit code 1, as
+// libuv); other signals are ENOSYS.
+Value js_process_kill(Value, std::span<const Value> a) {
+    if (!hasArg(a, 0) || !ev::isNumber(a[0]))
+        return ev::throwTypeError("The \"pid\" argument must be of type number");
+    const double pidD = ev::toDouble(a[0]);
+    if (!(pidD == pidD) || pidD != double(int64_t(pidD)))
+        return ev::throwTypeError("The \"pid\" argument must be an integer");
+    int sig = signalNumber("SIGTERM");
+    if (hasArg(a, 1) && !ev::isUndefined(a[1]) && !ev::isNull(a[1])) {
+        if (ev::isNumber(a[1])) {
+            sig = int(ev::toDouble(a[1]));
+        } else if (ev::isString(a[1])) {
+            std::string name = ev::toUtf8(a[1]);
+            sig = signalNumber(name.c_str());
+            if (sig < 0) return ev::throwTypeError("Unknown signal: " + name);
+        } else {
+            return ev::throwTypeError("The \"signal\" argument must be of type string or number");
+        }
+    }
+#ifdef _WIN32
+    constexpr int ESRCH_ = 3, EPERM_ = 1, ENOSYS_ = 40, EINVAL_ = 22;
+    const DWORD pid = DWORD(int64_t(pidD));
+    const bool ends = sig == 2 || sig == 3 || sig == 9 || sig == 15;
+    if (sig != 0 && !ends) throwKillError("ENOSYS", ENOSYS_, "kill");
+    if (pidD < 0) throwKillError("EINVAL", EINVAL_, "kill");
+    const DWORD access = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | (ends ? PROCESS_TERMINATE : 0);
+    HANDLE h = OpenProcess(access, FALSE, pid);
+    if (!h) {
+        DWORD e = GetLastError();
+        if (e == ERROR_INVALID_PARAMETER) throwKillError("ESRCH", ESRCH_, "kill");
+        throwKillError("EPERM", EPERM_, "kill");
+    }
+    // A process that has exited but whose handle someone still holds is
+    // still openable: it no longer exists for kill.
+    const bool exited = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+    if (exited) {
+        CloseHandle(h);
+        throwKillError("ESRCH", ESRCH_, "kill");
+    }
+    if (ends && !TerminateProcess(h, 1)) {
+        const bool goneMeanwhile = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+        CloseHandle(h);
+        throwKillError(goneMeanwhile ? "ESRCH" : "EPERM", goneMeanwhile ? ESRCH_ : EPERM_, "kill");
+    }
+    CloseHandle(h);
+    return ev::fromBool(true);
+#else
+    if (::kill(pid_t(int64_t(pidD)), sig) != 0) {
+        const int e = errno;
+        const char* code = e == ESRCH ? "ESRCH" : e == EPERM ? "EPERM" : e == EINVAL ? "EINVAL" : "EIO";
+        throwKillError(code, e, "kill");
+    }
+    return ev::fromBool(true);
 #endif
 }
 
@@ -126,6 +212,7 @@ void installProcess() {
     process.set("env", makeEnvProxy());
     process.def("cwd", 0, js_process_cwd);
     process.def("exit", 1, js_process_exit);
+    process.def("kill", 2, js_process_kill);
 
 #ifdef _WIN32
     process.set("platform", ev::fromUtf8("win32"));

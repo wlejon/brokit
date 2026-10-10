@@ -67,6 +67,57 @@ if (path.sep === '/') {
     assertEqual(path.basename('C:\\'), '', 'a drive root has no basename');
 }
 
+// The native versions keep the script versions' rules
+assertEqual(path.join(), '.', 'join of nothing');
+assertEqual(path.join('', ''), '.', 'join of empty strings');
+assertEqual(path.join('a', 5, 'b'), 'a' + path.sep + 'b', 'join leaves out a non-string');
+assertEqual(path.normalize(''), '.', 'normalize of empty');
+assertEqual(path.normalize('./'), '.', 'normalize of ./');
+assertEqual(path.normalize('a/../..'), '..', 'normalize keeps .. above a relative root');
+assertEqual(path.normalize('../a/../../b'), '..' + path.sep + '..' + path.sep + 'b', 'normalize leading ..s');
+assertEqual(path.dirname(''), '.', 'dirname of empty');
+assertEqual(path.dirname('a/'), '.', 'dirname of a name with a trailing separator');
+assertEqual(path.basename('a/b.txt', 'b.txt'), '', 'basename less the whole name');
+assertEqual(path.basename(42), '', 'basename of a non-string');
+assertEqual(path.extname('a/b.c/d'), '', 'extname looks at the base name only');
+assertEqual(path.extname('x.tar.gz/'), '.gz', 'extname ignores a trailing separator');
+if (path.sep === '/') {
+    assertEqual(path.normalize('/../a'), '/a', 'normalize does not climb above /');
+    assertEqual(path.normalize('//a//b/'), '/a/b', 'normalize collapses separators');
+    assertEqual(path.join('/a/', '/b/'), '/a/b', 'join drops doubled separators');
+    assertEqual(path.dirname('/'), '/', 'dirname of /');
+    assertEqual(path.resolve('/a', 'b', '../c'), '/a/c', 'resolve');
+    assertEqual(path.resolve('/a', '/b', 'c'), '/b/c', 'resolve restarts at an absolute part');
+} else {
+    assertEqual(path.normalize('C:\\..\\a'), 'C:\\a', 'normalize does not climb above a drive root');
+    assertEqual(path.normalize('C:/a//b/'), 'C:\\a\\b', 'normalize collapses separators');
+    assertEqual(path.normalize('C:a\\..\\..\\b'), 'C:..\\b', 'a drive-relative path keeps its ..');
+    assertEqual(path.join('C:\\a\\', '\\b\\'), 'C:\\a\\b', 'join drops doubled separators');
+    assertEqual(path.dirname('C:\\'), 'C:\\', 'dirname of a drive root');
+    assertEqual(path.dirname('C:\\a'), 'C:\\', 'dirname of a drive child');
+    assertEqual(path.dirname('C:a'), 'C:', 'dirname of a drive-relative name');
+    assertEqual(path.resolve('C:\\a', 'b', '..\\c'), 'C:\\a\\c', 'resolve');
+    assertEqual(path.resolve('C:\\a', 'D:\\b', 'c'), 'D:\\b\\c', 'resolve restarts at an absolute part');
+}
+assertEqual(path.resolve('x'), path.join(process.cwd(), 'x'), 'resolve of a relative path is under the cwd');
+var nonAscii = path.join('caf\u00e9', '\u65e5\u672c', 'x.txt');
+assertEqual(nonAscii, 'caf\u00e9' + path.sep + '\u65e5\u672c' + path.sep + 'x.txt', 'join keeps non-ASCII names');
+
+// Speed: joining is native, well under a microsecond (it was ~7 us in script).
+(function() {
+    var dir = path.sep === '/' ? '/home/someone/Pictures/Holiday 2024' : 'C:\\Users\\someone\\Pictures\\Holiday 2024';
+    var names = [];
+    for (var i = 0; i < 400; i++) names.push('IMG_' + (1000 + i) + '.jpg');
+    for (var w = 0; w < 5; w++) for (var j = 0; j < names.length; j++) path.join(dir, names[j]);
+    var best = Infinity;
+    for (var round = 0; round < 5; round++) {
+        var t0 = Date.now();
+        for (var r = 0; r < 25; r++) for (var k = 0; k < names.length; k++) path.join(dir, names[k]);
+        best = Math.min(best, (Date.now() - t0) * 1000 / (25 * names.length));
+    }
+    assert(best < 1.5, 'path.join costs ' + best.toFixed(2) + ' us a call (limit 1.5)');
+})();
+
 // parse
 var parsed = path.parse('/home/user/file.txt');
 assertEqual(parsed.base, 'file.txt', 'parse base');
