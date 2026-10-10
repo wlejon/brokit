@@ -14,7 +14,7 @@
         _timers[id] = {
             fn: fn, args: args,
             fireAt: globalThis.__brokit_now() + (delay || 0),
-            interval: 0
+            interval: -1
         };
         return id;
     };
@@ -23,7 +23,7 @@
         if (typeof fn !== 'function') return 0;
         var id = _nextId++;
         var args = Array.prototype.slice.call(arguments, 2);
-        var ms = delay || 0;
+        var ms = delay > 0 ? +delay : 0;
         _timers[id] = {
             fn: fn, args: args,
             fireAt: globalThis.__brokit_now() + ms,
@@ -35,33 +35,51 @@
     globalThis.clearTimeout = function(id) { delete _timers[id]; };
     globalThis.clearInterval = function(id) { delete _timers[id]; };
 
-    // Tick: fire all timers whose fireAt <= now.
-    // Returns ms until the next timer fires, or -1 if none.
-    globalThis.__brokit_tick_timers = function(now) {
+    // Ms until the next timer is due (0 when one is due now), or -1 if none.
+    function _nextDue(now) {
+        var next = -1;
+        for (var id in _timers) {
+            var remaining = _timers[id].fireAt - now;
+            if (remaining < 0) remaining = 0;
+            if (next < 0 || remaining < next) next = remaining;
+        }
+        return next;
+    }
+
+    // Tick: fire the timers whose fireAt <= now, earliest first (ties in the
+    // order they were set). `limit`, when given, fires at most that many, so
+    // a host can run its microtask checkpoint between timers as HTML's event
+    // loop does (each timer is its own task); call again while it returns 0.
+    // Returns ms until the next timer fires (0: one is due now), or -1 if none.
+    globalThis.__brokit_tick_timers = function(now, limit) {
         var fired = [];
         for (var id in _timers) {
             var t = _timers[id];
-            if (t.fireAt <= now) fired.push(id);
+            if (t.fireAt <= now) fired.push(+id);
         }
+        fired.sort(function(a, b) {
+            return (_timers[a].fireAt - _timers[b].fireAt) || (a - b);
+        });
+        if (typeof limit === 'number' && limit > 0 && fired.length > limit) fired.length = limit;
         for (var i = 0; i < fired.length; i++) {
             var id = fired[i];
             var t = _timers[id];
             if (!t) continue;
-            if (t.interval > 0) {
+            if (t.interval >= 0) {  // setInterval, a 0 ms one included
                 t.fireAt = now + t.interval;
             } else {
                 delete _timers[id];
             }
             try { t.fn.apply(null, t.args); } catch(e) { console.error('Timer error:', e); }
         }
-        // Find next fire time
-        var next = -1;
-        for (var id in _timers) {
-            var t = _timers[id];
-            var remaining = t.fireAt - now;
-            if (next < 0 || remaining < next) next = remaining;
-        }
-        return next;
+        return _nextDue(now);
+    };
+
+    // Ms until the next timer is due, without firing anything: what a host
+    // reads right before it sleeps, after the turn's microtasks (which may
+    // have set timers) have run. -1 if none.
+    globalThis.__brokit_next_timer = function(now) {
+        return _nextDue(now);
     };
 
     // queueMicrotask — via Promise
