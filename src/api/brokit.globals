@@ -100,6 +100,8 @@ __brokit_fetch_has_pending
 __brokit_fetch_tick
 __brokit_ws_has_pending
 __brokit_ws_tick
+__brokit_fs_async_has_pending
+__brokit_fs_async_tick
 __brokit_fs_watch_has_pending
 __brokit_fs_watch_tick
 __brokit_net_has_pending

@@ -140,65 +140,66 @@
         return globalThis.__brokit_fs_realpathSync(path);
     }
 
-    // ── Async (Promise) wrappers ──────────────────────────────────────────────
-    // Node.js fs callback-style functions: fs.readFile(path, enc, callback)
-    // We support both callback and promise style.
+    // ── fs.promises namespace ─────────────────────────────────────────────────
+    // Asynchronous for real: the I/O runs on brokit's fs threads and the
+    // promise settles on this thread at its next frame (fs_async.cpp), so
+    // awaiting a slow disk never stalls the page.
 
-    function wrapAsync(syncFn) {
-        return function() {
-            var args = Array.prototype.slice.call(arguments);
-            var callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
-            try {
-                var result = syncFn.apply(null, args);
-                if (callback) {
-                    callback(null, result);
-                } else {
-                    return Promise.resolve(result);
-                }
-            } catch (err) {
-                if (callback) {
-                    callback(err);
-                } else {
-                    return Promise.reject(err);
-                }
-            }
-        };
+    function run(op, a, b, c) {
+        return globalThis.__brokit_fs_async(op, a, b, c);
     }
 
-    // ── fs.promises namespace ─────────────────────────────────────────────────
+    function encodingOf(options) {
+        if (typeof options === 'string') return options;
+        if (options && typeof options.encoding === 'string') return options.encoding;
+        return '';
+    }
 
-    function promisify(syncFn) {
-        return function() {
-            var args = Array.prototype.slice.call(arguments);
-            try {
-                return Promise.resolve(syncFn.apply(null, args));
-            } catch (err) {
-                return Promise.reject(err);
-            }
-        };
+    function bytesOf(data) {
+        return data && data._u8 ? data._u8 : data;
     }
 
     var promises = {
-        readFile:    promisify(readFileSync),
-        writeFile:   promisify(writeFileSync),
-        appendFile:  promisify(appendFileSync),
-        stat:        promisify(statSync),
-        lstat:       promisify(lstatSync),
-        readdir:     promisify(readdirSync),
-        mkdir:       promisify(mkdirSync),
-        rmdir:       promisify(rmdirSync),
-        rm:          promisify(rmSync),
-        unlink:      promisify(unlinkSync),
-        rename:      promisify(renameSync),
-        copyFile:    promisify(copyFileSync),
-        chmod:       promisify(chmodSync),
-        realpath:    promisify(realpathSync),
-        access:      function(path) {
-            return existsSync(path)
-                ? Promise.resolve()
-                : Promise.reject(Object.assign(new Error("ENOENT: no such file or directory, access '" + path + "'"), { code: 'ENOENT' }));
+        readFile:   function(path, options) { return run('readFile', path, encodingOf(options)); },
+        writeFile:  function(path, data) { return run('writeFile', path, bytesOf(data)); },
+        appendFile: function(path, data) { return run('appendFile', path, bytesOf(data)); },
+        stat:       function(path) { return run('stat', path).then(wrapStats); },
+        lstat:      function(path) { return run('lstat', path).then(wrapStats); },
+        readdir:    function(path, options) {
+            var types = !!(options && options.withFileTypes);
+            return run('readdir', path, types).then(function(raw) {
+                return types ? raw.map(wrapDirent) : raw;
+            });
+        },
+        mkdir:      function(path, options) { return run('mkdir', path, !!(options && options.recursive)); },
+        rmdir:      function(path) { return run('rmdir', path); },
+        rm:         function(path, options) {
+            return run('rm', path, !!(options && options.recursive), !!(options && options.force));
+        },
+        unlink:     function(path) { return run('unlink', path); },
+        rename:     function(from, to) { return run('rename', from, to); },
+        copyFile:   function(from, to) { return run('copyFile', from, to); },
+        realpath:   function(path) { return run('realpath', path); },
+        access:     function(path) { return run('access', path); },
+        // chmod is a metadata write with nothing to wait on.
+        chmod:      function(path, mode) {
+            try { return Promise.resolve(chmodSync(path, mode)); } catch (err) { return Promise.reject(err); }
         }
     };
+
+    // ── Callback functions: fs.readFile(path, enc, callback) ──────────────────
+    // The callback runs later, never inside the call, as in Node; without a
+    // callback the promise is returned.
+
+    function wrapAsync(promiseFn) {
+        return function() {
+            var args = Array.prototype.slice.call(arguments);
+            var callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+            var p = promiseFn.apply(null, args);
+            if (!callback) return p;
+            p.then(function(v) { callback(null, v); }, function(err) { callback(err); });
+        };
+    }
 
     // ── Main fs object ────────────────────────────────────────────────────────
 
@@ -228,20 +229,20 @@
         closeSync:       closeSync,
 
         // Async (callback or Promise)
-        readFile:    wrapAsync(readFileSync),
-        writeFile:   wrapAsync(writeFileSync),
-        appendFile:  wrapAsync(appendFileSync),
-        stat:        wrapAsync(statSync),
-        lstat:       wrapAsync(lstatSync),
-        readdir:     wrapAsync(readdirSync),
-        mkdir:       wrapAsync(mkdirSync),
-        rmdir:       wrapAsync(rmdirSync),
-        rm:          wrapAsync(rmSync),
-        unlink:      wrapAsync(unlinkSync),
-        rename:      wrapAsync(renameSync),
-        copyFile:    wrapAsync(copyFileSync),
-        chmod:       wrapAsync(chmodSync),
-        realpath:    wrapAsync(realpathSync),
+        readFile:    wrapAsync(promises.readFile),
+        writeFile:   wrapAsync(promises.writeFile),
+        appendFile:  wrapAsync(promises.appendFile),
+        stat:        wrapAsync(promises.stat),
+        lstat:       wrapAsync(promises.lstat),
+        readdir:     wrapAsync(promises.readdir),
+        mkdir:       wrapAsync(promises.mkdir),
+        rmdir:       wrapAsync(promises.rmdir),
+        rm:          wrapAsync(promises.rm),
+        unlink:      wrapAsync(promises.unlink),
+        rename:      wrapAsync(promises.rename),
+        copyFile:    wrapAsync(promises.copyFile),
+        chmod:       wrapAsync(promises.chmod),
+        realpath:    wrapAsync(promises.realpath),
 
         // Convenience
         existsSync:  existsSync,

@@ -93,6 +93,7 @@ set(BROKIT_API_SOURCES
     fetch.cpp
     fetch_response.cpp
     fs.cpp
+    fs_async.cpp
     fs_watch.cpp
     fs_watch_linux.cpp
     fs_watch_macos.cpp

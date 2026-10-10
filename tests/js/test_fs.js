@@ -165,14 +165,14 @@ assert(!fs.existsSync(emptyDir), 'rmdirSync removes empty dir');
 var cbFile = testDir + '/cb_test.txt';
 fs.writeFileSync(cbFile, 'callback');
 
+// The callback runs later, as in Node: never inside the call.
 var cbResult = null;
-var cbErr = null;
+var cbErr = 'not called';
 fs.readFile(cbFile, 'utf8', function(err, data) {
     cbErr = err;
     cbResult = data;
 });
-assertEqual(cbErr, null, 'readFile callback no error');
-assertEqual(cbResult, 'callback', 'readFile callback result');
+assertEqual(cbErr, 'not called', 'readFile callback does not run inside the call');
 
 // ── Async (Promise style) ─────────────────────────────────────────────────
 var promiseFile = testDir + '/promise_test.txt';
@@ -218,6 +218,17 @@ assertEqual(fs.constants.W_OK, 2, 'fs.constants.W_OK');
 fs.writeFileSync(testFile, 'overwritten');
 assertEqual(fs.readFileSync(testFile, 'utf8'), 'overwritten', 'writeFileSync overwrites');
 
-// ── Cleanup ───────────────────────────────────────────────────────────────
-fs.rmSync(testDir, { recursive: true, force: true });
-assert(!fs.existsSync(testDir), 'cleanup: test directory removed');
+// ── The asynchronous results, once they have all settled ─────────────────
+globalThis.__test_onDone = function() {
+    assertEqual(cbErr, null, 'readFile callback no error');
+    assertEqual(cbResult, 'callback', 'readFile callback result');
+    assertEqual(promiseResult, 'promise data', 'fs.readFile without a callback answers a promise');
+    assertEqual(pResult, 'promises api', 'fs.promises.readFile utf8');
+    assert(pStatResult && pStatResult.isFile() && pStatResult.size === 12, 'fs.promises.stat');
+    assert(pReaddirResult && pReaddirResult.indexOf('promises_test.txt') >= 0, 'fs.promises.readdir');
+    assert(pError && pError.code === 'ENOENT' && pError instanceof Error, 'fs.promises.readFile rejects ENOENT with an Error');
+
+    // ── Cleanup ───────────────────────────────────────────────────────────
+    fs.rmSync(testDir, { recursive: true, force: true });
+    assert(!fs.existsSync(testDir), 'cleanup: test directory removed');
+};

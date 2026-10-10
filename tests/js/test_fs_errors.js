@@ -139,8 +139,11 @@ assert(threw, 'readFileSync error fully populated');
 // ── Async error paths via callback ────────────────────────────────────────
 var cbErr = null;
 fs.readFile(dir + '/missing2.txt', 'utf8', function(err, data) { cbErr = err; });
-assert(cbErr !== null, 'readFile async surfaces error');
-assertEqual(cbErr.code, 'ENOENT', 'async error code propagated');
+globalThis.__test_onDone = function() {
+    assert(cbErr !== null, 'readFile async surfaces error');
+    assertEqual(cbErr && cbErr.code, 'ENOENT', 'async error code propagated');
+    assertEqual(cbErr && cbErr.syscall, 'open', 'async error syscall');
+};
 
 // ── appendFileSync to a missing parent throws ─────────────────────────────
 threw = false;

@@ -64,7 +64,7 @@
         }
         if (p.charAt(0) === '/' || p.charAt(0) === '\\') {
             isAbsolute = true;
-            root += p.charAt(0);
+            root += path.sep;   // Windows spells the root '\' however it was written
             p = p.substring(1);
         }
 
@@ -177,6 +177,7 @@
         while (p.length > 0 && (p[p.length - 1] === '/' || p[p.length - 1] === '\\')) {
             p = p.substring(0, p.length - 1);
         }
+        if (isWindows && /^[A-Za-z]:$/.test(p)) return '';   // a drive root has no name, as in Node
         var lastSep = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
         var base = p.substring(lastSep + 1);
         if (ext && base.length >= ext.length && base.substring(base.length - ext.length) === ext) {

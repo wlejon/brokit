@@ -134,6 +134,8 @@ static TestResult runTestFile(const std::string& path) {
     ev::Persistent pNetHasPending = rootedFn("__brokit_net_has_pending");
     ev::Persistent pNetTick = rootedFn("__brokit_net_tick");
     ev::Persistent pCpHasPending = rootedFn("__brokit_cp_has_pending");
+    ev::Persistent pFsHasPending = rootedFn("__brokit_fs_async_has_pending");
+    ev::Persistent pFsTick = rootedFn("__brokit_fs_async_tick");
     ev::Persistent pTimersTick = rootedFn("__brokit_tick_timers");
 
     auto isFn = [](const ev::Persistent& p) { return ev::isFunction(p.get()); };
@@ -142,9 +144,10 @@ static TestResult runTestFile(const std::string& path) {
     bool haveFw = isFn(pFwHasPending) && isFn(pFwTick);
     bool haveNet = isFn(pNetHasPending) && isFn(pNetTick);
     bool haveCp = isFn(pCpHasPending);
+    bool haveFs = isFn(pFsHasPending) && isFn(pFsTick);
     bool haveTimers = isFn(pTimersTick);
 
-    if (haveFetch || haveWs || haveFw || haveNet || haveCp) {
+    if (haveFetch || haveWs || haveFw || haveNet || haveCp || haveFs) {
         for (int iters = 0; iters < 3000; iters++) { // max ~30s at 10ms sleep
             bool anyPending = false;
 
@@ -177,6 +180,12 @@ static TestResult runTestFile(const std::string& path) {
                 if (!p.thrown && ev::toBool(p.value)) anyPending = true;
             }
 
+            if (haveFs) {
+                auto p = ev::call(pFsHasPending.get(), ev::undefined(), {});
+                if (!p.thrown && ev::toBool(p.value)) anyPending = true;
+                ev::call(pFsTick.get(), ev::undefined(), {});
+            }
+
             if (haveTimers) {
                 double nowMs = static_cast<double>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -193,6 +202,24 @@ static TestResult runTestFile(const std::string& path) {
 #else
             usleep(10000);
 #endif
+        }
+    }
+
+    // A test with asynchronous parts checks what they left here, once every
+    // pump above has gone idle: an assertion that sits only in a callback
+    // that never ran would otherwise never count as a failure.
+    {
+        auto doneFn = ev::globalValue("__test_onDone");
+        if (doneFn.found && ev::isFunction(doneFn.value)) {
+            ev::Persistent fn{doneFn.value};
+            auto r = ev::call(fn.get(), ev::undefined(), {});
+            rt.executePendingJobs();
+            if (r.thrown) {
+                // Counted by the results below, which are the JS side's.
+                auto fail = rootedFn("__test_assert");
+                const ev::Value args[2] = {ev::fromBool(false), ev::fromUtf8("__test_onDone threw")};
+                if (ev::isFunction(fail.get())) ev::call(fail.get(), ev::undefined(), std::span<const ev::Value>(args, 2));
+            }
         }
     }
 

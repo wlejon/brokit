@@ -62,6 +62,9 @@ if (path.sep === '/') {
     assertEqual(path.relative('C:\\a', 'c:\\A\\b'), 'b', 'relative win is case-insensitive');
     assertEqual(path.relative('C:\\a', 'D:\\b'), 'D:\\b', 'relative across drives is the target');
     assertEqual(path.relative('C:\\a\\b', 'C:\\a\\b'), '', 'relative same');
+    assertEqual(path.resolve('D:/projects/bro'), 'D:\\projects\\bro', 'resolve spells every separator \\');
+    assertEqual(path.normalize('C:/'), 'C:\\', 'normalize of a drive root');
+    assertEqual(path.basename('C:\\'), '', 'a drive root has no basename');
 }
 
 // parse

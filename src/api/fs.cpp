@@ -1,5 +1,6 @@
 #include "api/api.h"
 #include "api/arg_reader.h"
+#include "api/fs_async.h"
 #include "api/object_builder.h"
 
 #include <cstring>
@@ -231,6 +232,11 @@ OpenFile* lookupFd(int fd)
 std::string resolveAssetPath(const std::string& path)
 {
     return resolveFsPath(path.c_str(), false);
+}
+
+std::string resolveFsPathOnThread(const std::string& path, bool forCreate)
+{
+    return resolveFsPath(path.c_str(), forCreate);
 }
 
 void addFsBasePath(const std::string& path)
@@ -894,6 +900,7 @@ void installFS()
     ev::setGlobalFunction("__brokit_fs_writeSync", 5, js_writeSync);
     ev::setGlobalFunction("__brokit_fs_fstatSync", 1, js_fstatSync);
     ev::setGlobalFunction("__brokit_fs_closeSync", 1, js_closeSync);
+    installFSAsync();
 
     bronze::embed::runEntry(bronze_fs_main);
 }
