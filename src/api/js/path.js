@@ -124,6 +124,25 @@
         return p.charAt(0) === '/';
     };
 
+    // Node's path.relative: the path from `from` to `to`, both resolved
+    // first; '' when they are the same. Windows compares case-insensitively
+    // and answers the absolute `to` when the drives differ.
+    path.relative = function(from, to) {
+        from = path.resolve(from);
+        to = path.resolve(to);
+        if (from === to) return '';
+        var fromParts = from.split(/[/\\]/).filter(function(s) { return s.length > 0; });
+        var toParts = to.split(/[/\\]/).filter(function(s) { return s.length > 0; });
+        var same = function(a, b) { return isWindows ? a.toLowerCase() === b.toLowerCase() : a === b; };
+        if (isWindows && fromParts.length && toParts.length && !same(fromParts[0], toParts[0])) return to;
+        var n = Math.min(fromParts.length, toParts.length);
+        var common = 0;
+        while (common < n && same(fromParts[common], toParts[common])) common++;
+        var out = [];
+        for (var i = common; i < fromParts.length; i++) out.push('..');
+        return out.concat(toParts.slice(common)).join(path.sep);
+    };
+
     path.dirname = function(p) {
         if (typeof p !== 'string' || p.length === 0) return '.';
 

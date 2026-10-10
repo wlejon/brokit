@@ -50,6 +50,20 @@ if (path.sep === '/') {
     assertEqual(path.normalize('C:\\foo\\bar\\..\\baz'), 'C:\\foo\\baz', 'normalize win ..');
 }
 
+// relative
+if (path.sep === '/') {
+    assertEqual(path.relative('/data/orandea/test/aaa', '/data/orandea/impl/bbb'), '../../impl/bbb', 'relative up and down');
+    assertEqual(path.relative('/a/b', '/a/b/c/d'), 'c/d', 'relative down');
+    assertEqual(path.relative('/a/b/c', '/a'), '../..', 'relative up');
+    assertEqual(path.relative('/a/b', '/a/b'), '', 'relative same');
+    assertEqual(path.relative('/a/b/', '/a/b'), '', 'relative ignores a trailing slash');
+} else {
+    assertEqual(path.relative('C:\\orandea\\test\\aaa', 'C:\\orandea\\impl\\bbb'), '..\\..\\impl\\bbb', 'relative win');
+    assertEqual(path.relative('C:\\a', 'c:\\A\\b'), 'b', 'relative win is case-insensitive');
+    assertEqual(path.relative('C:\\a', 'D:\\b'), 'D:\\b', 'relative across drives is the target');
+    assertEqual(path.relative('C:\\a\\b', 'C:\\a\\b'), '', 'relative same');
+}
+
 // parse
 var parsed = path.parse('/home/user/file.txt');
 assertEqual(parsed.base, 'file.txt', 'parse base');
