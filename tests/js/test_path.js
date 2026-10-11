@@ -104,7 +104,9 @@ var nonAscii = path.join('caf\u00e9', '\u65e5\u672c', 'x.txt');
 assertEqual(nonAscii, 'caf\u00e9' + path.sep + '\u65e5\u672c' + path.sep + 'x.txt', 'join keeps non-ASCII names');
 
 // Speed: joining is native, well under a microsecond (it was ~7 us in script).
-(function() {
+// Not under BRONZE_GC_STRESS, where every allocation runs a full collection.
+var GC_STRESS = !!(process.env.BRONZE_GC_STRESS && process.env.BRONZE_GC_STRESS !== '0');
+if (!GC_STRESS) (function() {
     var dir = path.sep === '/' ? '/home/someone/Pictures/Holiday 2024' : 'C:\\Users\\someone\\Pictures\\Holiday 2024';
     var names = [];
     for (var i = 0; i < 400; i++) names.push('IMG_' + (1000 + i) + '.jpg');
