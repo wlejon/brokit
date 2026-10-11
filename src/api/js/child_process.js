@@ -21,7 +21,8 @@
     function collectRun(file, args, options, callback, label, shell) {
         options = options || {};
 
-        var encoding = options.encoding === null ? null
+        // Node: strings by default; 'buffer' (or null) hands back Buffers.
+        var encoding = options.encoding === null || options.encoding === 'buffer' ? null
                      : (options.encoding || 'utf8');
         var maxBuffer = typeof options.maxBuffer === 'number' ? options.maxBuffer
                                                               : 1024 * 1024;
@@ -34,7 +35,7 @@
         };
         if (options.cwd) spawnOpts.cwd = options.cwd;
         if (options.env) spawnOpts.env = options.env;
-        if (encoding !== null) spawnOpts.encoding = 'utf8';
+        if (encoding !== null) spawnOpts.encoding = encoding;
 
         var settle;
         var promise = null;
@@ -55,7 +56,10 @@
         } catch (e) {
             // Deliver the failure asynchronously so a caller never sees the
             // callback fire before this function has returned.
-            setTimeout(function () { settle(e, encoding === null ? new Uint8Array(0) : '', ''); }, 0);
+            setTimeout(function () {
+                settle(e, encoding === null ? asBuffer(new Uint8Array(0)) : '',
+                       encoding === null ? asBuffer(new Uint8Array(0)) : '');
+            }, 0);
             return promise;
         }
 
@@ -92,7 +96,7 @@
             var out = new Uint8Array(total);
             var at = 0;
             for (var i = 0; i < chunks.length; i++) { out.set(chunks[i], at); at += chunks[i].length; }
-            return out;
+            return asBuffer(out);
         }
 
         var timedOut = false;
@@ -220,11 +224,14 @@
     //                 DEFAULT is 'ignore' (no pipes at all), which diverges
     //                 from Node: an existing caller that never reads must not
     //                 silently start buffering, and a GUI child keeps its own
-    //                 window. Pass 'pipe' explicitly to opt in.
+    //                 window. Pass 'pipe' explicitly to opt in. Node's array
+    //                 form ([stdin, stdout, stderr]) pipes all three when any
+    //                 entry is 'pipe', else none.
     //   encoding    — with stdio:'pipe', 'utf8' delivers stdout/stderr as
     //                 decoded strings (UTF-8 safe across chunk boundaries).
-    //                 Default is binary: chunks arrive as Uint8Array, which is
-    //                 what raw pixel/audio streams need.
+    //                 Default is binary: chunks arrive as Buffers (Uint8Arrays,
+    //                 as raw pixel/audio streams need, whose toString() is the
+    //                 text), as in Node.
     //   highWaterMark — per-stream buffer cap in bytes (default 8 MB). When a
     //                 stream is full the reader stops, the pipe fills, and the
     //                 child blocks in write(). That is the backpressure: it is
@@ -315,8 +322,16 @@
         catch (e) { this._decoder = new TextDecoder(); }
         return this;
     };
+    // Bytes as Node hands them: a Buffer (a Uint8Array, so binary readers are
+    // unaffected) whose toString() is the text, not "99,111,...". A view on
+    // the same memory, never a copy.
+    function asBuffer(bytes) {
+        var B = globalThis.Buffer;
+        if (!B || typeof B.from !== 'function' || B.isBuffer && B.isBuffer(bytes)) return bytes;
+        return B.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    }
     ChildStream.prototype._push = function (bytes) {
-        var chunk = this._decoder ? this._decoder.decode(bytes, { stream: true }) : bytes;
+        var chunk = this._decoder ? this._decoder.decode(bytes, { stream: true }) : asBuffer(bytes);
         if (chunk === '') return;
         emitAll(this._listeners.data, [chunk], 'data');
     };
@@ -483,6 +498,13 @@
         if (args && !Array.isArray(args)) { options = args; args = []; }
         args = args || [];
         options = options || {};
+        // Node's array form ([stdin, stdout, stderr]): the child is piped when
+        // any of its streams asks for a pipe. The native side pipes all three
+        // or none, so a pipe asked for one stream is opened for each.
+        if (Array.isArray(options.stdio)) {
+            var piped = options.stdio.some(function (s) { return s === 'pipe' || s === 'overlapped'; });
+            options = Object.assign({}, options, { stdio: piped ? 'pipe' : 'ignore' });
+        }
         var handle = globalThis.__brokit_cp_spawnAsync(file, args, options);
         return new ChildProcess(handle, options);
     }

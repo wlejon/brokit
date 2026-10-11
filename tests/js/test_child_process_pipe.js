@@ -188,6 +188,48 @@ p6.on('close', function () {
 });
 assertEqual(p6.kill('SIGKILL'), true, 'kill returns true for a live piped child');
 
+// ── Node's array stdio, and binary chunks as Buffers ───────────────────────
+
+const arr = cp.spawn(sh('echo array form').file, sh('echo array form').args,
+                     { stdio: ['ignore', 'pipe', 'pipe'] });
+assert(arr.stdout !== null && arr.stderr !== null, "stdio ['ignore','pipe','pipe'] pipes");
+let arrChunks = [];
+arr.stdout.on('data', function (c) { arrChunks.push(c); });
+arr.on('close', function () {
+    assert(arrChunks.length > 0, 'array-form child delivered output');
+    assert(Buffer.isBuffer(arrChunks[0]), 'a binary chunk is a Buffer');
+    assert(arrChunks[0] instanceof Uint8Array, 'and still a Uint8Array');
+    const text = arrChunks.map(function (c) { return c.toString(); }).join('');
+    assert(text.indexOf('array form') === 0, "a Buffer chunk's toString() is the text: " + JSON.stringify(text));
+});
+const none = cp.spawn(sh('echo none').file, sh('echo none').args,
+                      { stdio: ['ignore', 'ignore', 'ignore'] });
+assert(none.stdout === null, "stdio ['ignore','ignore','ignore'] opens no pipes");
+
+const enc2 = cp.spawn(sh('echo decoded').file, sh('echo decoded').args, { stdio: 'pipe' });
+enc2.stdout.setEncoding('utf8');
+let enc2Text = '';
+enc2.stdout.on('data', function (c) {
+    assert(typeof c === 'string', 'after setEncoding a chunk is a string');
+    enc2Text += c;
+});
+enc2.on('close', function () {
+    assert(enc2Text.indexOf('decoded') === 0, 'setEncoding output: ' + JSON.stringify(enc2Text));
+});
+
+// exec / execFile: strings by default, Buffers for encoding 'buffer' or null.
+cp.exec(isWin ? 'echo bytes' : 'echo bytes', { encoding: 'buffer' }, function (err, out, errOut) {
+    assert(!err, 'exec encoding:buffer runs');
+    assert(Buffer.isBuffer(out) && Buffer.isBuffer(errOut), "exec encoding:'buffer' gives Buffers");
+    assert(out.toString().indexOf('bytes') === 0, 'and their text: ' + JSON.stringify(out.toString()));
+});
+cp.execFile(sh('echo nul').file, sh('echo nul').args, { encoding: null }, function (err, out) {
+    assert(!err && Buffer.isBuffer(out), 'execFile encoding:null gives a Buffer');
+});
+cp.exec('echo text', function (err, out) {
+    assert(!err && typeof out === 'string' && out.indexOf('text') === 0, 'exec gives a string by default');
+});
+
 // ── native guards ──────────────────────────────────────────────────────────
 
 let readThrew = false;
