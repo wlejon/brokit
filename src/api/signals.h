@@ -60,4 +60,12 @@ inline int signalNumber(const char* name) {
     return -1;
 }
 
+// The name for a number (SIGTERM for 15), or null. Where two names share a
+// number (SIGABRT/SIGIOT, SIGIO/SIGPOLL) the first listed, Node's, wins.
+inline const char* signalName(int number) {
+    for (const SignalName& s : signalNames())
+        if (s.number == number) return s.name;
+    return nullptr;
+}
+
 }  // namespace brokit::api

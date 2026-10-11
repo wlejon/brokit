@@ -1,6 +1,7 @@
 #include "api/api.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
+#include "api/signals.h"
 
 extern "C" void bronze_child_process_main();
 
@@ -1283,7 +1284,11 @@ static bronze::Value js_childPoll(bronze::Value, std::span<const bronze::Value> 
     std::string sig;
     if (r > 0) {
         if (WIFEXITED(status)) exitCode = WEXITSTATUS(status);
-        else if (WIFSIGNALED(status)) { exitCode = 128 + WTERMSIG(status); sig = "SIG" + std::to_string(WTERMSIG(status)); }
+        else if (WIFSIGNALED(status)) {
+            exitCode = 128 + WTERMSIG(status);
+            const char* name = signalName(WTERMSIG(status));
+            sig = name ? name : "SIG" + std::to_string(WTERMSIG(status));
+        }
     }
 #endif
 
@@ -1444,11 +1449,15 @@ static bronze::Value js_childKill(bronze::Value, std::span<const bronze::Value> 
 #ifdef _WIN32
     TerminateProcess(h->process, 1);
 #else
+    // Any of Node's signal names, or a number; an unknown name is SIGTERM.
     int sig = SIGTERM;
     if (a.size() >= 2 && ev::isString(a[1])) {
         std::string s = ev::toUtf8(a[1]);
-        if (s == "SIGKILL") sig = SIGKILL;
-        else if (s == "SIGINT") sig = SIGINT;
+        const int n = signalNumber(s.c_str());
+        if (n > 0) sig = n;
+    } else if (a.size() >= 2 && ev::isNumber(a[1])) {
+        const int n = int(ev::toDouble(a[1]));
+        if (n > 0) sig = n;
     }
     ::kill(h->pid, sig);
 #endif
