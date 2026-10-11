@@ -5,7 +5,8 @@
 // page walking a whole drive.
 
 var fs = globalThis.__brokit_fs;
-var root = 'brokit_fs_async_test';
+// Per process: this test and its _gcstress twin run side by side under ctest -j.
+var root = 'brokit_fs_async_test_' + process.pid;
 fs.rmSync(root, { recursive: true, force: true });
 
 // ── Nothing settles inside the call ───────────────────────────────────────
