@@ -41,16 +41,21 @@ foreach(js ${BROKIT_JS_TESTS})
     if(name MATCHES "^(test_fetch|test_fetch_abort)$")
         continue()
     endif()
+    # Each test, and its gcstress twin below, runs in a directory of its own:
+    # what a script leaves relative to the working directory (IndexedDB's
+    # databases, fs scratch trees) must not be shared by two copies of it
+    # running at once under `ctest -j`.
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/run/${name}" "${CMAKE_CURRENT_BINARY_DIR}/run/${name}_gcstress")
     add_test(NAME ${name} COMMAND brokit_test "${js}")
     set_tests_properties(${name} PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/run/${name}")
     # The same script with a collection at every allocation and freed space
     # poisoned: a binding that holds a raw Value across an allocating call
     # reads garbage here instead of passing by luck. `ctest -LE gcstress`
     # skips these.
     add_test(NAME ${name}_gcstress COMMAND brokit_test "${js}")
     set_tests_properties(${name}_gcstress PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/run/${name}_gcstress"
         ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1"
         LABELS gcstress)
 endforeach()
