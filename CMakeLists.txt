@@ -101,6 +101,22 @@ endif()
 # FastNoise2 — SIMD noise generation for procedural worlds
 option(BROKIT_ENABLE_NOISE "Build FastNoise2 noise API" ON)
 if(BROKIT_ENABLE_NOISE)
+    if(NOT TARGET FastNoise)
+        bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF ba93f17ec40a9d09066c8d07b3e72b789e5b5657 THIRD_PARTY
+                       TARGET FastNoise SOURCE_ONLY)
+        # FastNoise2 fetches FastSIMD through the CPM.cmake copy vendored next
+        # to it. CPM caches CPM_DIRECTORY and early-returns (defining nothing)
+        # when a *different* copy of CPM.cmake is included later, so a build
+        # tree that moved between FastNoise2 trees keeps a stale CPM_DIRECTORY
+        # that leaves CPMAddPackage undefined. Drop it when it no longer
+        # matches (as bro's third_party/CMakeLists.txt does).
+        get_filename_component(_fn2_cpm_dir "${FastNoise2_SOURCE_DIR}/cmake" REALPATH)
+        if(DEFINED CPM_DIRECTORY AND NOT CPM_DIRECTORY STREQUAL _fn2_cpm_dir)
+            unset(CPM_DIRECTORY CACHE)
+            unset(CPM_FILE CACHE)
+            unset(CPM_VERSION CACHE)
+        endif()
+    endif()
     bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF ba93f17ec40a9d09066c8d07b3e72b789e5b5657 THIRD_PARTY TARGET FastNoise
                    OPTIONS FASTNOISE2_NOISETOOL=OFF FASTNOISE2_TESTS=OFF)
 endif()
