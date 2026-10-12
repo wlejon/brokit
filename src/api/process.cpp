@@ -30,13 +30,56 @@ namespace brokit::api {
 
 namespace {
 
+#ifdef _WIN32
+// Windows strings cross into JS as UTF-8 through the wide (UTF-16) APIs; the
+// narrow ones speak the ANSI code page, which loses or mangles anything
+// outside it (an environment value "×4" read through getenv came back as
+// the bytes D7 34).
+std::wstring widen(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(n > 0 ? n : 0), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+
+std::string narrow(const wchar_t* w, size_t len) {
+    if (len == 0) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, static_cast<int>(len), nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n > 0 ? n : 0), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, static_cast<int>(len), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+// An environment variable of this process, as UTF-8; false when unset.
+bool envGet(const std::string& key, std::string& out) {
+    const std::wstring wkey = widen(key);
+    std::wstring buf(256, L'\0');
+    for (;;) {
+        SetLastError(ERROR_SUCCESS);
+        DWORD n = GetEnvironmentVariableW(wkey.c_str(), buf.data(), static_cast<DWORD>(buf.size()));
+        if (n == 0) {
+            if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) return false;
+            out.clear();
+            return true;
+        }
+        if (n < buf.size()) { out = narrow(buf.data(), n); return true; }
+        buf.resize(n);
+    }
+}
+#endif
+
 // The running executable's absolute path (Node's process.execPath), so an
 // app can start another instance of its own runtime.
 std::string executablePath() {
 #ifdef _WIN32
-    char buf[MAX_PATH];
-    DWORD len = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    return (len > 0 && len < MAX_PATH) ? std::string(buf, len) : std::string("bro");
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0) return std::string("bro");
+        if (len < buf.size()) return narrow(buf.data(), len);
+        buf.resize(buf.size() * 2);
+    }
 #elif defined(__APPLE__)
     char buf[4096];
     uint32_t size = sizeof(buf);
@@ -50,10 +93,12 @@ std::string executablePath() {
 
 Value js_process_cwd(Value, std::span<const Value>) {
 #ifdef _WIN32
-    char buf[MAX_PATH];
-    DWORD len = GetCurrentDirectoryA(MAX_PATH, buf);
-    if (len == 0) return ev::throwError("process.cwd: failed");
-    return ev::fromUtf8(buf);
+    DWORD need = GetCurrentDirectoryW(0, nullptr);
+    if (need == 0) return ev::throwError("process.cwd: failed");
+    std::wstring buf(need, L'\0');
+    DWORD len = GetCurrentDirectoryW(need, buf.data());
+    if (len == 0 || len >= need) return ev::throwError("process.cwd: failed");
+    return ev::fromUtf8(narrow(buf.data(), len));
 #else
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) return ev::throwError("process.cwd: failed");
@@ -154,43 +199,60 @@ Value js_process_exit(Value, std::span<const Value> a) {
 Value makeEnvProxy() {
     HostProxyTraps traps;
     traps.get = [](const std::string& key, Value& out) -> bool {
+#ifdef _WIN32
+        std::string val;
+        if (!envGet(key, val)) return false;
+        out = ev::fromUtf8(val);
+        return true;
+#else
         const char* val = getenv(key.c_str());
         if (!val) return false;
         out = ev::fromUtf8(val);
         return true;
+#endif
     };
+    // On Windows both the process block (what a child inherits, what
+    // GetEnvironmentVariable reads) and the CRT's copy (what a library's
+    // getenv reads) are kept in step.
     traps.set = [](const std::string& key, Value v) {
         std::string val = ev::toUtf8(v);
 #ifdef _WIN32
-        SetEnvironmentVariableA(key.c_str(), val.c_str());
-        _putenv_s(key.c_str(), val.c_str());
+        const std::wstring wkey = widen(key), wval = widen(val);
+        SetEnvironmentVariableW(wkey.c_str(), wval.c_str());
+        _wputenv_s(wkey.c_str(), wval.c_str());
 #else
         setenv(key.c_str(), val.c_str(), 1);
 #endif
     };
     traps.remove = [](const std::string& key) {
 #ifdef _WIN32
-        SetEnvironmentVariableA(key.c_str(), nullptr);
-        _putenv_s(key.c_str(), "");
+        const std::wstring wkey = widen(key);
+        SetEnvironmentVariableW(wkey.c_str(), nullptr);
+        _wputenv_s(wkey.c_str(), L"");
 #else
         unsetenv(key.c_str());
 #endif
     };
     traps.has = [](const std::string& key) -> bool {
+#ifdef _WIN32
+        std::string val;
+        return envGet(key, val);
+#else
         return getenv(key.c_str()) != nullptr;
+#endif
     };
     traps.ownKeys = []() -> std::vector<std::string> {
         std::vector<std::string> keys;
 #ifdef _WIN32
-        char* block = GetEnvironmentStringsA();
+        wchar_t* block = GetEnvironmentStringsW();
         if (block) {
-            for (char* p = block; *p; p += strlen(p) + 1) {
-                if (p[0] == '=') continue;
-                const char* eq = strchr(p, '=');
+            for (wchar_t* p = block; *p; p += wcslen(p) + 1) {
+                if (p[0] == L'=') continue;
+                const wchar_t* eq = wcschr(p, L'=');
                 if (!eq) continue;
-                keys.emplace_back(p, static_cast<size_t>(eq - p));
+                keys.push_back(narrow(p, static_cast<size_t>(eq - p)));
             }
-            FreeEnvironmentStringsA(block);
+            FreeEnvironmentStringsW(block);
         }
 #else
         for (char** e = environ; e && *e; e++) {
