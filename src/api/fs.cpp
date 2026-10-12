@@ -13,11 +13,14 @@
 #include <sstream>
 #include <filesystem>
 #include <chrono>
+#include <random>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
 #else
+#include <cerrno>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -100,6 +103,25 @@ std::string resolveBrokitPrefixMount(const std::string& path)
     return bestRewrite;
 }
 
+const char* fsErrorCode(const std::error_code& ec)
+{
+    if (ec == std::errc::no_such_file_or_directory) return "ENOENT";
+    if (ec == std::errc::file_exists) return "EEXIST";
+    if (ec == std::errc::permission_denied) return "EACCES";
+    if (ec == std::errc::operation_not_permitted) return "EPERM";
+    if (ec == std::errc::is_a_directory) return "EISDIR";
+    if (ec == std::errc::not_a_directory) return "ENOTDIR";
+    if (ec == std::errc::directory_not_empty) return "ENOTEMPTY";
+    if (ec == std::errc::no_space_on_device) return "ENOSPC";
+    if (ec == std::errc::too_many_files_open) return "EMFILE";
+    if (ec == std::errc::cross_device_link) return "EXDEV";
+    if (ec == std::errc::bad_file_descriptor) return "EBADF";
+    if (ec == std::errc::io_error) return "EIO";
+    if (ec == std::errc::read_only_file_system) return "EROFS";
+    if (ec == std::errc::invalid_argument) return "EINVAL";
+    return "ERR_FS";
+}
+
 namespace {
 
 thread_local std::vector<std::string> g_fsBasePaths;
@@ -172,16 +194,7 @@ std::string getEncoding(std::span<const bronze::Value> a, size_t idx)
 
 bronze::Value throwFsError(const char* syscall, const char* path, const std::error_code& ec)
 {
-    const char* code = "ERR_FS";
-    if (ec == std::errc::no_such_file_or_directory) code = "ENOENT";
-    else if (ec == std::errc::file_exists) code = "EEXIST";
-    else if (ec == std::errc::permission_denied) code = "EACCES";
-    else if (ec == std::errc::is_a_directory) code = "EISDIR";
-    else if (ec == std::errc::not_a_directory) code = "ENOTDIR";
-    else if (ec == std::errc::directory_not_empty) code = "ENOTEMPTY";
-    else if (ec == std::errc::no_space_on_device) code = "ENOSPC";
-    else if (ec == std::errc::too_many_files_open) code = "EMFILE";
-    else if (ec == std::errc::cross_device_link) code = "EXDEV";
+    const char* code = fsErrorCode(ec);
 
     std::string msg = std::string(code) + ": " + ec.message() + ", " + syscall;
     if (path) msg += " '" + std::string(path) + "'";
@@ -506,6 +519,119 @@ static bronze::Value js_closeSync(bronze::Value, std::span<const bronze::Value> 
     it->second->stream.close();
     g_fds.erase(it);
     return ev::undefined();
+}
+
+bool flushFdForSync(int fd, std::string& path, bool& writable)
+{
+    std::lock_guard<std::mutex> lock(g_fdMutex);
+    OpenFile* file = lookupFd(fd);
+    if (!file) return false;
+    file->stream.clear();
+    if (file->writable) file->stream.flush();
+    file->stream.clear();
+    path = file->path;
+    writable = file->writable;
+    return true;
+}
+
+// An fd here is an fstream, which hands out no OS handle, so the file is
+// opened again by path and that handle synced: fsync and FlushFileBuffers
+// flush the file, whichever handle names it.
+std::error_code syncPath(const std::string& path, bool dataOnly, bool writable)
+{
+#ifdef _WIN32
+    (void)dataOnly;
+    // FlushFileBuffers needs a handle open for writing; a descriptor opened
+    // only for reading has written nothing to flush.
+    if (!writable) return {};
+    HANDLE h = CreateFileW(u8p(path).c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        std::error_code ec(static_cast<int>(GetLastError()), std::system_category());
+        if (ec == std::errc::no_such_file_or_directory) return {};
+        return ec;
+    }
+    std::error_code ec;
+    if (!FlushFileBuffers(h)) ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+    CloseHandle(h);
+    return ec;
+#else
+    (void)writable;
+    int h = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (h < 0) {
+        if (errno == ENOENT) return {};
+        return std::error_code(errno, std::generic_category());
+    }
+    int r;
+#if defined(__APPLE__)
+    (void)dataOnly;
+    r = ::fsync(h);
+#else
+    r = dataOnly ? ::fdatasync(h) : ::fsync(h);
+#endif
+    std::error_code ec;
+    if (r != 0) ec = std::error_code(errno, std::generic_category());
+    ::close(h);
+    return ec;
+#endif
+}
+
+std::string makeTempDir(const std::string& resolvedPrefix, std::error_code& ec)
+{
+    static const char kChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    thread_local std::mt19937_64 rng{std::random_device{}()};
+    std::uniform_int_distribution<int> pick(0, static_cast<int>(sizeof(kChars)) - 2);
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::string suffix(6, ' ');
+        for (char& c : suffix) c = kChars[pick(rng)];
+        const std::string full = resolvedPrefix + suffix;
+#ifdef _WIN32
+        ec.clear();
+        bool created = fs::create_directory(u8p(full), ec);
+        if (ec) return {};
+        if (created) return suffix;
+#else
+        if (::mkdir(full.c_str(), 0700) == 0) {
+            ec.clear();
+            return suffix;
+        }
+        if (errno != EEXIST) {
+            ec = std::error_code(errno, std::generic_category());
+            return {};
+        }
+#endif
+    }
+    ec = std::make_error_code(std::errc::file_exists);
+    return {};
+}
+
+// fsyncSync(fd[, dataOnly])
+static bronze::Value js_fsyncSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    int32_t fd = a.empty() ? -1 : i32At(a, 0);
+    const bool dataOnly = a.size() >= 2 && ev::isBool(a[1]) && ev::toBool(a[1]);
+    const char* syscall = dataOnly ? "fdatasync" : "fsync";
+    std::string path;
+    bool writable = false;
+    if (!flushFdForSync(fd, path, writable)) {
+        return throwErrno(syscall, nullptr, "EBADF", (std::string("EBADF: bad file descriptor, ") + syscall).c_str());
+    }
+    std::error_code ec = syncPath(path, dataOnly, writable);
+    if (ec) return throwFsError(syscall, nullptr, ec);
+    return ev::undefined();
+}
+
+// mkdtempSync(prefix) -> the directory made
+static bronze::Value js_mkdtempSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.empty() || !ev::isString(a[0])) return ev::throwTypeError("mkdtempSync: prefix must be a string");
+    const std::string prefix = ev::toUtf8(a[0]);
+    const std::string resolved = resolveFsPath(prefix.c_str(), /*forCreate=*/true);
+    std::error_code ec;
+    const std::string suffix = makeTempDir(resolved, ec);
+    if (ec) return throwFsError("mkdtemp", (prefix + "XXXXXX").c_str(), ec);
+    return ev::fromUtf8(prefix + suffix);
 }
 
 // writeFileSync(path, data[, encoding])
@@ -896,6 +1022,8 @@ void installFS()
     ev::setGlobalFunction("__brokit_fs_writeSync", 5, js_writeSync);
     ev::setGlobalFunction("__brokit_fs_fstatSync", 1, js_fstatSync);
     ev::setGlobalFunction("__brokit_fs_closeSync", 1, js_closeSync);
+    ev::setGlobalFunction("__brokit_fs_fsyncSync", 2, js_fsyncSync);
+    ev::setGlobalFunction("__brokit_fs_mkdtempSync", 1, js_mkdtempSync);
     installFSAsync();
 
     bronze::embed::runEntry(bronze_fs_main);

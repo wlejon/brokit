@@ -126,7 +126,24 @@
         if (enc === 'hex') return 'hex';
         if (enc === 'ascii') return 'ascii';
         if (enc === 'latin1' || enc === 'binary') return 'latin1';
+        if (enc === 'utf16le' || enc === 'utf-16le' || enc === 'ucs2' || enc === 'ucs-2') return 'utf16le';
         throw new TypeError('Unknown encoding: ' + enc);
+    }
+
+    function utf16leEncode(str) {
+        var u8 = new Uint8Array(str.length * 2);
+        for (var i = 0; i < str.length; i++) {
+            var c = str.charCodeAt(i);
+            u8[i * 2] = c & 0xff;
+            u8[i * 2 + 1] = c >> 8;
+        }
+        return u8;
+    }
+
+    function utf16leDecode(u8) {
+        var out = '';
+        for (var i = 0; i + 1 < u8.length; i += 2) out += String.fromCharCode(u8[i] | (u8[i + 1] << 8));
+        return out;
     }
 
     function strToBytes(str, enc) {
@@ -137,6 +154,7 @@
             case 'hex': return hexDecode(str);
             case 'ascii': return asciiEncode(str);
             case 'latin1': return latin1Encode(str);
+            case 'utf16le': return utf16leEncode(str);
         }
     }
 
@@ -148,6 +166,7 @@
             case 'hex': return hexEncode(u8);
             case 'ascii':
             case 'latin1': return latin1Decode(u8);
+            case 'utf16le': return utf16leDecode(u8);
         }
     }
 

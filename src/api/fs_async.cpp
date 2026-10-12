@@ -11,6 +11,7 @@
 
 #include "api/fs_async.h"
 #include "api/api.h"
+#include "api/arg_reader.h"
 #include "api/object_builder.h"
 
 #include <algorithm>
@@ -83,19 +84,7 @@ struct Dirents { std::vector<DirentOut> entries; };
 
 using Result = std::variant<std::monostate, FsError, Bytes, Text, StatOut, Names, Dirents>;
 
-const char* codeFor(const std::error_code& ec)
-{
-    if (ec == std::errc::no_such_file_or_directory) return "ENOENT";
-    if (ec == std::errc::file_exists) return "EEXIST";
-    if (ec == std::errc::permission_denied) return "EACCES";
-    if (ec == std::errc::is_a_directory) return "EISDIR";
-    if (ec == std::errc::not_a_directory) return "ENOTDIR";
-    if (ec == std::errc::directory_not_empty) return "ENOTEMPTY";
-    if (ec == std::errc::no_space_on_device) return "ENOSPC";
-    if (ec == std::errc::too_many_files_open) return "EMFILE";
-    if (ec == std::errc::cross_device_link) return "EXDEV";
-    return "ERR_FS";
-}
+const char* codeFor(const std::error_code& ec) { return fsErrorCode(ec); }
 
 FsError errorFrom(const char* syscall, const std::string& path, const std::error_code& ec)
 {
@@ -458,6 +447,36 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
             std::error_code ec;
             if (!fs::exists(u8p(p), ec)) return errorOf("ENOENT", "access", p, "no such file or directory");
             return std::monostate{};
+        };
+    } else if (op == "fsync" || op == "fdatasync") {
+        // The stream's buffer is pushed to the OS here, on the thread that
+        // owns the fd; the wait for the disk runs on the pool.
+        const int fd = a.size() > 1 ? i32At(a, 1) : -1;
+        const bool dataOnly = op == "fdatasync";
+        std::string p;
+        bool writable = false;
+        if (!flushFdForSync(fd, p, writable)) {
+            FsError bad{"EBADF", op, "", "EBADF: bad file descriptor, " + op};
+            work = [bad]() -> Result { return bad; };
+        } else {
+            const std::string syscall = op;
+            work = [p, dataOnly, writable, syscall]() -> Result {
+                std::error_code ec = syncPath(p, dataOnly, writable);
+                if (ec) {
+                    const char* code = codeFor(ec);
+                    return FsError{code, syscall, "", std::string(code) + ": " + ec.message() + ", " + syscall};
+                }
+                return std::monostate{};
+            };
+        }
+    } else if (op == "mkdtemp") {
+        const std::string prefix = argString(a, 1);
+        const std::string p = resolveFsPathOnThread(prefix, true);
+        work = [prefix, p]() -> Result {
+            std::error_code ec;
+            std::string suffix = makeTempDir(p, ec);
+            if (ec) return errorFrom("mkdtemp", prefix + "XXXXXX", ec);
+            return Text{prefix + suffix};
         };
     } else {
         return ev::throwTypeError(("fs: no asynchronous '" + op + "'").c_str());

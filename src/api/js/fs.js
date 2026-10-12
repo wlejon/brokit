@@ -76,12 +76,52 @@
             position === undefined ? null : position);
     }
 
+    // A string's bytes in a Node encoding (utf8 when none is named), by
+    // Buffer's encoders where Buffer is installed.
+    function stringBytes(str, encoding) {
+        var B = globalThis.Buffer;
+        if (typeof B === 'function' && B.from) return B.from(str, encoding || 'utf8')._u8;
+        var enc = encoding ? String(encoding).toLowerCase() : 'utf8';
+        if (enc !== 'utf8' && enc !== 'utf-8') throw new TypeError('Unknown encoding: ' + encoding);
+        return new TextEncoder().encode(str);
+    }
+
+    // writeSync(fd, buffer[, offset[, length[, position]]])
+    // writeSync(fd, buffer, { offset, length, position })
+    // writeSync(fd, string[, position[, encoding]])
     function writeSync(fd, buffer, offset, length, position) {
+        if (typeof buffer === 'string') {
+            var bytes = stringBytes(buffer, typeof length === 'string' ? length : undefined);
+            return globalThis.__brokit_fs_writeSync(
+                fd, bytes, 0, bytes.byteLength,
+                typeof offset === 'number' ? offset : null);
+        }
+        if (buffer === null || typeof buffer !== 'object') {
+            throw new TypeError('writeSync: data must be a string, Buffer, TypedArray or DataView');
+        }
+        if (offset !== null && typeof offset === 'object') {
+            var o = offset;
+            offset = o.offset;
+            length = o.length;
+            position = o.position;
+        }
+        var off = offset === undefined || offset === null ? 0 : offset;
         return globalThis.__brokit_fs_writeSync(
-            fd, buffer,
-            offset === undefined ? 0 : offset,
-            length === undefined ? buffer.byteLength : length,
+            fd, buffer, off,
+            length === undefined || length === null ? buffer.byteLength - off : length,
             position === undefined ? null : position);
+    }
+
+    function fsyncSync(fd) {
+        globalThis.__brokit_fs_fsyncSync(fd, false);
+    }
+
+    function fdatasyncSync(fd) {
+        globalThis.__brokit_fs_fsyncSync(fd, true);
+    }
+
+    function mkdtempSync(prefix) {
+        return globalThis.__brokit_fs_mkdtempSync(prefix);
     }
 
     function fstatSync(fd) {
@@ -181,6 +221,7 @@
         copyFile:   function(from, to) { return run('copyFile', from, to); },
         realpath:   function(path) { return run('realpath', path); },
         access:     function(path) { return run('access', path); },
+        mkdtemp:    function(prefix) { return run('mkdtemp', prefix); },
         // chmod is a metadata write with nothing to wait on.
         chmod:      function(path, mode) {
             try { return Promise.resolve(chmodSync(path, mode)); } catch (err) { return Promise.reject(err); }
@@ -200,6 +241,28 @@
             p.then(function(v) { callback(null, v); }, function(err) { callback(err); });
         };
     }
+
+    // fs.write(fd, buffer, offset, length, position, callback), (fd, buffer,
+    // options, callback) or (fd, string, position, encoding, callback):
+    // callback(err, bytesWritten, data). A write lands in the fd's stream
+    // buffer, so it runs in the call; the callback still runs later.
+    function write(fd, data) {
+        var args = Array.prototype.slice.call(arguments);
+        var callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+        var p;
+        try {
+            p = Promise.resolve(writeSync.apply(null, args));
+        } catch (err) {
+            p = Promise.reject(err);
+        }
+        if (!callback) return p;
+        p.then(function(n) { callback(null, n, data); }, function(err) { callback(err); });
+    }
+
+    // fsync / fdatasync: the stream's buffer reaches the OS in the call, the
+    // wait for the disk runs on the fs threads.
+    function fsyncAsync(fd) { return run('fsync', fd); }
+    function fdatasyncAsync(fd) { return run('fdatasync', fd); }
 
     // ── Main fs object ────────────────────────────────────────────────────────
 
@@ -227,6 +290,12 @@
         writeSync:       writeSync,
         fstatSync:       fstatSync,
         closeSync:       closeSync,
+        fsyncSync:       fsyncSync,
+        fdatasyncSync:   fdatasyncSync,
+        mkdtempSync:     mkdtempSync,
+        write:           write,
+        fsync:           wrapAsync(fsyncAsync),
+        fdatasync:       wrapAsync(fdatasyncAsync),
 
         // Async (callback or Promise)
         readFile:    wrapAsync(promises.readFile),
@@ -243,6 +312,7 @@
         copyFile:    wrapAsync(promises.copyFile),
         chmod:       wrapAsync(promises.chmod),
         realpath:    wrapAsync(promises.realpath),
+        mkdtemp:     wrapAsync(promises.mkdtemp),
 
         // Convenience
         existsSync:  existsSync,
