@@ -117,6 +117,24 @@ fs.copyFileSync(testFile, copyDest);
 var copied = fs.readFileSync(copyDest, 'utf8');
 assertEqual(copied, 'Hello, brokit! World!', 'copyFileSync');
 
+// ── cpSync ────────────────────────────────────────────────────────────────
+fs.mkdirSync(testDir + '/tree/sub', { recursive: true });
+fs.writeFileSync(testDir + '/tree/a.txt', 'a');
+fs.writeFileSync(testDir + '/tree/sub/b.txt', 'b');
+fs.cpSync(testDir + '/tree', testDir + '/tree2/deeper', { recursive: true });
+assertEqual(fs.readFileSync(testDir + '/tree2/deeper/a.txt', 'utf8'), 'a', 'cpSync copies a tree');
+assertEqual(fs.readFileSync(testDir + '/tree2/deeper/sub/b.txt', 'utf8'), 'b', 'cpSync copies nested directories');
+threw = false;
+try { fs.cpSync(testDir + '/tree', testDir + '/tree3'); } catch (e) { threw = e.code === 'ERR_FS_EISDIR'; }
+assert(threw, 'cpSync refuses a directory without recursive');
+fs.cpSync(testDir + '/tree/a.txt', testDir + '/one/two/a.txt');
+assertEqual(fs.readFileSync(testDir + '/one/two/a.txt', 'utf8'), 'a', 'cpSync makes a file\'s parent directories');
+fs.writeFileSync(testDir + '/one/two/a.txt', 'kept');
+fs.cpSync(testDir + '/tree/a.txt', testDir + '/one/two/a.txt', { force: false });
+assertEqual(fs.readFileSync(testDir + '/one/two/a.txt', 'utf8'), 'kept', 'cpSync force: false leaves an existing file');
+fs.cpSync(testDir + '/tree/a.txt', testDir + '/one/two/a.txt');
+assertEqual(fs.readFileSync(testDir + '/one/two/a.txt', 'utf8'), 'a', 'cpSync overwrites by default');
+
 // ── renameSync ────────────────────────────────────────────────────────────
 var renamed = testDir + '/renamed.txt';
 fs.renameSync(copyDest, renamed);

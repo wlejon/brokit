@@ -172,6 +172,39 @@
         return globalThis.__brokit_fs_copyFileSync(src, dest);
     }
 
+    // Node's cpSync: a file (its parent directories made), or a directory
+    // tree with { recursive: true }. force (default true) overwrites a file
+    // that exists; with force false it is left, or with errorOnExist throws
+    // EEXIST.
+    function cpSync(src, dest, options) {
+        var o = options || {};
+        var force = o.force !== false;
+        var st = statSync(src);
+        if (st.isDirectory()) {
+            if (!o.recursive) {
+                var e = new Error("cpSync: '" + src + "' is a directory (pass { recursive: true })");
+                e.code = 'ERR_FS_EISDIR';
+                throw e;
+            }
+            mkdirSync(dest, { recursive: true });
+            var names = readdirSync(src);
+            for (var i = 0; i < names.length; i++)
+                cpSync(src + '/' + names[i], dest + '/' + names[i], o);
+            return;
+        }
+        if (existsSync(dest)) {
+            if (o.errorOnExist && !force) {
+                var x = new Error("cpSync: '" + dest + "' exists");
+                x.code = 'EEXIST';
+                throw x;
+            }
+            if (!force) return;
+        }
+        var cut = Math.max(dest.lastIndexOf('/'), dest.lastIndexOf('\\'));
+        if (cut > 0) mkdirSync(dest.slice(0, cut), { recursive: true });
+        copyFileSync(src, dest);
+    }
+
     function chmodSync(path, mode) {
         return globalThis.__brokit_fs_chmodSync(path, mode);
     }
@@ -281,6 +314,7 @@
         unlinkSync:      unlinkSync,
         renameSync:      renameSync,
         copyFileSync:    copyFileSync,
+        cpSync:          cpSync,
         chmodSync:       chmodSync,
         realpathSync:    realpathSync,
 
