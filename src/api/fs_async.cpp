@@ -69,10 +69,6 @@ std::string u8s(const fs::path& p)
 struct FsError {
     std::string code, syscall, path, message;
 };
-struct StatOut {
-    double size = 0, mtimeMs = 0, mode = 0;
-    bool isFile = false, isDir = false, isLink = false;
-};
 struct DirentOut {
     std::string name;
     bool isFile = false, isDir = false, isLink = false;
@@ -82,64 +78,32 @@ struct Text { std::string data; };
 struct Names { std::vector<std::string> names; };
 struct Dirents { std::vector<DirentOut> entries; };
 
-using Result = std::variant<std::monostate, FsError, Bytes, Text, StatOut, Names, Dirents>;
+using Result = std::variant<std::monostate, FsError, Bytes, Text, StatFields, Names, Dirents>;
 
 const char* codeFor(const std::error_code& ec) { return fsErrorCode(ec); }
 
 FsError errorFrom(const char* syscall, const std::string& path, const std::error_code& ec)
 {
     const char* code = codeFor(ec);
-    return {code, syscall, path, std::string(code) + ": " + ec.message() + ", " + syscall + " '" + path + "'"};
+    std::string msg = std::string(code) + ": " + ec.message() + ", " + syscall;
+    if (!path.empty()) msg += " '" + path + "'";
+    return {code, syscall, path, std::move(msg)};
 }
 
 FsError errorOf(const char* code, const char* syscall, const std::string& path, const std::string& what)
 {
-    return {code, syscall, path, std::string(code) + ": " + what + ", " + syscall + " '" + path + "'"};
-}
-
-double mtimeMsOf(const fs::path& p)
-{
-    std::error_code ec;
-    auto t = fs::last_write_time(p, ec);
-    if (ec) return 0;
-    return fileTimeToUnixMs(t);
+    std::string msg = std::string(code) + ": " + what + ", " + syscall;
+    if (!path.empty()) msg += " '" + path + "'";
+    return {code, syscall, path, std::move(msg)};
 }
 
 // stat (follow = true) or lstat, as the synchronous pair report them.
-Result statPath(const std::string& path, bool follow)
+Result statPath(const std::string& path, bool follow, const char* syscall = nullptr)
 {
-    const fs::path p = u8p(path);
+    StatFields s;
     std::error_code ec;
-    const auto st = follow ? fs::status(p, ec) : fs::symlink_status(p, ec);
-    if (ec) return errorFrom(follow ? "stat" : "lstat", path, ec);
-    StatOut s;
-    s.isFile = fs::is_regular_file(st);
-    s.isDir = fs::is_directory(st);
-    if (follow) {
-        auto ls = fs::symlink_status(p, ec);
-        s.isLink = !ec && fs::is_symlink(ls);
-    } else {
-        s.isLink = fs::is_symlink(st);
-    }
-    if (s.isFile) {
-        auto size = fs::file_size(p, ec);
-        s.size = ec ? 0.0 : static_cast<double>(size);
-    }
-    if (follow) {
-        s.mtimeMs = mtimeMsOf(p);
-#ifdef _WIN32
-        DWORD attrs = GetFileAttributesW(p.c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES) {
-            int mode = 0444;
-            if (!(attrs & FILE_ATTRIBUTE_READONLY)) mode |= 0222;
-            if (s.isDir) mode |= 0111;
-            s.mode = mode;
-        }
-#else
-        struct stat raw;
-        if (::stat(path.c_str(), &raw) == 0) s.mode = raw.st_mode & 07777;
-#endif
-    }
+    const char* sc = syscall ? syscall : (follow ? "stat" : "lstat");
+    if (!statPathFields(path, follow, s, ec)) return errorFrom(sc, path, ec);
     return s;
 }
 
@@ -292,18 +256,6 @@ Pending& pending()
 
 // ---- results to JS (on the owning thread) -----------------------------------------
 
-bronze::Value statToJs(const StatOut& s)
-{
-    ObjectBuilder obj;
-    obj.set("size", ev::fromDouble(s.size));
-    obj.set("mtimeMs", ev::fromDouble(s.mtimeMs));
-    obj.set("mode", ev::fromDouble(s.mode));
-    obj.set("_isFile", ev::fromBool(s.isFile));
-    obj.set("_isDirectory", ev::fromBool(s.isDir));
-    obj.set("_isSymbolicLink", ev::fromBool(s.isLink));
-    return obj.get();
-}
-
 bronze::Value errorToJs(const FsError& e)
 {
     ev::Persistent err{newError("Error", e.message)};
@@ -329,8 +281,8 @@ bronze::Value resultToJs(const Result& r)
             return u8;
         } else if constexpr (std::is_same_v<T, Text>) {
             return ev::fromUtf8(v.data);
-        } else if constexpr (std::is_same_v<T, StatOut>) {
-            return statToJs(v);
+        } else if constexpr (std::is_same_v<T, StatFields>) {
+            return statFieldsToJs(v);
         } else if constexpr (std::is_same_v<T, Names>) {
             ArrayBuilder arr;
             for (const auto& n : v.names) arr.push(ev::fromUtf8(n));
@@ -392,6 +344,15 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
         const bool follow = op == "stat";
         work = [p, follow] { return statPath(p, follow); };
+    } else if (op == "fstat") {
+        const int fd = a.size() > 1 ? i32At(a, 1) : -1;
+        std::string p;
+        bool writable = false;
+        if (!flushFdForSync(fd, p, writable)) {
+            work = []() -> Result { return errorOf("EBADF", "fstat", "", "bad file descriptor"); };
+        } else {
+            work = [p] { return statPath(p, /*follow=*/true, "fstat"); };
+        }
     } else if (op == "readdir") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
         const bool types = argBool(a, 2);
@@ -413,7 +374,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         const std::string syscall = op;
         work = [p, recursive, force, syscall]() -> Result {
             std::error_code ec;
-            if (!fs::exists(u8p(p), ec)) {
+            if (!fs::exists(fs::symlink_status(u8p(p), ec))) {
                 if (force) return std::monostate{};
                 return errorOf("ENOENT", syscall.c_str(), p, "no such file or directory");
             }
@@ -462,13 +423,79 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
             const std::string syscall = op;
             work = [p, dataOnly, writable, syscall]() -> Result {
                 std::error_code ec = syncPath(p, dataOnly, writable);
-                if (ec) {
-                    const char* code = codeFor(ec);
-                    return FsError{code, syscall, "", std::string(code) + ": " + ec.message() + ", " + syscall};
-                }
+                if (ec) return errorFrom(syscall.c_str(), "", ec);
                 return std::monostate{};
             };
         }
+    } else if (op == "utimes" || op == "lutimes") {
+        const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        const double atimeSec = a.size() > 2 ? ev::toDouble(a[2]) : 0.0;
+        const double mtimeSec = a.size() > 3 ? ev::toDouble(a[3]) : 0.0;
+        const bool follow = (op == "utimes");
+        const char* syscall = follow ? "utime" : "lutime";
+        work = [p, atimeSec, mtimeSec, follow, syscall]() -> Result {
+            std::error_code ec = utimesPath(p, atimeSec, mtimeSec, follow);
+            if (ec) return errorFrom(syscall, p, ec);
+            return std::monostate{};
+        };
+    } else if (op == "futimes") {
+        const int fd = a.size() > 1 ? i32At(a, 1) : -1;
+        const double atimeSec = a.size() > 2 ? ev::toDouble(a[2]) : 0.0;
+        const double mtimeSec = a.size() > 3 ? ev::toDouble(a[3]) : 0.0;
+        std::string p;
+        bool writable = false;
+        if (!flushFdForSync(fd, p, writable)) {
+            work = []() -> Result { return errorOf("EBADF", "futime", "", "bad file descriptor"); };
+        } else {
+            work = [p, atimeSec, mtimeSec]() -> Result {
+                std::error_code ec = utimesPath(p, atimeSec, mtimeSec, /*follow=*/true);
+                if (ec) return errorFrom("futime", "", ec);
+                return std::monostate{};
+            };
+        }
+    } else if (op == "truncate") {
+        const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        const int64_t len = (a.size() > 2 && !ev::isUndefined(a[2]) && !ev::isNull(a[2]))
+                                ? saturateI64(ev::toDouble(a[2]))
+                                : 0;
+        work = [p, len]() -> Result {
+            if (len < 0) return errorFrom("truncate", p, std::make_error_code(std::errc::invalid_argument));
+            std::error_code ec;
+            fs::resize_file(u8p(p), static_cast<uintmax_t>(len), ec);
+            if (ec) return errorFrom("truncate", p, ec);
+            return std::monostate{};
+        };
+    } else if (op == "ftruncate") {
+        const int fd = a.size() > 1 ? i32At(a, 1) : -1;
+        const int64_t len = (a.size() > 2 && !ev::isUndefined(a[2]) && !ev::isNull(a[2]))
+                                ? saturateI64(ev::toDouble(a[2]))
+                                : 0;
+        work = [fd, len]() -> Result {
+            std::string p;
+            std::error_code ec;
+            if (!truncateFd(fd, len, p, ec)) {
+                return errorOf("EBADF", "ftruncate", "", "bad file descriptor");
+            }
+            if (ec) return errorFrom("ftruncate", p, ec);
+            return std::monostate{};
+        };
+    } else if (op == "symlink") {
+        const std::string target = argString(a, 1);
+        const std::string resolvedTarget = resolveFsPathOnThread(target, false);
+        const std::string linkPath = resolveFsPathOnThread(argString(a, 2), true);
+        const std::string type = argString(a, 3);
+        work = [target, resolvedTarget, linkPath, type]() -> Result {
+            bool isDir = (type == "dir" || type == "junction");
+            if (!isDir && type != "file") {
+                std::error_code targetEc;
+                isDir = fs::is_directory(u8p(resolvedTarget), targetEc);
+            }
+            std::error_code ec;
+            if (isDir) fs::create_directory_symlink(u8p(target), u8p(linkPath), ec);
+            else fs::create_symlink(u8p(target), u8p(linkPath), ec);
+            if (ec) return errorFrom("symlink", linkPath, ec);
+            return std::monostate{};
+        };
     } else if (op == "mkdtemp") {
         const std::string prefix = argString(a, 1);
         const std::string p = resolveFsPathOnThread(prefix, true);

@@ -3,17 +3,19 @@
 #include "api/fs_async.h"
 #include "api/object_builder.h"
 
+#include <chrono>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <random>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <sstream>
-#include <filesystem>
-#include <chrono>
-#include <random>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -192,6 +194,25 @@ std::string getEncoding(std::span<const bronze::Value> a, size_t idx)
     return "";
 }
 
+bronze::Value makeU8(std::span<const uint8_t> bytes)
+{
+    bronze::Value v = ev::createTypedArray(elements::Uint8, static_cast<uint32_t>(bytes.size()));
+    ev::fillTypedArray(v, bytes);
+    return v;
+}
+
+std::optional<bronze::embed::TypedArrayInfo> getBufferOrTypedArrayInfo(bronze::Value val)
+{
+    if (auto info = ev::typedArrayInfo(val)) return info;
+    if (ev::isObject(val)) {
+        bronze::Value u8 = ev::getProperty(val, "_u8");
+        if (auto info = ev::typedArrayInfo(u8)) return info;
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
 bronze::Value throwFsError(const char* syscall, const char* path, const std::error_code& ec)
 {
     const char* code = fsErrorCode(ec);
@@ -216,31 +237,6 @@ bronze::Value throwErrno(const char* syscall, const char* path, const char* code
     if (path) err.set("path", ev::fromUtf8(path));
     return ev::throwValue(err.get());
 }
-
-bronze::Value makeU8(std::span<const uint8_t> bytes)
-{
-    bronze::Value v = ev::createTypedArray(elements::Uint8, static_cast<uint32_t>(bytes.size()));
-    ev::fillTypedArray(v, bytes);
-    return v;
-}
-
-struct OpenFile {
-    std::fstream stream;
-    std::string path;
-    bool writable = false;
-};
-
-std::mutex g_fdMutex;
-std::map<int, std::unique_ptr<OpenFile>> g_fds;
-int g_nextFd = 3;
-
-OpenFile* lookupFd(int fd)
-{
-    auto it = g_fds.find(fd);
-    return it == g_fds.end() ? nullptr : it->second.get();
-}
-
-} // namespace
 
 std::string resolveAssetPath(const std::string& path)
 {
@@ -296,287 +292,6 @@ static bronze::Value js_readFileSync(bronze::Value, std::span<const bronze::Valu
     return makeU8(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
 }
 
-// openSync(path[, flags]) -> fd
-static bronze::Value js_openSync(bronze::Value, std::span<const bronze::Value> a)
-{
-    if (a.empty()) return ev::throwTypeError("openSync: path required");
-
-    std::string rawPath = ev::toUtf8(a[0]);
-    std::string resolved = resolveFsPath(rawPath.c_str());
-
-    std::string flags = "r";
-    if (a.size() >= 2 && ev::isString(a[1])) {
-        flags = ev::toUtf8(a[1]);
-    }
-
-    std::ios::openmode mode = std::ios::binary;
-    bool writable = false;
-    if (flags == "r") {
-        mode |= std::ios::in;
-    } else if (flags == "r+") {
-        mode |= std::ios::in | std::ios::out;
-        writable = true;
-    } else if (flags == "w") {
-        mode |= std::ios::out | std::ios::trunc;
-        writable = true;
-    } else if (flags == "w+") {
-        mode |= std::ios::in | std::ios::out | std::ios::trunc;
-        writable = true;
-    } else if (flags == "a" || flags == "a+") {
-        mode |= std::ios::out | std::ios::app;
-        if (flags == "a+") mode |= std::ios::in;
-        writable = true;
-    } else {
-        return ev::throwTypeError(("openSync: unsupported flags '" + flags + "'").c_str());
-    }
-
-    std::error_code existsEc;
-    if (flags == "r+" && !fs::exists(u8p(resolved), existsEc)) {
-        return throwErrno("open", resolved.c_str(), "ENOENT",
-                          ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
-    }
-
-    auto file = std::make_unique<OpenFile>();
-    file->stream.open(u8p(resolved), mode);
-    if (!file->stream.is_open()) {
-        return throwErrno("open", resolved.c_str(), "ENOENT",
-                          ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
-    }
-    file->path = resolved;
-    file->writable = writable;
-
-    std::lock_guard<std::mutex> lock(g_fdMutex);
-    int fd = g_nextFd++;
-    g_fds[fd] = std::move(file);
-    return ev::fromDouble(fd);
-}
-
-static std::optional<bronze::embed::TypedArrayInfo> getBufferOrTypedArrayInfo(bronze::Value val)
-{
-    if (auto info = ev::typedArrayInfo(val)) return info;
-    if (ev::isObject(val)) {
-        bronze::Value u8 = ev::getProperty(val, "_u8");
-        if (auto info = ev::typedArrayInfo(u8)) return info;
-    }
-    return std::nullopt;
-}
-
-// [offset, offset + length) inside a buffer of byteLength bytes, checked
-// without forming offset + length (two script-sized int64s can overflow it
-// back into range).
-static bool windowFits(int64_t offset, int64_t length, size_t byteLength)
-{
-    if (offset < 0 || length < 0) return false;
-    const uint64_t cap = static_cast<uint64_t>(byteLength);
-    return static_cast<uint64_t>(offset) <= cap &&
-           static_cast<uint64_t>(length) <= cap - static_cast<uint64_t>(offset);
-}
-
-// readSync(fd, buffer, offset, length[, position]) -> bytes read
-static bronze::Value js_readSync(bronze::Value, std::span<const bronze::Value> a)
-{
-    if (a.size() < 2) return ev::throwTypeError("readSync: fd and buffer required");
-
-    int32_t fd = i32At(a, 0);
-    auto info = getBufferOrTypedArrayInfo(a[1]);
-    if (!info) return ev::throwTypeError("readSync: buffer must be a typed array");
-
-    uint8_t* base = info->data;
-    size_t byteLength = info->byteLength;
-
-    int64_t offset = 0, length = static_cast<int64_t>(byteLength);
-    if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
-        offset = saturateI64(ev::toDouble(a[2]));
-    }
-    if (a.size() >= 4 && !ev::isUndefined(a[3]) && !ev::isNull(a[3])) {
-        length = saturateI64(ev::toDouble(a[3]));
-    }
-    if (!windowFits(offset, length, byteLength)) {
-        return ev::throwRangeError("readSync: offset/length out of buffer bounds");
-    }
-
-    bool seek = false;
-    int64_t position = 0;
-    if (a.size() >= 5 && !ev::isUndefined(a[4]) && !ev::isNull(a[4])) {
-        position = saturateI64(ev::toDouble(a[4]));
-        if (position >= 0) seek = true;
-    }
-
-    // The option reads above can run user code (valueOf) and allocate, so
-    // the buffer's address is taken again, and its bounds rechecked, here.
-    info = getBufferOrTypedArrayInfo(a[1]);
-    if (!info || !windowFits(offset, length, info->byteLength))
-        return ev::throwRangeError("readSync: buffer changed size during the call");
-    base = info->data;
-
-    std::lock_guard<std::mutex> lock(g_fdMutex);
-    OpenFile* file = lookupFd(fd);
-    if (!file) return throwErrno("read", nullptr, "EBADF", "EBADF: bad file descriptor, read");
-
-    file->stream.clear();
-    if (seek) file->stream.seekg(static_cast<std::streamoff>(position), std::ios::beg);
-    if (!file->stream) {
-        return throwErrno("read", file->path.c_str(), "EINVAL", "EINVAL: invalid position, read");
-    }
-
-    file->stream.read(reinterpret_cast<char*>(base + offset),
-                      static_cast<std::streamsize>(length));
-    std::streamsize got = file->stream.gcount();
-    file->stream.clear();
-    return ev::fromDouble(static_cast<double>(got));
-}
-
-// writeSync(fd, buffer, offset, length[, position]) -> bytes written
-static bronze::Value js_writeSync(bronze::Value, std::span<const bronze::Value> a)
-{
-    if (a.size() < 2) return ev::throwTypeError("writeSync: fd and buffer required");
-
-    int32_t fd = i32At(a, 0);
-    auto info = getBufferOrTypedArrayInfo(a[1]);
-    if (!info) return ev::throwTypeError("writeSync: buffer must be a typed array");
-
-    uint8_t* base = info->data;
-    size_t byteLength = info->byteLength;
-
-    int64_t offset = 0, length = static_cast<int64_t>(byteLength);
-    if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
-        offset = saturateI64(ev::toDouble(a[2]));
-    }
-    if (a.size() >= 4 && !ev::isUndefined(a[3]) && !ev::isNull(a[3])) {
-        length = saturateI64(ev::toDouble(a[3]));
-    }
-    if (!windowFits(offset, length, byteLength)) {
-        return ev::throwRangeError("writeSync: offset/length out of buffer bounds");
-    }
-
-    bool seek = false;
-    int64_t position = 0;
-    if (a.size() >= 5 && !ev::isUndefined(a[4]) && !ev::isNull(a[4])) {
-        position = saturateI64(ev::toDouble(a[4]));
-        if (position >= 0) seek = true;
-    }
-
-    info = getBufferOrTypedArrayInfo(a[1]);
-    if (!info || !windowFits(offset, length, info->byteLength))
-        return ev::throwRangeError("writeSync: buffer changed size during the call");
-    base = info->data;
-
-    std::lock_guard<std::mutex> lock(g_fdMutex);
-    OpenFile* file = lookupFd(fd);
-    if (!file) return throwErrno("write", nullptr, "EBADF", "EBADF: bad file descriptor, write");
-    if (!file->writable) {
-        return throwErrno("write", file->path.c_str(), "EBADF",
-                          "EBADF: file descriptor is not open for writing, write");
-    }
-
-    file->stream.clear();
-    if (seek) file->stream.seekp(static_cast<std::streamoff>(position), std::ios::beg);
-    file->stream.write(reinterpret_cast<const char*>(base + offset),
-                       static_cast<std::streamsize>(length));
-    if (!file->stream) {
-        return throwErrno("write", file->path.c_str(), "EIO", "EIO: write failed");
-    }
-    return ev::fromDouble(static_cast<double>(length));
-}
-
-// fstatSync(fd) -> { size, ... }
-static bronze::Value js_fstatSync(bronze::Value, std::span<const bronze::Value> a)
-{
-    if (a.empty()) return ev::throwTypeError("fstatSync: fd required");
-    int32_t fd = i32At(a, 0);
-
-    std::string path;
-    {
-        std::lock_guard<std::mutex> lock(g_fdMutex);
-        OpenFile* file = lookupFd(fd);
-        if (!file) return throwErrno("fstat", nullptr, "EBADF", "EBADF: bad file descriptor, fstat");
-        path = file->path;
-    }
-
-    std::error_code ec;
-    auto size = fs::file_size(u8p(path), ec);
-    if (ec) return throwFsError("fstat", path.c_str(), ec);
-
-    ObjectBuilder obj;
-    obj.set("size", ev::fromDouble(static_cast<double>(size)));
-    obj.set("_isFile", ev::fromBool(true));
-    obj.set("_isDirectory", ev::fromBool(false));
-    obj.set("_isSymbolicLink", ev::fromBool(false));
-    return obj.get();
-}
-
-// closeSync(fd)
-static bronze::Value js_closeSync(bronze::Value, std::span<const bronze::Value> a)
-{
-    if (a.empty()) return ev::undefined();
-    int32_t fd = i32At(a, 0);
-
-    std::lock_guard<std::mutex> lock(g_fdMutex);
-    auto it = g_fds.find(fd);
-    if (it == g_fds.end()) {
-        return throwErrno("close", nullptr, "EBADF", "EBADF: bad file descriptor, close");
-    }
-    it->second->stream.close();
-    g_fds.erase(it);
-    return ev::undefined();
-}
-
-bool flushFdForSync(int fd, std::string& path, bool& writable)
-{
-    std::lock_guard<std::mutex> lock(g_fdMutex);
-    OpenFile* file = lookupFd(fd);
-    if (!file) return false;
-    file->stream.clear();
-    if (file->writable) file->stream.flush();
-    file->stream.clear();
-    path = file->path;
-    writable = file->writable;
-    return true;
-}
-
-// An fd here is an fstream, which hands out no OS handle, so the file is
-// opened again by path and that handle synced: fsync and FlushFileBuffers
-// flush the file, whichever handle names it.
-std::error_code syncPath(const std::string& path, bool dataOnly, bool writable)
-{
-#ifdef _WIN32
-    (void)dataOnly;
-    // FlushFileBuffers needs a handle open for writing; a descriptor opened
-    // only for reading has written nothing to flush.
-    if (!writable) return {};
-    HANDLE h = CreateFileW(u8p(path).c_str(), GENERIC_WRITE,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
-        std::error_code ec(static_cast<int>(GetLastError()), std::system_category());
-        if (ec == std::errc::no_such_file_or_directory) return {};
-        return ec;
-    }
-    std::error_code ec;
-    if (!FlushFileBuffers(h)) ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
-    CloseHandle(h);
-    return ec;
-#else
-    (void)writable;
-    int h = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (h < 0) {
-        if (errno == ENOENT) return {};
-        return std::error_code(errno, std::generic_category());
-    }
-    int r;
-#if defined(__APPLE__)
-    (void)dataOnly;
-    r = ::fsync(h);
-#else
-    r = dataOnly ? ::fdatasync(h) : ::fsync(h);
-#endif
-    std::error_code ec;
-    if (r != 0) ec = std::error_code(errno, std::generic_category());
-    ::close(h);
-    return ec;
-#endif
-}
-
 std::string makeTempDir(const std::string& resolvedPrefix, std::error_code& ec)
 {
     static const char kChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -604,22 +319,6 @@ std::string makeTempDir(const std::string& resolvedPrefix, std::error_code& ec)
     }
     ec = std::make_error_code(std::errc::file_exists);
     return {};
-}
-
-// fsyncSync(fd[, dataOnly])
-static bronze::Value js_fsyncSync(bronze::Value, std::span<const bronze::Value> a)
-{
-    int32_t fd = a.empty() ? -1 : i32At(a, 0);
-    const bool dataOnly = a.size() >= 2 && ev::isBool(a[1]) && ev::toBool(a[1]);
-    const char* syscall = dataOnly ? "fdatasync" : "fsync";
-    std::string path;
-    bool writable = false;
-    if (!flushFdForSync(fd, path, writable)) {
-        return throwErrno(syscall, nullptr, "EBADF", (std::string("EBADF: bad file descriptor, ") + syscall).c_str());
-    }
-    std::error_code ec = syncPath(path, dataOnly, writable);
-    if (ec) return throwFsError(syscall, nullptr, ec);
-    return ev::undefined();
 }
 
 // mkdtempSync(prefix) -> the directory made
@@ -706,52 +405,12 @@ static bronze::Value js_statSync(bronze::Value, std::span<const bronze::Value> a
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
 
-    const fs::path p = u8p(resolved);
+    StatFields sf;
     std::error_code ec;
-    auto status = fs::status(p, ec);
-    if (ec) {
+    if (!statPathFields(resolved, /*follow=*/true, sf, ec)) {
         return throwFsError("stat", resolved.c_str(), ec);
     }
-
-    auto fileSize = fs::file_size(p, ec);
-    if (ec) fileSize = 0;
-
-    auto mtime = fs::last_write_time(p, ec);
-    double mtimeMs = 0;
-    if (!ec) mtimeMs = fileTimeToUnixMs(mtime);
-
-    bool isFile = fs::is_regular_file(status);
-    bool isDir = fs::is_directory(status);
-    bool isSymlink = false;
-    {
-        auto lstatus = fs::symlink_status(p, ec);
-        if (!ec) isSymlink = fs::is_symlink(lstatus);
-    }
-
-    int mode = 0;
-#ifdef _WIN32
-    DWORD attrs = GetFileAttributesW(p.c_str());
-    if (attrs != INVALID_FILE_ATTRIBUTES) {
-        mode = 0444;
-        if (!(attrs & FILE_ATTRIBUTE_READONLY)) mode |= 0222;
-        if (isDir) mode |= 0111;
-    }
-#else
-    struct stat st;
-    if (::stat(resolved.c_str(), &st) == 0) {
-        mode = st.st_mode & 07777;
-    }
-#endif
-
-    ObjectBuilder obj;
-    obj.set("size", ev::fromDouble(static_cast<double>(fileSize)));
-    obj.set("mtimeMs", ev::fromDouble(mtimeMs));
-    obj.set("mode", ev::fromDouble(mode));
-    obj.set("_isFile", ev::fromBool(isFile));
-    obj.set("_isDirectory", ev::fromBool(isDir));
-    obj.set("_isSymbolicLink", ev::fromBool(isSymlink));
-
-    return obj.get();
+    return statFieldsToJs(sf);
 }
 
 // lstatSync(path)
@@ -762,28 +421,12 @@ static bronze::Value js_lstatSync(bronze::Value, std::span<const bronze::Value> 
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
 
-    const fs::path p = u8p(resolved);
+    StatFields sf;
     std::error_code ec;
-    auto status = fs::symlink_status(p, ec);
-    if (ec) {
+    if (!statPathFields(resolved, /*follow=*/false, sf, ec)) {
         return throwFsError("lstat", resolved.c_str(), ec);
     }
-
-    auto fileSize = fs::file_size(p, ec);
-    if (ec) fileSize = 0;
-
-    bool isFile = fs::is_regular_file(status);
-    bool isDir = fs::is_directory(status);
-    bool isSymlink = fs::is_symlink(status);
-
-    ObjectBuilder obj;
-    obj.set("size", ev::fromDouble(static_cast<double>(fileSize)));
-    obj.set("mode", ev::fromDouble(0));
-    obj.set("_isFile", ev::fromBool(isFile));
-    obj.set("_isDirectory", ev::fromBool(isDir));
-    obj.set("_isSymbolicLink", ev::fromBool(isSymlink));
-
-    return obj.get();
+    return statFieldsToJs(sf);
 }
 
 // readdirSync(path[, options])
@@ -897,7 +540,7 @@ static bronze::Value js_rmSync(bronze::Value, std::span<const bronze::Value> a)
 
     std::error_code ec;
     const fs::path p = u8p(resolved);
-    if (!fs::exists(p, ec) && force) {
+    if (!fs::exists(fs::symlink_status(p, ec)) && force) {
         return ev::undefined();
     }
 
@@ -1000,6 +643,69 @@ static bronze::Value js_realpathSync(bronze::Value, std::span<const bronze::Valu
     return ev::fromUtf8(u8s(canonical));
 }
 
+// utimesSync(path, atimeSec, mtimeSec[, follow])
+static bronze::Value js_utimesSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.size() < 3) return ev::throwTypeError("utimesSync: path, atime, and mtime required");
+
+    std::string resolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
+    const double atimeSec = ev::toDouble(a[1]);
+    const double mtimeSec = ev::toDouble(a[2]);
+    const bool follow = !(a.size() >= 4 && ev::isBool(a[3]) && !ev::toBool(a[3]));
+    const char* syscall = follow ? "utime" : "lutime";
+    if (!std::isfinite(atimeSec) || !std::isfinite(mtimeSec)) {
+        return ev::throwTypeError("utimesSync: atime and mtime must be finite numbers");
+    }
+
+    std::error_code ec = utimesPath(resolved, atimeSec, mtimeSec, follow);
+    if (ec) return throwFsError(syscall, resolved.c_str(), ec);
+    return ev::undefined();
+}
+
+// truncateSync(path[, len])
+static bronze::Value js_truncateSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.empty()) return ev::throwTypeError("truncateSync: path required");
+
+    std::string resolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
+    int64_t len = (a.size() >= 2 && !ev::isUndefined(a[1]) && !ev::isNull(a[1]))
+                      ? saturateI64(ev::toDouble(a[1]))
+                      : 0;
+    if (len < 0) {
+        return throwFsError("truncate", resolved.c_str(), std::make_error_code(std::errc::invalid_argument));
+    }
+
+    std::error_code ec;
+    fs::resize_file(u8p(resolved), static_cast<uintmax_t>(len), ec);
+    if (ec) return throwFsError("truncate", resolved.c_str(), ec);
+    return ev::undefined();
+}
+
+// symlinkSync(target, path[, type])
+static bronze::Value js_symlinkSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.size() < 2) return ev::throwTypeError("symlinkSync: target and path required");
+
+    std::string target = ev::toUtf8(a[0]);
+    std::string resolvedPath = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
+    std::string type = (a.size() >= 3 && ev::isString(a[2])) ? ev::toUtf8(a[2]) : "";
+
+    bool isDir = (type == "dir" || type == "junction");
+    if (!isDir && type != "file") {
+        std::error_code targetEc;
+        isDir = fs::is_directory(u8p(resolveFsPath(target.c_str())), targetEc);
+    }
+
+    std::error_code ec;
+    if (isDir) {
+        fs::create_directory_symlink(u8p(target), u8p(resolvedPath), ec);
+    } else {
+        fs::create_symlink(u8p(target), u8p(resolvedPath), ec);
+    }
+    if (ec) return throwFsError("symlink", resolvedPath.c_str(), ec);
+    return ev::undefined();
+}
+
 void installFS()
 {
     ev::setGlobalFunction("__brokit_fs_readFileSync", 2, js_readFileSync);
@@ -1017,13 +723,11 @@ void installFS()
     ev::setGlobalFunction("__brokit_fs_copyFileSync", 2, js_copyFileSync);
     ev::setGlobalFunction("__brokit_fs_chmodSync", 2, js_chmodSync);
     ev::setGlobalFunction("__brokit_fs_realpathSync", 1, js_realpathSync);
-    ev::setGlobalFunction("__brokit_fs_openSync", 2, js_openSync);
-    ev::setGlobalFunction("__brokit_fs_readSync", 5, js_readSync);
-    ev::setGlobalFunction("__brokit_fs_writeSync", 5, js_writeSync);
-    ev::setGlobalFunction("__brokit_fs_fstatSync", 1, js_fstatSync);
-    ev::setGlobalFunction("__brokit_fs_closeSync", 1, js_closeSync);
-    ev::setGlobalFunction("__brokit_fs_fsyncSync", 2, js_fsyncSync);
     ev::setGlobalFunction("__brokit_fs_mkdtempSync", 1, js_mkdtempSync);
+    ev::setGlobalFunction("__brokit_fs_utimesSync", 4, js_utimesSync);
+    ev::setGlobalFunction("__brokit_fs_truncateSync", 2, js_truncateSync);
+    ev::setGlobalFunction("__brokit_fs_symlinkSync", 3, js_symlinkSync);
+    installFSFd();
     installFSAsync();
 
     bronze::embed::runEntry(bronze_fs_main);
