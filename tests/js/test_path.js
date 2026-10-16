@@ -117,7 +117,9 @@ if (!GC_STRESS) (function() {
         for (var r = 0; r < 25; r++) for (var k = 0; k < names.length; k++) path.join(dir, names[k]);
         best = Math.min(best, (Date.now() - t0) * 1000 / (25 * names.length));
     }
-    assert(best < 1.5, 'path.join costs ' + best.toFixed(2) + ' us a call (limit 1.5)');
+    var unopt = !!(process.env.BROKIT_UNOPTIMIZED && process.env.BROKIT_UNOPTIMIZED !== '0');
+    var limit = unopt ? 10.0 : 1.5;
+    assert(best < limit, 'path.join costs ' + best.toFixed(2) + ' us a call (limit ' + limit + ')');
 })();
 
 // parse

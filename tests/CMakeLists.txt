@@ -46,9 +46,14 @@ foreach(js ${BROKIT_JS_TESTS})
     # databases, fs scratch trees) must not be shared by two copies of it
     # running at once under `ctest -j`.
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/run/${name}" "${CMAKE_CURRENT_BINARY_DIR}/run/${name}_gcstress")
+    set(_brokit_unopt "0")
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_CXX_FLAGS MATCHES "coverage")
+        set(_brokit_unopt "1")
+    endif()
     add_test(NAME ${name} COMMAND brokit_test "${js}")
     set_tests_properties(${name} PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/run/${name}")
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/run/${name}"
+        ENVIRONMENT "BROKIT_UNOPTIMIZED=${_brokit_unopt}")
     # The same script with a collection at every allocation and freed space
     # poisoned: a binding that holds a raw Value across an allocating call
     # reads garbage here instead of passing by luck. `ctest -LE gcstress`
@@ -56,6 +61,6 @@ foreach(js ${BROKIT_JS_TESTS})
     add_test(NAME ${name}_gcstress COMMAND brokit_test "${js}")
     set_tests_properties(${name}_gcstress PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/run/${name}_gcstress"
-        ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1"
+        ENVIRONMENT "BRONZE_GC_STRESS=1;BRONZE_GC_POISON=1;BROKIT_UNOPTIMIZED=${_brokit_unopt}"
         LABELS gcstress)
 endforeach()
