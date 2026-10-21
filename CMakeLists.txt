@@ -140,6 +140,15 @@ if(NOT TARGET sqlite3)
     endif()
 endif()
 
+# llhttp — Node.js official HTTP/1.1 C parser
+if(NOT TARGET llhttp)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llhttp/CMakeLists.txt")
+        add_subdirectory(third_party/llhttp EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR "llhttp not found. Place llhttp sources in third_party/llhttp/")
+    endif()
+endif()
+
 add_subdirectory(src)
 enable_testing()
 add_subdirectory(tests)

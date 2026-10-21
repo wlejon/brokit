@@ -126,6 +126,7 @@ Runtime::Runtime()
     for (const auto& candidate : {
         fs::current_path() / "src/api/brokit.globals",
         fs::current_path() / "brokit.globals",
+        fs::current_path().parent_path() / "brokit/src/api/brokit.globals",
         fs::path(__FILE__).parent_path().parent_path() / "api/brokit.globals"
     }) {
         if (fs::exists(candidate)) {

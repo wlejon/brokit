@@ -261,6 +261,10 @@ void installAll()
     installNet();
     installNetJS();
     installWebSocketServerJS();
+    installHttp();
+    installHttpJS();
+    installSqlite();
+    installSqliteJS();
 
     // require() must come last — after all modules are installed
     installRequire();

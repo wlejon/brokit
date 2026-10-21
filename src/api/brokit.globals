@@ -80,6 +80,8 @@ events
 EventEmitter
 net
 dgram
+http
+sqlite
 util
 
 # Bro ecosystem extensions

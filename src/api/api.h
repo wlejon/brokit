@@ -154,6 +154,14 @@ void installNetJS();
 /// RFC 6455 WebSocketServer over the `net` module. Requires installNetJS,
 /// installEncoding, installBase64, and installTimers to have run first.
 void installWebSocketServerJS();
+/// Native HTTP/1.1 parser bindings over llhttp (__brokit_http_parser_*).
+void installHttp();
+/// Node-compat `http` module over installHttp + the `net` module.
+void installHttpJS();
+/// Native SQLite bindings over the bundled sqlite3 (__brokit_sqlite_*).
+void installSqlite();
+/// Node-compat `sqlite` (`node:sqlite`) module over installSqlite.
+void installSqliteJS();
 void installEventSource();
 void installFormData();
 void installFetchClasses();

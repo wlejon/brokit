@@ -64,6 +64,8 @@ else()
     bronze_compile_js(net                bronze_net_main)
     bronze_compile_js(dgram              bronze_dgram_main)
     bronze_compile_js(websocket_server   bronze_websocket_server_main)
+    bronze_compile_js(http               bronze_http_main)
+    bronze_compile_js(sqlite             bronze_sqlite_main)
 endif()
 
 ## ── Library ──────────────────────────────────────────────────────────────────
@@ -118,6 +120,10 @@ set(BROKIT_API_SOURCES
     net.cpp
     net_js.cpp
     websocket_server_js.cpp
+    http.cpp
+    http_js.cpp
+    sqlite.cpp
+    sqlite_js.cpp
 )
 
 if(BROKIT_ENABLE_NOISE)
@@ -152,6 +158,7 @@ target_link_libraries(brokit_api PUBLIC brokit_runtime)
 target_link_libraries(brokit_api PUBLIC libcurl_static)
 target_link_libraries(brokit_api PUBLIC sqlite3)
 target_link_libraries(brokit_api PRIVATE miniz)
+target_link_libraries(brokit_api PRIVATE llhttp)
 target_link_libraries(brokit_api PUBLIC bronze::runtime_shared)
 
 if(BROKIT_ENABLE_NOISE)

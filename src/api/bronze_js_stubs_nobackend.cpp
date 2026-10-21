@@ -93,4 +93,6 @@ void bronze_compression_main() { evaluatePolyfill("compression"); }
 void bronze_net_main() { evaluatePolyfill("net"); }
 void bronze_dgram_main() { evaluatePolyfill("dgram"); }
 void bronze_websocket_server_main() { evaluatePolyfill("websocket_server"); }
+void bronze_http_main() { evaluatePolyfill("http"); }
+void bronze_sqlite_main() { evaluatePolyfill("sqlite"); }
 }
