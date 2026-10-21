@@ -102,7 +102,7 @@ endif()
 option(BROKIT_ENABLE_NOISE "Build FastNoise2 noise API" ON)
 if(BROKIT_ENABLE_NOISE)
     if(NOT TARGET FastNoise)
-        bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF ba93f17ec40a9d09066c8d07b3e72b789e5b5657 THIRD_PARTY
+        bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF bf7a921b6d172c001ee1597a1dc1d0ae5fc36fcc THIRD_PARTY
                        TARGET FastNoise SOURCE_ONLY)
         # FastNoise2 fetches FastSIMD through the CPM.cmake copy vendored next
         # to it. CPM caches CPM_DIRECTORY and early-returns (defining nothing)
@@ -117,7 +117,7 @@ if(BROKIT_ENABLE_NOISE)
             unset(CPM_VERSION CACHE)
         endif()
     endif()
-    bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF ba93f17ec40a9d09066c8d07b3e72b789e5b5657 THIRD_PARTY TARGET FastNoise
+    bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF bf7a921b6d172c001ee1597a1dc1d0ae5fc36fcc THIRD_PARTY TARGET FastNoise
                    OPTIONS FASTNOISE2_NOISETOOL=OFF FASTNOISE2_TESTS=OFF)
 endif()
 

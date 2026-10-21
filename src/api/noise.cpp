@@ -6,6 +6,7 @@
 #include <FastNoise/FastNoise.h>
 #include <FastNoise/Metadata.h>
 
+#include <memory>
 #include <vector>
 #include <cstdint>
 #include <cstring>
@@ -14,8 +15,14 @@
 
 namespace brokit::api {
 
+// A node and its tree as data (FastNoise's NodeData, mirroring every set),
+// so encode() can hand the tree on as the string NewFromEncodedNodeTree
+// reads: to another thread or process, or to a file. A source's data is
+// held by the node it is set on.
 struct NoiseWrapper {
     FastNoise::SmartNode<> node;
+    std::shared_ptr<FastNoise::NodeData> data;
+    std::vector<std::shared_ptr<FastNoise::NodeData>> lookups, hybrids;   // the sources' data, a slot each
 };
 
 static HostClass g_fastNoiseClass;
@@ -32,13 +39,29 @@ static NoiseWrapper* getNoise(bronze::Value v)
     return static_cast<NoiseWrapper*>(g_fastNoiseClass.unwrap(v));
 }
 
+static bronze::Value wrap(NoiseWrapper* w)
+{
+    w->lookups.resize(w->data->nodeLookups.size());
+    w->hybrids.resize(w->data->hybrids.size());
+    return g_fastNoiseClass.make(w, fastNoiseDtor);
+}
+
 static bronze::Value wrapNode(FastNoise::SmartNode<> node)
 {
     if (!node)
         return ev::throwTypeError("Failed to create FastNoise node");
 
-    auto* w = new NoiseWrapper{std::move(node)};
-    return g_fastNoiseClass.make(w, fastNoiseDtor);
+    // The node takes its metadata's defaults, the ones its data starts
+    // with: a class's own default can differ (DistanceToPoint's distance
+    // function is EuclideanSquared, its metadata's Euclidean), and the node
+    // here must make the noise its encoding decodes to.
+    const auto& meta = node->GetMetadata();
+    auto data = std::make_shared<FastNoise::NodeData>(&meta);
+    for (size_t vi = 0; vi < meta.memberVariables.size(); vi++)
+        meta.memberVariables[vi].setFunc(node.get(), data->variables[vi]);
+    for (size_t hi = 0; hi < meta.memberHybrids.size(); hi++)
+        meta.memberHybrids[hi].setValueFunc(node.get(), data->hybrids[hi].second);
+    return wrap(new NoiseWrapper{std::move(node), std::move(data), {}, {}});
 }
 
 static bronze::Value make_float32_array(const float* data, size_t count)
@@ -144,19 +167,27 @@ static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronz
     std::string name = ev::toUtf8(args[0]);
     const auto& meta = w->node->GetMetadata();
     bronze::Value val = args[1];
+    using Value = FastNoise::Metadata::MemberVariable::ValueUnion;
+    FastNoise::NodeData& data = *w->data;
 
-    for (const auto& mv : meta.memberVariables) {
+    for (size_t vi = 0; vi < meta.memberVariables.size(); vi++) {
+        const auto& mv = meta.memberVariables[vi];
         if (!memberNameMatches(name.c_str(), mv)) continue;
+        const auto setVariable = [&](Value v) {
+            if (!mv.setFunc(w->node.get(), v)) return false;
+            data.variables[vi] = v;
+            return true;
+        };
         if (mv.type == FastNoise::Metadata::MemberVariable::EFloat) {
             if (!ev::isDouble(val)) return ev::throwTypeError("expected number");
             double d = ev::toDouble(val);
-            return mv.setFunc(w->node.get(), FastNoise::Metadata::MemberVariable::ValueUnion(static_cast<float>(d)))
+            return setVariable(Value(static_cast<float>(d)))
                 ? ev::undefined() : ev::throwTypeError("Failed to set variable");
         }
         if (mv.type == FastNoise::Metadata::MemberVariable::EInt) {
             if (!ev::isDouble(val)) return ev::throwTypeError("expected number");
             int32_t i = saturateI32(ev::toDouble(val));
-            return mv.setFunc(w->node.get(), FastNoise::Metadata::MemberVariable::ValueUnion(static_cast<int>(i)))
+            return setVariable(Value(static_cast<int>(i)))
                 ? ev::undefined() : ev::throwTypeError("Failed to set variable");
         }
         if (mv.type == FastNoise::Metadata::MemberVariable::EEnum) {
@@ -172,27 +203,40 @@ static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronz
                 }
                 if (i < 0) return ev::throwRangeError("Unknown enum value");
             } else return ev::throwTypeError("Enum expects int or string");
-            return mv.setFunc(w->node.get(), FastNoise::Metadata::MemberVariable::ValueUnion(static_cast<int>(i)))
+            return setVariable(Value(static_cast<int>(i)))
                 ? ev::undefined() : ev::throwTypeError("Failed to set enum");
         }
         return ev::throwTypeError("Unknown variable type");
     }
-    for (const auto& mn : meta.memberNodeLookups) {
+    for (size_t ni = 0; ni < meta.memberNodeLookups.size(); ni++) {
+        const auto& mn = meta.memberNodeLookups[ni];
         if (!memberNameMatches(name.c_str(), mn)) continue;
         auto* sw = getNoise(val);
         if (!sw) return ev::throwTypeError("Node input requires a FastNoise node");
-        return mn.setFunc(w->node.get(), sw->node)
-            ? ev::undefined() : ev::throwTypeError("Failed to set node source (type mismatch)");
+        if (!mn.setFunc(w->node.get(), sw->node))
+            return ev::throwTypeError("Failed to set node source (type mismatch)");
+        data.nodeLookups[ni] = sw->data.get();
+        w->lookups[ni] = sw->data;
+        return ev::undefined();
     }
-    for (const auto& mh : meta.memberHybrids) {
+    for (size_t hi = 0; hi < meta.memberHybrids.size(); hi++) {
+        const auto& mh = meta.memberHybrids[hi];
         if (!memberNameMatches(name.c_str(), mh)) continue;
         auto* sw = getNoise(val);
-        if (sw) return mh.setNodeFunc(w->node.get(), sw->node)
-            ? ev::undefined() : ev::throwTypeError("Failed to set hybrid node source");
+        if (sw) {
+            if (!mh.setNodeFunc(w->node.get(), sw->node))
+                return ev::throwTypeError("Failed to set hybrid node source");
+            data.hybrids[hi].first = sw->data.get();
+            w->hybrids[hi] = sw->data;
+            return ev::undefined();
+        }
         if (!ev::isDouble(val)) return ev::throwTypeError("expected number");
         double d = ev::toDouble(val);
-        return mh.setValueFunc(w->node.get(), static_cast<float>(d))
-            ? ev::undefined() : ev::throwTypeError("Failed to set hybrid value");
+        if (!mh.setValueFunc(w->node.get(), static_cast<float>(d)))
+            return ev::throwTypeError("Failed to set hybrid value");
+        data.hybrids[hi] = {nullptr, static_cast<float>(d)};
+        w->hybrids[hi].reset();
+        return ev::undefined();
     }
     return ev::throwError("No member '" + name + "' on this node type");
 }
@@ -513,18 +557,29 @@ static bronze::Value fast_noise_gen_tileable2_d(bronze::Value thisVal, std::span
     return make_float32_array(output.data(), count);
 }
 
+static bronze::Value fast_noise_encode(bronze::Value thisVal, std::span<const bronze::Value>)
+{
+    auto* w = getNoise(thisVal);
+    if (!w) return ev::throwTypeError("receiver is not a FastNoise instance");
+    std::string encoded = FastNoise::Metadata::SerialiseNodeData(w->data.get());
+    if (encoded.empty()) return ev::throwError("encode: the node tree has an unset source");
+    return ev::fromUtf8(encoded);
+}
+
 static bronze::Value js_fast_noise_constructor(bronze::Value, std::span<const bronze::Value> args)
 {
     if (args.empty() || !ev::isString(args[0]))
         return ev::throwTypeError("FastNoise: expected encoded node tree string");
-    
+
     std::string encoded = ev::toUtf8(args[0]);
     auto node = FastNoise::NewFromEncodedNodeTree(encoded.c_str());
-    if (!node)
+    // The tree as data: every node's, owned together, the root's shared.
+    auto owned = std::make_shared<std::vector<std::unique_ptr<FastNoise::NodeData>>>();
+    FastNoise::NodeData* root = FastNoise::Metadata::DeserialiseNodeData(encoded.c_str(), *owned);
+    if (!node || !root)
         return ev::throwTypeError("FastNoise: invalid encoded node tree");
-    
-    auto* w = new NoiseWrapper{std::move(node)};
-    return g_fastNoiseClass.make(w, fastNoiseDtor);
+
+    return wrap(new NoiseWrapper{std::move(node), std::shared_ptr<FastNoise::NodeData>(owned, root), {}, {}});
 }
 
 void installNoise()
@@ -532,6 +587,7 @@ void installNoise()
     g_fastNoiseClass.install("FastNoise", 1, js_fast_noise_constructor, [](ObjectBuilder& proto) {
         proto.def("set", 2, fast_noise_set);
         proto.def("getMembers", 0, fast_noise_get_members);
+        proto.def("encode", 0, fast_noise_encode);
         proto.def("genSingle2D", 3, fast_noise_gen_single2_d);
         proto.def("genSingle3D", 4, fast_noise_gen_single3_d);
         proto.def("genUniformGrid2D", 6, fast_noise_gen_uniform_grid2_d);
