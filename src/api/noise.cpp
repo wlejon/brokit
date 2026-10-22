@@ -300,8 +300,9 @@ static bronze::Value fast_noise_gen_single2_d(bronze::Value thisVal, std::span<c
     double y = reader.getDouble(1, 0.0);
     int32_t seed = reader.getInt(2, 0);
 
-    return ev::fromDouble(w->node->GenSingle2D(
-        static_cast<float>(x), static_cast<float>(y), seed));
+    // (At the point itself, a double: FastNoise2 splits it into its cell and
+    // fraction, so a point 6371 km out keeps its fine octaves.)
+    return ev::fromDouble(w->node->GenSingle2D(x, y, seed));
 }
 
 static bronze::Value fast_noise_gen_single3_d(bronze::Value thisVal, std::span<const bronze::Value> args)
@@ -317,9 +318,7 @@ static bronze::Value fast_noise_gen_single3_d(bronze::Value thisVal, std::span<c
     double z = reader.getDouble(2, 0.0);
     int32_t seed = reader.getInt(3, 0);
 
-    return ev::fromDouble(w->node->GenSingle3D(
-        static_cast<float>(x), static_cast<float>(y),
-        static_cast<float>(z), seed));
+    return ev::fromDouble(w->node->GenSingle3D(x, y, z, seed));
 }
 
 static bronze::Value fast_noise_gen_uniform_grid2_d(bronze::Value thisVal, std::span<const bronze::Value> args)
