@@ -212,6 +212,8 @@ static TestResult runTestFile(const std::string& path) {
         auto doneFn = ev::globalValue("__test_onDone");
         if (doneFn.found && ev::isFunction(doneFn.value)) {
             ev::Persistent fn{doneFn.value};
+            // The files share one realm: the hook is this file's alone.
+            ev::setGlobalValue("__test_onDone", ev::undefined());
             auto r = ev::call(fn.get(), ev::undefined(), {});
             rt.executePendingJobs();
             if (r.thrown) {
