@@ -14,8 +14,9 @@
 // in one shader) and compiles to SPIR-V like any other shader.
 //
 // Not yet ported: SuperSimplex, the Cellular nodes, the domain warps, and
-// 4D (a 3D field through AddDimension). A tree that uses one is refused with
-// the node's name.
+// 4D (a 3D field through AddDimension). Not a field: ConvertRGBA8 (a colour
+// packed in the float's bits, NaNs among them, which a GPU need not keep).
+// A tree that uses one is refused with the node's name.
 
 #include <string>
 

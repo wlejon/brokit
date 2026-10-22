@@ -497,12 +497,6 @@ private:
             b += "    float r = toMin + ((s - fromMin) / (fromMax - fromMin) * (toMax - toMin));\n";
             if (ivar(n, "Clamp Output", 0) == 1) b += "    r = min(max(r, toMin), toMax);\n";
             ret("r");
-        } else if (type == "ConvertRGBA8") {
-            const float lo = fvar(n, "Min", -1.0f), hi = fvar(n, "Max", 1.0f);
-            b += "    float s = max(min(" + source(n, "Source", dim) + ", " + lit(hi) + "), " + lit(lo) + ");\n";
-            b += "    s = (s - " + lit(lo) + ") * " + lit(255.0f / (hi - lo)) + ";\n";
-            b += "    int v = int(roundEven(s));\n";
-            ret("intBitsToFloat(int(0xFF000000u) | v | (v << 8) | (v << 16))");
         } else if (type == "Terrace") {
             const float steps = fvar(n, "Step Count", 1.0f);
             b += "    float s = " + source(n, "Source", dim) + " * " + lit(steps) + ";\n";
