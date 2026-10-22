@@ -183,4 +183,9 @@ void installFSWatch()
     bronze::embed::runEntry(bronze_fs_watch_main);
 }
 
+void uninstallFSWatch()
+{
+    g_state.watchers.clear();
+}
+
 } // namespace brokit::api

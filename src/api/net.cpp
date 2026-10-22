@@ -618,8 +618,8 @@ static bronze::Value js_net_poll(bronze::Value, std::span<const bronze::Value> a
         break;
     case NetEvent::Type::Data: {
         obj.set("type", "data");
-        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(evNet.data.data(), evNet.data.size()));
-        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(evNet.data.size()));
+        ev::Persistent ab{ev::createArrayBuffer(std::span<const uint8_t>(evNet.data.data(), evNet.data.size()))};
+        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab.get(), 0, static_cast<uint32_t>(evNet.data.size()));
         obj.set("data", u8);
         break;
     }
@@ -628,8 +628,8 @@ static bronze::Value js_net_poll(bronze::Value, std::span<const bronze::Value> a
         break;
     case NetEvent::Type::Message: {
         obj.set("type", "message");
-        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(evNet.data.data(), evNet.data.size()));
-        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(evNet.data.size()));
+        ev::Persistent ab{ev::createArrayBuffer(std::span<const uint8_t>(evNet.data.data(), evNet.data.size()))};
+        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab.get(), 0, static_cast<uint32_t>(evNet.data.size()));
         obj.set("data", u8);
         obj.set("address", evNet.address);
         obj.set("port", static_cast<double>(evNet.port));
@@ -1018,6 +1018,16 @@ void installNet()
     ev::registerFunction("__brokit_net_poll", js_net_poll);
     ev::registerFunction("__brokit_net_tick", js_net_tick);
     ev::registerFunction("__brokit_net_has_pending", js_net_has_pending);
+}
+
+void uninstallNet()
+{
+    for (auto& [id, h] : g_handles) {
+        if (!h) continue;
+        hardClose(h);
+        delete h;
+    }
+    g_handles.clear();
 }
 
 } // namespace brokit::api

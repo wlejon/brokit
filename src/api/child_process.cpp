@@ -108,6 +108,10 @@ struct ChildHandle {
 #else
         if (outRead >= 0) ::close(outRead);
         if (errRead >= 0) ::close(errRead);
+        if (!exitReported && pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, WNOHANG);
+        }
 #endif
     }
 };
@@ -475,6 +479,17 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 
 #else // Linux/macOS
 
+static int makeCloexecPipe(int p[2])
+{
+#ifdef __linux__
+    if (pipe2(p, O_CLOEXEC) == 0) return 0;
+#endif
+    if (pipe(p) != 0) return -1;
+    fcntl(p[0], F_SETFD, fcntl(p[0], F_GETFD) | FD_CLOEXEC);
+    fcntl(p[1], F_SETFD, fcntl(p[1], F_GETFD) | FD_CLOEXEC);
+    return 0;
+}
+
 // See the Windows overload above for what `argv` means: null runs `command`
 // through /bin/sh, non-null execs argv[0] directly with no shell in between.
 static ExecResult runCommand(const std::string& command, const std::string& cwd,
@@ -484,8 +499,17 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
 {
     ExecResult result;
 
-    int stdoutPipe[2], stderrPipe[2], stdinPipe[2];
-    if (pipe(stdoutPipe) != 0 || pipe(stderrPipe) != 0 || pipe(stdinPipe) != 0) {
+    int stdoutPipe[2] = {-1, -1}, stderrPipe[2] = {-1, -1}, stdinPipe[2] = {-1, -1};
+    auto closeAllPipes = [&]() {
+        for (int fd : { stdoutPipe[0], stdoutPipe[1], stderrPipe[0], stderrPipe[1],
+                        stdinPipe[0], stdinPipe[1] }) {
+            if (fd >= 0) ::close(fd);
+        }
+    };
+    if (makeCloexecPipe(stdoutPipe) != 0 ||
+        makeCloexecPipe(stderrPipe) != 0 ||
+        makeCloexecPipe(stdinPipe) != 0) {
+        closeAllPipes();
         result.error = "Failed to create pipes";
         return result;
     }
@@ -493,6 +517,7 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
     const pid_t parent = getpid();
     pid_t pid = fork();
     if (pid < 0) {
+        closeAllPipes();
         result.error = "Failed to fork";
         return result;
     }
@@ -559,8 +584,33 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
     // Read with optional timeout
     auto startTime = std::chrono::steady_clock::now();
     bool stdoutDone = false, stderrDone = false;
+    char buf[16384];
+
+    auto drainFd = [&](int fd, std::string& out, bool& done) {
+        while (!done) {
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n > 0) {
+                if (maxBuffer > 0) {
+                    if (out.size() < static_cast<size_t>(maxBuffer)) {
+                        size_t take = std::min(static_cast<size_t>(n),
+                                               static_cast<size_t>(maxBuffer) - out.size());
+                        out.append(buf, take);
+                    }
+                } else {
+                    out.append(buf, static_cast<size_t>(n));
+                }
+            } else if (n == 0) {
+                done = true;
+            } else {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                done = true;
+            }
+        }
+    };
 
     while (!stdoutDone || !stderrDone) {
+        int pollWaitMs = 50;
         if (timeoutMs > 0) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - startTime).count();
@@ -569,37 +619,30 @@ static ExecResult runCommand(const std::string& command, const std::string& cwd,
                 result.timedOut = true;
                 break;
             }
+            pollWaitMs = static_cast<int>(std::min<long long>(pollWaitMs, timeoutMs - elapsed));
         }
 
-        char buf[4096];
+        drainFd(stdoutPipe[0], result.stdoutData, stdoutDone);
+        drainFd(stderrPipe[0], result.stderrData, stderrDone);
+        if (stdoutDone && stderrDone) break;
 
+        struct pollfd pfds[2];
+        nfds_t nfds = 0;
         if (!stdoutDone) {
-            ssize_t n = read(stdoutPipe[0], buf, sizeof(buf));
-            if (n > 0) {
-                if (maxBuffer > 0 && result.stdoutData.size() + n > static_cast<size_t>(maxBuffer)) {
-                    result.stdoutData.append(buf, static_cast<size_t>(maxBuffer) - result.stdoutData.size());
-                } else {
-                    result.stdoutData.append(buf, n);
-                }
-            } else if (n == 0) {
-                stdoutDone = true;
-            }
+            pfds[nfds].fd = stdoutPipe[0];
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            ++nfds;
         }
-
         if (!stderrDone) {
-            ssize_t n = read(stderrPipe[0], buf, sizeof(buf));
-            if (n > 0) {
-                if (maxBuffer > 0 && result.stderrData.size() + n > static_cast<size_t>(maxBuffer)) {
-                    result.stderrData.append(buf, static_cast<size_t>(maxBuffer) - result.stderrData.size());
-                } else {
-                    result.stderrData.append(buf, n);
-                }
-            } else if (n == 0) {
-                stderrDone = true;
-            }
+            pfds[nfds].fd = stderrPipe[0];
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            ++nfds;
         }
-
-        usleep(1000); // 1ms poll
+        if (nfds > 0) {
+            poll(pfds, nfds, pollWaitMs);
+        }
     }
 
     close(stdoutPipe[0]);
@@ -1087,7 +1130,9 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
 #else
     int outPipe[2] = {-1, -1}, errPipe[2] = {-1, -1}, inPipe[2] = {-1, -1};
     if (opts.pipeStdio) {
-        if (pipe(outPipe) != 0 || pipe(errPipe) != 0 || pipe(inPipe) != 0) {
+        if (makeCloexecPipe(outPipe) != 0 ||
+            makeCloexecPipe(errPipe) != 0 ||
+            makeCloexecPipe(inPipe) != 0) {
             for (int fd : { outPipe[0], outPipe[1], errPipe[0], errPipe[1],
                             inPipe[0], inPipe[1] })
                 if (fd >= 0) ::close(fd);
@@ -1110,11 +1155,10 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     };
 
     int execPipe[2] = {-1, -1};
-    if (pipe(execPipe) != 0) {
+    if (makeCloexecPipe(execPipe) != 0) {
         closeChildEnds();
         return ev::throwTypeError("spawn failed: pipe");
     }
-    fcntl(execPipe[1], F_SETFD, fcntl(execPipe[1], F_GETFD) | FD_CLOEXEC);
 
     const pid_t parent = getpid();
     pid_t pid = fork();

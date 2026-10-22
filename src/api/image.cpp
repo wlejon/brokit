@@ -221,9 +221,9 @@ static bronze::Value image_gradient(bronze::Value, std::span<const bronze::Value
     std::vector<uint8_t> outBytes;
     broimage::gradient(stops.data(), static_cast<int>(stop_count), n, outBytes);
 
-    bronze::Value ab = ev::createArrayBuffer(
-        std::span<const uint8_t>(outBytes.data(), outBytes.size()));
-    return ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(outBytes.size()));
+    ev::Persistent ab{ev::createArrayBuffer(
+        std::span<const uint8_t>(outBytes.data(), outBytes.size()))};
+    return ev::createTypedArrayView(elements::Uint8, ab.get(), 0, static_cast<uint32_t>(outBytes.size()));
 }
 
 // ---------------------------------------------------------------------------
@@ -448,9 +448,9 @@ static bronze::Value image_reduce(bronze::Value, std::span<const bronze::Value> 
                 counts[idx]++;
             }
         }
-        bronze::Value ab = ev::createArrayBuffer(
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(counts.data()), counts.size() * sizeof(uint32_t)));
-        return ev::createTypedArrayView(elements::Uint32, ab, 0, static_cast<uint32_t>(counts.size()));
+        ev::Persistent ab{ev::createArrayBuffer(
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(counts.data()), counts.size() * sizeof(uint32_t)))};
+        return ev::createTypedArrayView(elements::Uint32, ab.get(), 0, static_cast<uint32_t>(counts.size()));
     }
     return ev::throwTypeError("reduce: unknown op '" + op + "'");
 }

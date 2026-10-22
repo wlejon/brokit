@@ -182,8 +182,8 @@ static bronze::Value js_fetch_stream_read(bronze::Value, std::span<const bronze:
 
         ObjectBuilder obj;
         obj.set("done", false);
-        bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(chunk.data(), chunk.size()));
-        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(chunk.size()));
+        ev::Persistent ab{ev::createArrayBuffer(std::span<const uint8_t>(chunk.data(), chunk.size()))};
+        bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab.get(), 0, static_cast<uint32_t>(chunk.size()));
         obj.set("value", u8);
         return obj.build();
     }

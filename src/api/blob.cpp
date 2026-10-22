@@ -184,7 +184,7 @@ std::string base64Encode(const std::vector<uint8_t>& in) {
     return out;
 }
 
-static HostTaskPoster g_hostTaskPoster;
+static thread_local HostTaskPoster g_hostTaskPoster;
 
 std::string readerListenerKey(const std::string& type) {
     return "__brokitListeners_" + type;

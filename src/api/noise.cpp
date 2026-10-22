@@ -67,9 +67,9 @@ static bronze::Value wrapNode(FastNoise::SmartNode<> node)
 static bronze::Value make_float32_array(const float* data, size_t count)
 {
     size_t byte_len = count * sizeof(float);
-    bronze::Value ab = ev::createArrayBuffer(
-        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data), byte_len));
-    return ev::createTypedArrayView(elements::Float32, ab, 0, static_cast<uint32_t>(count));
+    ev::Persistent ab{ev::createArrayBuffer(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data), byte_len))};
+    return ev::createTypedArrayView(elements::Float32, ab.get(), 0, static_cast<uint32_t>(count));
 }
 
 // Largest grid a generator allocates: the result becomes one Float32Array,

@@ -52,15 +52,21 @@ struct WSConnection {
     // Ticks a closed (state 3) connection has survived without a JS reader
     // claiming its close event.
     int closedSweeps = 0;
+
+    struct curl_slist* headers = nullptr;
+
+    ~WSConnection() {
+        if (headers) curl_slist_free_all(headers);
+    }
 };
 
 // ---------------------------------------------------------------------------
-// Global state
+// Per-thread state
 // ---------------------------------------------------------------------------
-static CURLM* g_ws_multi = nullptr;
-static std::unordered_map<int, WSConnection*> g_ws_conns;
-static std::vector<WSConnection*> g_ws_connecting; // handles in curl_multi
-static int g_ws_nextId = 1;
+static thread_local CURLM* g_ws_multi = nullptr;
+static thread_local std::unordered_map<int, WSConnection*> g_ws_conns;
+static thread_local std::vector<WSConnection*> g_ws_connecting; // handles in curl_multi
+static thread_local int g_ws_nextId = 1;
 
 // Dummy write callback — curl WS with CONNECT_ONLY doesn't use it after upgrade
 static size_t wsWriteCallback(char*, size_t size, size_t nmemb, void*)
@@ -99,9 +105,8 @@ static bronze::Value js_ws_connect(bronze::Value, std::span<const bronze::Value>
     if (!protocols.empty()) {
         // Set WebSocket sub-protocols via headers
         std::string header = "Sec-WebSocket-Protocol: " + protocols;
-        struct curl_slist* hdrs = nullptr;
-        hdrs = curl_slist_append(hdrs, header.c_str());
-        curl_easy_setopt(conn->easy, CURLOPT_HTTPHEADER, hdrs);
+        conn->headers = curl_slist_append(conn->headers, header.c_str());
+        curl_easy_setopt(conn->easy, CURLOPT_HTTPHEADER, conn->headers);
     }
 
     // Create promise for connection result
@@ -263,8 +268,8 @@ static bronze::Value js_ws_recv(bronze::Value, std::span<const bronze::Value> ar
         result.set("binary", msg.binary);
 
         if (msg.binary) {
-            bronze::Value ab = ev::createArrayBuffer(std::span<const uint8_t>(msg.data.data(), msg.data.size()));
-            bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab, 0, static_cast<uint32_t>(msg.data.size()));
+            ev::Persistent ab{ev::createArrayBuffer(std::span<const uint8_t>(msg.data.data(), msg.data.size()))};
+            bronze::Value u8 = ev::createTypedArrayView(elements::Uint8, ab.get(), 0, static_cast<uint32_t>(msg.data.size()));
             result.set("data", u8);
         } else {
             result.set("data", std::string(reinterpret_cast<const char*>(msg.data.data()), msg.data.size()));
@@ -493,6 +498,26 @@ void installWebSocket()
     ev::registerFunction("__brokit_ws_state", js_ws_state);
     ev::registerFunction("__brokit_ws_tick", js_ws_tick);
     ev::registerFunction("__brokit_ws_has_pending", js_ws_has_pending);
+}
+
+void uninstallWebSocket()
+{
+    for (auto& [id, conn] : g_ws_conns) {
+        if (!conn) continue;
+        if (conn->easy) {
+            if (g_ws_multi) curl_multi_remove_handle(g_ws_multi, conn->easy);
+            curl_easy_cleanup(conn->easy);
+            conn->easy = nullptr;
+        }
+        conn->promise.reset();
+        delete conn;
+    }
+    g_ws_connecting.clear();
+    g_ws_conns.clear();
+    if (g_ws_multi) {
+        curl_multi_cleanup(g_ws_multi);
+        g_ws_multi = nullptr;
+    }
 }
 
 } // namespace brokit::api

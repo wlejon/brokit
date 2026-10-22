@@ -263,4 +263,11 @@ void installSqlite() {
     ev::registerFunction("__brokit_sqlite_query", js_sqlite_query, 4);
 }
 
+void cleanupSqlite() {
+    for (auto& [id, db] : g_dbs) {
+        if (db) sqlite3_close_v2(db);
+    }
+    g_dbs.clear();
+}
+
 } // namespace brokit::api

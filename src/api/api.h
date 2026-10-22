@@ -134,6 +134,7 @@ void uninstallFetch();
 int settleLocalFetches();
 void installFS();
 void installFSWatch();
+void uninstallFSWatch();
 void installChildProcess();
 void installStorage();
 void setStoragePath(const std::string& path);
@@ -145,9 +146,11 @@ void cleanupIndexedDB();
 void installWritableStream();
 void installWebSocket();
 void installWebSocketJS();
+void uninstallWebSocket();
 /// Raw TCP/UDP sockets: native __brokit_net_* bindings (nonblocking, pumped
 /// by the host via __brokit_net_tick like fetch/websocket).
 void installNet();
+void uninstallNet();
 /// Block the calling thread up to `timeoutMs` milliseconds until any socket on
 /// this thread is ready for I/O, already has pending events, or wakeNetWait()
 /// is called. Returns true if woken by socket readiness or wakeNetWait().
@@ -166,6 +169,7 @@ void installHttp();
 void installHttpJS();
 /// Native SQLite bindings over the bundled sqlite3 (__brokit_sqlite_*).
 void installSqlite();
+void cleanupSqlite();
 /// Node-compat `sqlite` (`node:sqlite`) module over installSqlite.
 void installSqliteJS();
 void installEventSource();
