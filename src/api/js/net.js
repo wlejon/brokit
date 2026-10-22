@@ -26,18 +26,25 @@
     globalThis.__brokit_net_unregister = function(id) { delete _drains[id]; };
 
     globalThis.__brokit_net_drain_all = function() {
-        for (var key in _drains) {
-            var id = +key;
-            var ev;
-            while (_drains[key] && (ev = globalThis.__brokit_net_poll(id)) !== null) {
-                var fn = _drains[key];
-                if (!fn) break;
-                try { fn(ev); } catch (e) {
-                    if (globalThis.console && globalThis.console.error)
-                        console.error('net drain error:', e && e.message ? e.message : e);
+        for (var pass = 0; pass < 2; pass++) {
+            var keys = Object.keys(_drains);
+            var drainedAny = false;
+            for (var i = 0; i < keys.length; i++) {
+                var key = keys[i];
+                var id = +key;
+                var ev;
+                while (_drains[key] && (ev = globalThis.__brokit_net_poll(id)) !== null) {
+                    drainedAny = true;
+                    var fn = _drains[key];
+                    if (!fn) break;
+                    try { fn(ev); } catch (e) {
+                        if (globalThis.console && globalThis.console.error)
+                            console.error('net drain error:', e && e.message ? e.message : e);
+                    }
+                    if (ev.type === 'close') break; // native handle is gone
                 }
-                if (ev.type === 'close') break; // native handle is gone
             }
+            if (!drainedAny) break;
         }
     };
 

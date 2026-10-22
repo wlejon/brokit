@@ -148,6 +148,12 @@ void installWebSocketJS();
 /// Raw TCP/UDP sockets: native __brokit_net_* bindings (nonblocking, pumped
 /// by the host via __brokit_net_tick like fetch/websocket).
 void installNet();
+/// Block the calling thread up to `timeoutMs` milliseconds until any socket on
+/// this thread is ready for I/O, already has pending events, or wakeNetWait()
+/// is called. Returns true if woken by socket readiness or wakeNetWait().
+bool waitForNetEvents(double timeoutMs);
+/// Wake a thread blocked in waitForNetEvents() from any thread or signal handler.
+void wakeNetWait();
 /// Node-compat `net` + `dgram` modules over installNet. Requires
 /// installEvents (EventEmitter) to have run first.
 void installNetJS();

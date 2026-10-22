@@ -45,6 +45,7 @@ void FsWatcher::pushEvent(EventType type, std::string filename)
     ring_[t].type     = type;
     ring_[t].filename = std::move(filename);
     tail_.store(n, std::memory_order_release);
+    wakeNetWait();
 }
 
 void FsWatcher::drain(std::vector<Event>& out)

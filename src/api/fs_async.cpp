@@ -218,8 +218,11 @@ private:
             } catch (const std::exception& e) {
                 r = FsError{"EIO", "", "", std::string("EIO: ") + e.what()};
             }
-            std::lock_guard lock(doneMu_);
-            done_[job.owner].push_back({job.id, std::move(r)});
+            {
+                std::lock_guard lock(doneMu_);
+                done_[job.owner].push_back({job.id, std::move(r)});
+            }
+            wakeNetWait();
         }
     }
 
