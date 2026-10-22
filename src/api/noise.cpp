@@ -1,6 +1,7 @@
 #include "api/api.h"
 #include "api/arg_reader.h"
 #include "api/host_class.h"
+#include "api/noise_glsl.h"
 #include "api/object_builder.h"
 
 #include <FastNoise/FastNoise.h>
@@ -566,6 +567,45 @@ static bronze::Value fast_noise_encode(bronze::Value thisVal, std::span<const br
     return ev::fromUtf8(encoded);
 }
 
+// glsl({name = "field", dims = 2}): the tree as GLSL (noise_glsl.h), a
+// function name(vec2 p, int seed) and/or name(vec3 p, int seed); dims is 2,
+// 3 or [2, 3].
+static bronze::Value fast_noise_glsl(bronze::Value thisVal, std::span<const bronze::Value> args)
+{
+    auto* w = getNoise(thisVal);
+    if (!w) return ev::throwTypeError("receiver is not a FastNoise instance");
+    std::string encoded = FastNoise::Metadata::SerialiseNodeData(w->data.get());
+    if (encoded.empty()) return ev::throwError("glsl: the node tree has an unset source");
+    brokit::noise::GlslOptions options;
+    if (!args.empty() && ev::isObject(args[0])) {
+        ev::Persistent opts(args[0]);
+        bronze::Value name = ev::getProperty(opts.get(), "name");
+        if (!ev::isUndefined(name)) options.name = ev::toUtf8(name);
+        bronze::Value dims = ev::getProperty(opts.get(), "dims");
+        if (ev::isNumber(dims)) {
+            const double d = ev::toDouble(dims);
+            options.dims2 = d == 2;
+            options.dims3 = d == 3;
+        } else if (ev::isObject(dims)) {
+            std::vector<double> list;
+            const double* data = nullptr;
+            size_t count = 0;
+            if (!plainArrayData(dims, list, [](double d) { return d; }, &data, &count))
+                return ev::throwTypeError("glsl: dims is 2, 3 or [2, 3]");
+            options.dims2 = options.dims3 = false;
+            for (double d : list) {
+                options.dims2 |= d == 2;
+                options.dims3 |= d == 3;
+            }
+        } else if (!ev::isUndefined(dims)) {
+            return ev::throwTypeError("glsl: dims is 2, 3 or [2, 3]");
+        }
+    }
+    std::string glsl, error;
+    if (!brokit::noise::treeToGlsl(encoded, options, glsl, error)) return ev::throwError("glsl: " + error);
+    return ev::fromUtf8(glsl);
+}
+
 static bronze::Value js_fast_noise_constructor(bronze::Value, std::span<const bronze::Value> args)
 {
     if (args.empty() || !ev::isString(args[0]))
@@ -588,6 +628,7 @@ void installNoise()
         proto.def("set", 2, fast_noise_set);
         proto.def("getMembers", 0, fast_noise_get_members);
         proto.def("encode", 0, fast_noise_encode);
+        proto.def("glsl", 1, fast_noise_glsl);
         proto.def("genSingle2D", 3, fast_noise_gen_single2_d);
         proto.def("genSingle3D", 4, fast_noise_gen_single3_d);
         proto.def("genUniformGrid2D", 6, fast_noise_gen_uniform_grid2_d);
