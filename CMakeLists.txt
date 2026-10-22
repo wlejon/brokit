@@ -17,9 +17,9 @@ endif()
 # Dependencies resolve through cmake/bro_deps.cmake, like every repo in the bro
 # ecosystem: an existing target (bro adds these before brokit, and its choice
 # wins) first; otherwise the ../<name> working tree beside the top-level project
-# (the third-party ones, curl and FastNoise2, skip this step); otherwise the
-# head of the sibling's main (curl and FastNoise2: the commits pinned here),
-# fetched at configure.
+# (the third-party one, curl, skips this step); otherwise the head of the
+# sibling's main (curl: the commit pinned here), fetched at configure.
+# FastNoise2 is wlejon's fork, tracked like any sibling.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/bro_deps.cmake)
 
 # bronze, the JavaScript runtime the api binds (it brings brass, its code
@@ -102,8 +102,7 @@ endif()
 option(BROKIT_ENABLE_NOISE "Build FastNoise2 noise API" ON)
 if(BROKIT_ENABLE_NOISE)
     if(NOT TARGET FastNoise)
-        bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF bf7a921b6d172c001ee1597a1dc1d0ae5fc36fcc THIRD_PARTY
-                       TARGET FastNoise SOURCE_ONLY)
+        bro_dependency(FastNoise2 TARGET FastNoise SOURCE_ONLY)
         # FastNoise2 fetches FastSIMD through the CPM.cmake copy vendored next
         # to it. CPM caches CPM_DIRECTORY and early-returns (defining nothing)
         # when a *different* copy of CPM.cmake is included later, so a build
@@ -117,8 +116,7 @@ if(BROKIT_ENABLE_NOISE)
             unset(CPM_VERSION CACHE)
         endif()
     endif()
-    bro_dependency(FastNoise2 GITHUB Auburn/FastNoise2 REF bf7a921b6d172c001ee1597a1dc1d0ae5fc36fcc THIRD_PARTY TARGET FastNoise
-                   OPTIONS FASTNOISE2_NOISETOOL=OFF FASTNOISE2_TESTS=OFF)
+    bro_dependency(FastNoise2 TARGET FastNoise OPTIONS FASTNOISE2_NOISETOOL=OFF FASTNOISE2_TESTS=OFF)
 endif()
 
 # miniz — amalgamation build (single file, no submodule); DEFLATE backend

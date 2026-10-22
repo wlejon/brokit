@@ -1,6 +1,6 @@
 // FastNoise2 node trees as GLSL (noise_glsl.h). Every node is ported from
-// FastNoise2's own generators (include/FastNoise/Generators/*.inl at the
-// pinned commit): the same primes, hashes, gradient tables, interpolants and
+// FastNoise2's own generators (include/FastNoise/Generators/*.inl of wlejon's
+// fork): the same primes, hashes, gradient tables, interpolants and
 // bounds, in the same order of operations, FastNoise2's fused multiply-adds
 // as fma(). The tree is FastNoise2's own decoding of it (NodeData), its
 // members read by their metadata names, so a value set the way the CPU's
@@ -83,17 +83,114 @@ float fn_gradCommon(int h, float x, float y, float z) {
     return u + v;
 }
 
-float fn_value(int seed, vec2 p) {
+// The origin positions are relative to, as FastNoise2 keeps it beside its
+// float positions (its offsets are doubles): far from zero a float position
+// is too coarse for a lattice's cells and their fractions, so each axis'
+// origin is a double-float (x: the float nearest it, y: the rest), carried
+// through the tree, scaled and turned with the positions, and split at each
+// lattice noise into the cell it lies in (added to the noise's own cells)
+// and the fraction (added to the positions). The host sets it by defining
+// FN_ORIGIN2 and FN_ORIGIN3 (FnO2 / FnO3 expressions, e.g. of a uniform)
+// before this code; without them the origin is 0 and every helper below
+// passes the positions through untouched.
+struct FnO2 { vec2 x; vec2 y; };
+struct FnO3 { vec2 x; vec2 y; vec2 z; };
+#if defined(FN_ORIGIN2) || defined(FN_ORIGIN3)
+// a * k, a + b (Dekker's products and Knuth's sums; fma fused). Every step
+// is precise: a compiler free to reassociate would cancel the error terms.
+vec2 fn_dmul(vec2 a, float k) {
+    precise float p = a.x * k;
+    precise float e = fma(a.x, k, -p);
+    e = fma(a.y, k, e);
+    precise float s = p + e;
+    precise float r = e - (s - p);
+    return vec2(s, r);
+}
+vec2 fn_dadd(vec2 a, vec2 b) {
+    precise float s = a.x + b.x;
+    precise float bb = s - a.x;
+    precise float e = (a.x - (s - bb)) + (b.x - bb) + a.y + b.y;
+    precise float t = s + e;
+    precise float r = e - (t - s);
+    return vec2(t, r);
+}
+// The cell a value lies in (its floor, mod 2^32 as the hashes take it) and
+// its fraction.
+float fn_dsplit(vec2 a, out int cell) {
+    float f = floor(a.x);
+    precise float r = (a.x - f) + a.y;
+    float g = floor(r);
+    // Past 2^31 a float's whole numbers are multiples of 256, so f mod 2^32
+    // is exact in one.
+    if (abs(f) < 2147483648.0) cell = int(f);
+    else cell = int(uint(f - 4294967296.0 * floor(f * (1.0 / 4294967296.0))));
+    cell += int(g);
+    return r - g;
+}
+float fn_dflat(vec2 a) { return a.x + a.y; }
+// The value less a whole number of periods: its fraction of a period
+// (inv: 1 / period, a double-float) times the period. (Not a less n times
+// the period: on the 4090 that product of a constant by a variable lost its
+// error term, precise or not.)
+float fn_dwrap(vec2 a, vec2 inv, float period) {
+    vec2 q = fn_dadd(fn_dmul(a, inv.x), vec2(a.x * inv.y, 0.0));
+    float f = floor(q.x);
+    precise float r = (q.x - f) + q.y;
+    return (r - floor(r)) * period;
+}
+FnO2 fn_oscale(FnO2 o, float k) { return FnO2(fn_dmul(o.x, k), fn_dmul(o.y, k)); }
+FnO3 fn_oscale(FnO3 o, float k) { return FnO3(fn_dmul(o.x, k), fn_dmul(o.y, k), fn_dmul(o.z, k)); }
+vec2 fn_rebase(vec2 p, FnO2 o, out ivec2 c) { return p + vec2(fn_dsplit(o.x, c.x), fn_dsplit(o.y, c.y)); }
+vec3 fn_rebase(vec3 p, FnO3 o, out ivec3 c) {
+    return p + vec3(fn_dsplit(o.x, c.x), fn_dsplit(o.y, c.y), fn_dsplit(o.z, c.z));
+}
+// A simplex lattice's: each axis plus `skew` times the sum of them all.
+vec2 fn_rebaseSkewed(FnO2 o, float skew, out ivec2 c) {
+    vec2 t = fn_dmul(fn_dadd(o.x, o.y), skew);
+    return vec2(fn_dsplit(fn_dadd(o.x, t), c.x), fn_dsplit(fn_dadd(o.y, t), c.y));
+}
+vec3 fn_rebaseSkewed(FnO3 o, float skew, out ivec3 c) {
+    vec2 t = fn_dmul(fn_dadd(fn_dadd(o.x, o.y), o.z), skew);
+    return vec3(fn_dsplit(fn_dadd(o.x, t), c.x), fn_dsplit(fn_dadd(o.y, t), c.y), fn_dsplit(fn_dadd(o.z, t), c.z));
+}
+float fn_plus(float a, float fraction) { return a + fraction; }
+float fn_flat(float p, vec2 o) { return p + fn_dflat(o); }
+float fn_wrap(float p, vec2 o, vec2 inv, float period) { return p + fn_dwrap(o, inv, period); }
+#else
+vec2 fn_dmul(vec2 a, float k) { return a * k; }
+vec2 fn_dadd(vec2 a, vec2 b) { return a + b; }
+FnO2 fn_oscale(FnO2 o, float k) { return o; }
+FnO3 fn_oscale(FnO3 o, float k) { return o; }
+vec2 fn_rebase(vec2 p, FnO2 o, out ivec2 c) { c = ivec2(0); return p; }
+vec3 fn_rebase(vec3 p, FnO3 o, out ivec3 c) { c = ivec3(0); return p; }
+vec2 fn_rebaseSkewed(FnO2 o, float skew, out ivec2 c) { c = ivec2(0); return vec2(0.0); }
+vec3 fn_rebaseSkewed(FnO3 o, float skew, out ivec3 c) { c = ivec3(0); return vec3(0.0); }
+float fn_plus(float a, float fraction) { return a; }
+float fn_flat(float p, vec2 o) { return p; }
+float fn_wrap(float p, vec2 o, vec2 inv, float period) { return p; }
+#endif
+#ifndef FN_ORIGIN2
+#define FN_ORIGIN2 FnO2(vec2(0.0), vec2(0.0))
+#endif
+#ifndef FN_ORIGIN3
+#define FN_ORIGIN3 FnO3(vec2(0.0), vec2(0.0), vec2(0.0))
+#endif
+
+float fn_value(int seed, vec2 p, FnO2 o) {
+    ivec2 c;
+    p = fn_rebase(p, o, c);
     vec2 s = floor(p);
-    int x0 = int(s.x) * FN_PX, y0 = int(s.y) * FN_PY;
+    int x0 = (int(s.x) + c.x) * FN_PX, y0 = (int(s.y) + c.y) * FN_PY;
     int x1 = x0 + FN_PX, y1 = y0 + FN_PY;
     float xs = fn_hermite(p.x - s.x), ys = fn_hermite(p.y - s.y);
     return fn_lerp(fn_lerp(fn_valueCoord(seed, x0, y0), fn_valueCoord(seed, x1, y0), xs),
                    fn_lerp(fn_valueCoord(seed, x0, y1), fn_valueCoord(seed, x1, y1), xs), ys);
 }
-float fn_value(int seed, vec3 p) {
+float fn_value(int seed, vec3 p, FnO3 o) {
+    ivec3 c;
+    p = fn_rebase(p, o, c);
     vec3 s = floor(p);
-    int x0 = int(s.x) * FN_PX, y0 = int(s.y) * FN_PY, z0 = int(s.z) * FN_PZ;
+    int x0 = (int(s.x) + c.x) * FN_PX, y0 = (int(s.y) + c.y) * FN_PY, z0 = (int(s.z) + c.z) * FN_PZ;
     int x1 = x0 + FN_PX, y1 = y0 + FN_PY, z1 = z0 + FN_PZ;
     float xs = fn_hermite(p.x - s.x), ys = fn_hermite(p.y - s.y), zs = fn_hermite(p.z - s.z);
     return fn_lerp(fn_lerp(fn_lerp(fn_valueCoord(seed, x0, y0, z0), fn_valueCoord(seed, x1, y0, z0), xs),
@@ -102,9 +199,11 @@ float fn_value(int seed, vec3 p) {
                            fn_lerp(fn_valueCoord(seed, x0, y1, z1), fn_valueCoord(seed, x1, y1, z1), xs), ys), zs);
 }
 
-float fn_perlin(int seed, vec2 p) {
+float fn_perlin(int seed, vec2 p, FnO2 o) {
+    ivec2 c;
+    p = fn_rebase(p, o, c);
     vec2 s = floor(p);
-    int x0 = int(s.x) * FN_PX, y0 = int(s.y) * FN_PY;
+    int x0 = (int(s.x) + c.x) * FN_PX, y0 = (int(s.y) + c.y) * FN_PY;
     int x1 = x0 + FN_PX, y1 = y0 + FN_PY;
     float xf0 = p.x - s.x, yf0 = p.y - s.y;
     float xf1 = xf0 - 1.0, yf1 = yf0 - 1.0;
@@ -112,9 +211,11 @@ float fn_perlin(int seed, vec2 p) {
     return fn_lerp(fn_lerp(fn_gradPerlin(fn_hash(seed, x0, y0), xf0, yf0), fn_gradPerlin(fn_hash(seed, x1, y0), xf1, yf0), xs),
                    fn_lerp(fn_gradPerlin(fn_hash(seed, x0, y1), xf0, yf1), fn_gradPerlin(fn_hash(seed, x1, y1), xf1, yf1), xs), ys);
 }
-float fn_perlin(int seed, vec3 p) {
+float fn_perlin(int seed, vec3 p, FnO3 o) {
+    ivec3 c;
+    p = fn_rebase(p, o, c);
     vec3 s = floor(p);
-    int x0 = int(s.x) * FN_PX, y0 = int(s.y) * FN_PY, z0 = int(s.z) * FN_PZ;
+    int x0 = (int(s.x) + c.x) * FN_PX, y0 = (int(s.y) + c.y) * FN_PY, z0 = (int(s.z) + c.z) * FN_PZ;
     int x1 = x0 + FN_PX, y1 = y0 + FN_PY, z1 = z0 + FN_PZ;
     float xf0 = p.x - s.x, yf0 = p.y - s.y, zf0 = p.z - s.z;
     float xf1 = xf0 - 1.0, yf1 = yf0 - 1.0, zf1 = zf0 - 1.0;
@@ -127,17 +228,19 @@ float fn_perlin(int seed, vec3 p) {
         zs);
 }
 
-float fn_simplex(int seed, vec2 p) {
+float fn_simplex(int seed, vec2 p, FnO2 o) {
     const float kSkew = 0.366025403784438647;          // 1 / (sqrt(3) + 1)
     const float kUnskew = -0.211324865405187118;       // -1 / (sqrt(3) + 3)
     const float kUnskew1 = 0.788675134594812882;       // kUnskew + 1
     const float kUnskew2 = 0.577350269189625765;       // kUnskew * 2 + 1
     const float kFalloff2 = -3.15470053837925153;      // -4 (sqrt(3) + 2) / (sqrt(3) + 3)
+    ivec2 c;
+    vec2 sf = fn_rebaseSkewed(o, kSkew, c);
     float skewDelta = kSkew * (p.x + p.y);
-    float xSkewed = p.x + skewDelta, ySkewed = p.y + skewDelta;
+    float xSkewed = fn_plus(p.x + skewDelta, sf.x), ySkewed = fn_plus(p.y + skewDelta, sf.y);
     float xb = floor(xSkewed), yb = floor(ySkewed);
     float dxs = xSkewed - xb, dys = ySkewed - yb;
-    int xp = int(xb) * FN_PX, yp = int(yb) * FN_PY;
+    int xp = (int(xb) + c.x) * FN_PX, yp = (int(yb) + c.y) * FN_PY;
     bool xge = dxs >= dys;
     float unskewDelta = kUnskew * (dxs + dys);
     float dx0 = dxs + unskewDelta, dy0 = dys + unskewDelta;
@@ -156,14 +259,16 @@ float fn_simplex(int seed, vec2 p) {
     float g2 = fn_gradPerlin(fn_hash(seed, xp + FN_PX, yp + FN_PY), dx2, dy2);
     return fma(g0, f0, fma(g1, f1, g2 * f2));
 }
-float fn_simplex(int seed, vec3 p) {
+float fn_simplex(int seed, vec3 p, FnO3 o) {
     const float kSkew = 0.333333333333333333;
     const float kUnskew = -0.5;
+    ivec3 c;
+    vec3 sf = fn_rebaseSkewed(o, kSkew, c);
     float skewDelta = kSkew * (p.x + p.y + p.z);
-    vec3 skewed = vec3(p.x + skewDelta, p.y + skewDelta, p.z + skewDelta);
+    vec3 skewed = vec3(fn_plus(p.x + skewDelta, sf.x), fn_plus(p.y + skewDelta, sf.y), fn_plus(p.z + skewDelta, sf.z));
     vec3 b = floor(skewed);
     vec3 d = skewed - b;
-    int xp = int(b.x) * FN_PX, yp = int(b.y) * FN_PY, zp = int(b.z) * FN_PZ;
+    int xp = (int(b.x) + c.x) * FN_PX, yp = (int(b.y) + c.y) * FN_PY, zp = (int(b.z) + c.z) * FN_PZ;
     bool xgy = d.x >= d.y, ygz = d.y >= d.z, xgz = d.x >= d.z;
     float unskewDelta = kUnskew * (d.x + d.y + d.z);
     float dx0 = d.x + unskewDelta, dy0 = d.y + unskewDelta, dz0 = d.z + unskewDelta;
@@ -223,6 +328,12 @@ std::string lit(int i) { return i < 0 ? "(" + std::to_string(i) + ")" : std::to_
 
 const char* vecType(int dim) { return dim == 2 ? "vec2" : "vec3"; }
 const char* axis(int i) { return i == 0 ? "x" : i == 1 ? "y" : "z"; }
+const char* originType(int dim) { return dim == 2 ? "FnO2" : "FnO3"; }
+// The position, origin and all, as one float (exact only near zero).
+std::string flat(int dim) {
+    return dim == 2 ? "vec2(fn_flat(p.x, o.x), fn_flat(p.y, o.y))"
+                    : "vec3(fn_flat(p.x, o.x), fn_flat(p.y, o.y), fn_flat(p.z, o.z))";
+}
 
 class Emitter {
 public:
@@ -241,7 +352,7 @@ public:
         names_[key] = name;
         std::string body;
         if (!emitBody(*n, dim, body)) return "";
-        code += "float " + name + "(" + vecType(dim) + " p, int seed) {\n" + body + "}\n";
+        code += "float " + name + "(" + vecType(dim) + " p, " + originType(dim) + " o, int seed) {\n" + body + "}\n";
         return name;
     }
 
@@ -274,10 +385,12 @@ private:
             if (name == members[i].name) return n.nodeLookups[i];
         return nullptr;
     }
-    /// A source's value at (p, seed) in `dim` dimensions.
-    std::string call(const NodeData* src, int dim, const std::string& p = "p", const std::string& seed = "seed") {
+    /// A source's value at (p, seed), p relative to the origin o, in `dim`
+    /// dimensions.
+    std::string call(const NodeData* src, int dim, const std::string& p = "p", const std::string& seed = "seed",
+                     const std::string& o = "o") {
         const std::string f = node(src, dim);
-        return f.empty() ? "0.0" : f + "(" + p + ", " + seed + ")";
+        return f.empty() ? "0.0" : f + "(" + p + ", " + o + ", " + seed + ")";
     }
     std::string source(const NodeData& n, std::string_view name, int dim) {
         const NodeData* src = lookup(n, name);
@@ -310,6 +423,7 @@ private:
     static std::string scaleAndSeed(const NodeData& n, bool seeded) {
         const float frequency = 1.0f / fvar(n, "Feature Scale", 100.0f);
         std::string s = "    p *= " + lit(frequency) + ";\n";
+        s += "    o = fn_oscale(o, " + lit(frequency) + ");\n";
         if (seeded) s += "    seed += " + lit(ivar(n, "Seed Offset", 0)) + ";\n";
         return s;
     }
@@ -354,19 +468,28 @@ private:
         } else if (type == "White") {
             b += "    seed += " + lit(ivar(n, "Seed Offset", 0)) + ";\n";
             const std::string it = dim == 2 ? "ivec2" : "ivec3";
-            b += "    " + it + " q = floatBitsToInt(p);\n";
+            b += "    " + it + " q = floatBitsToInt(" + flat(dim) + ");\n";
             b += "    q = (q ^ (q >> 16)) * " + it + (dim == 2 ? "(FN_PX, FN_PY)" : "(FN_PX, FN_PY, FN_PZ)") + ";\n";
             const std::string raw = dim == 2 ? "fn_valueCoord(seed, q.x, q.y)" : "fn_valueCoord(seed, q.x, q.y, q.z)";
             ret(scaleOutput(n, raw, -2147483648.0f, 2147483648.0f));
         } else if (type == "Checkerboard") {
             b += scaleAndSeed(n, false);
-            std::string v = "int(roundEven(p.x)) ^ int(roundEven(p.y))";
-            if (dim == 3) v += " ^ int(roundEven(p.z))";
+            b += std::string("    ") + (dim == 2 ? "ivec2" : "ivec3") + " c;\n";
+            b += "    " + vt + " q = fn_rebase(p, o, c);\n";
+            std::string v = "(int(roundEven(q.x)) + c.x) ^ (int(roundEven(q.y)) + c.y)";
+            if (dim == 3) v += " ^ (int(roundEven(q.z)) + c.z)";
             b += "    float raw = ((" + v + ") & 1) != 0 ? 2.0 : 0.0;\n";
             ret(scaleOutput(n, "raw", 0.0f, 2.0f));
         } else if (type == "SineWave") {
             b += scaleAndSeed(n, false);
-            ret(scaleOutput(n, dim == 2 ? "(sin(p.x) * sin(p.y))" : "(sin(p.x) * (sin(p.y) * sin(p.z)))", -1.0f, 1.0f));
+            const double inv = 1.0 / 6.283185307179586;
+            const float hi = static_cast<float>(inv);
+            const std::string wrap = "vec2(" + lit(hi) + ", " + lit(static_cast<float>(inv - hi)) + "), " +
+                                     lit(6.283185307179586f);
+            for (int i = 0; i < dim; ++i)
+                b += std::string("    float s") + axis(i) + " = sin(fn_wrap(p." + axis(i) + ", o." + axis(i) + ", " +
+                     wrap + "));\n";
+            ret(scaleOutput(n, dim == 2 ? "(sx * sy)" : "(sx * (sy * sz))", -1.0f, 1.0f));
         } else if (type == "Value" || type == "Perlin" || type == "Simplex") {
             b += scaleAndSeed(n, true);
             float bound;
@@ -374,13 +497,14 @@ private:
             else if (type == "Perlin") bound = dim == 2 ? 1.726796627044677734375f : static_cast<float>(1.0363423824310302734375);
             else bound = dim == 2 ? 0.0261208079755306243896484375f : 0.030586399137973785400390625f;
             const std::string fn = type == "Value" ? "fn_value" : type == "Perlin" ? "fn_perlin" : "fn_simplex";
-            ret(scaleOutput(n, fn + "(seed, p)", -bound, bound));
+            ret(scaleOutput(n, fn + "(seed, p, o)", -bound, bound));
         } else if (type == "Gradient") {
             std::vector<std::string> off;
             for (int i = 0; i < dim; ++i) off.push_back(hybrid(n, "Offset", dim, i));
             b += "    float r = 0.0;\n";
             for (int i = 0; i < dim; ++i)
-                b += std::string("    r = fma(p.") + axis(i) + " + " + off[static_cast<size_t>(i)] + ", " +
+                b += std::string("    r = fma(fn_flat(p.") + axis(i) + ", o." + axis(i) + ") + " +
+                     off[static_cast<size_t>(i)] + ", " +
                      lit(fvar(n, "Multiplier", 0.0f, i)) + ", r);\n";
             ret("r");
         } else if (type == "DistanceToPoint") {
@@ -388,7 +512,8 @@ private:
             if (fn == 5) b += "    float mp = " + hybrid(n, "Minkowski P", dim) + ";\n";
             std::vector<std::string> d;
             for (int i = 0; i < dim; ++i) {
-                b += std::string("    float d") + axis(i) + " = p." + axis(i) + " - " + hybrid(n, "Point", dim, i) + ";\n";
+                b += std::string("    float d") + axis(i) + " = fn_flat(p." + axis(i) + ", o." + axis(i) + ") - " +
+                     hybrid(n, "Point", dim, i) + ";\n";
                 d.push_back(std::string("d") + axis(i));
             }
             ret(distance(fn, d, "mp"));
@@ -409,6 +534,7 @@ private:
                  ", weighted);\n";
             b += "        amp *= gain;\n";
             b += "        p *= " + lit(fvar(n, "Lacunarity", 2.0f)) + ";\n";
+            b += "        o = fn_oscale(o, " + lit(fvar(n, "Lacunarity", 2.0f)) + ");\n";
             b += "        noise = " + sample + ";\n";
             b += "        sum += " + term + ";\n";
             b += "    }\n";
@@ -456,10 +582,14 @@ private:
             ret("fn_lerp(" + source(n, "A", dim) + ", " + source(n, "B", dim) + ", fade)");
         } else if (type == "DomainScale") {
             b += "    p *= " + lit(fvar(n, "Scaling", 1.0f)) + ";\n";
+            b += "    o = fn_oscale(o, " + lit(fvar(n, "Scaling", 1.0f)) + ");\n";
             ret(source(n, "Source", dim));
         } else if (type == "DomainAxisScale") {
-            for (int i = 0; i < dim; ++i)
-                b += std::string("    p.") + axis(i) + " *= " + lit(fvar(n, "Scaling", 1.0f, i)) + ";\n";
+            for (int i = 0; i < dim; ++i) {
+                const std::string k = lit(fvar(n, "Scaling", 1.0f, i));
+                b += std::string("    p.") + axis(i) + " *= " + k + ";\n";
+                b += std::string("    o.") + axis(i) + " = fn_dmul(o." + axis(i) + ", " + k + ");\n";
+            }
             ret(source(n, "Source", dim));
         } else if (type == "DomainOffset") {
             std::string offsets;
@@ -476,15 +606,24 @@ private:
             if (dim == 2 && ps == 0.0f && rs == 0.0f) {
                 b += "    " + vt + " q = vec2(fma(-p.y, " + lit(ys) + ", p.x * " + lit(yc) + "), fma(p.x, " + lit(ys) +
                      ", p.y * " + lit(yc) + "));\n";
-                ret(call(lookup(n, "Source"), 2, "q"));
+                b += "    FnO2 oq = FnO2(fn_dadd(fn_dmul(o.x, " + lit(yc) + "), fn_dmul(o.y, " + lit(-ys) +
+                     ")),\n        fn_dadd(fn_dmul(o.x, " + lit(ys) + "), fn_dmul(o.y, " + lit(yc) + ")));\n";
+                ret(call(lookup(n, "Source"), 2, "q", "seed", "oq"));
             } else {
                 b += dim == 2 ? "    vec3 r = vec3(p, 0.0);\n" : "    vec3 r = p;\n";
+                b += dim == 2 ? "    FnO3 ro = FnO3(o.x, o.y, vec2(0.0));\n" : "    FnO3 ro = o;\n";
                 auto row = [&](float a, float bb, float c) {
                     return "fma(r.x, " + lit(a) + ", fma(r.y, " + lit(bb) + ", r.z * " + lit(c) + "))";
                 };
+                auto orow = [&](float a, float bb, float c) {
+                    return "fn_dadd(fn_dmul(ro.x, " + lit(a) + "), fn_dadd(fn_dmul(ro.y, " + lit(bb) +
+                           "), fn_dmul(ro.z, " + lit(c) + ")))";
+                };
                 b += "    vec3 q = vec3(" + row(xa, xb, xc) + ",\n        " + row(ya, yb, yc2) + ",\n        " +
                      row(za, zb, zc) + ");\n";
-                ret(call(lookup(n, "Source"), 3, "q"));
+                b += "    FnO3 oq = FnO3(" + orow(xa, xb, xc) + ",\n        " + orow(ya, yb, yc2) + ",\n        " +
+                     orow(za, zb, zc) + ");\n";
+                ret(call(lookup(n, "Source"), 3, "q", "seed", "oq"));
             }
         } else if (type == "SeedOffset") {
             ret(call(lookup(n, "Source"), dim, "p", "seed + " + lit(ivar(n, "Seed Offset", 1))));
@@ -523,16 +662,16 @@ private:
         } else if (type == "AddDimension") {
             if (dim == 3) return !fail("AddDimension of a 3D field (4D, not ported)").empty();
             b += "    vec3 q = vec3(p, " + hybrid(n, "New Dimension Position", dim) + ");\n";
-            ret(call(lookup(n, "Source"), 3, "q"));
+            ret(call(lookup(n, "Source"), 3, "q", "seed", "FnO3(o.x, o.y, vec2(0.0))"));
         } else if (type == "RemoveDimension") {
             const NodeData* src = lookup(n, "Source");
             if (dim == 2) {
                 ret(call(src, 2));
             } else {
                 const int removed = ivar(n, "Remove Dimension", 1);
-                if (removed == 0) ret(call(src, 2, "p.yz"));
-                else if (removed == 1) ret(call(src, 2, "p.xz"));
-                else if (removed == 2) ret(call(src, 2, "p.xy"));
+                if (removed == 0) ret(call(src, 2, "p.yz", "seed", "FnO2(o.y, o.z)"));
+                else if (removed == 1) ret(call(src, 2, "p.xz", "seed", "FnO2(o.x, o.z)"));
+                else if (removed == 2) ret(call(src, 2, "p.xy", "seed", "FnO2(o.x, o.y)"));
                 else ret(call(src, 3));
             }
         } else if (type == "GeneratorCache") {
@@ -545,18 +684,29 @@ private:
         } else if (type == "DomainRotatePlane") {
             const int kind = dim == 2 ? 0 : ivar(n, "Rotation Type", 0);
             b += dim == 2 ? "    vec3 r = vec3(p, 0.0);\n" : "    vec3 r = p;\n";
+            b += dim == 2 ? "    FnO3 ro = FnO3(o.x, o.y, vec2(0.0));\n" : "    FnO3 ro = o;\n";
             if (kind == 0) {
                 b += "    float xy = r.x + r.y;\n"
                      "    float s2 = xy * -0.211324865;\n"
                      "    float nz = r.z * 0.577350269;\n"
-                     "    vec3 q = vec3(r.x + s2 - nz, r.y + s2 - nz, nz + xy * 0.577350269);\n";
+                     "    vec3 q = vec3(r.x + s2 - nz, r.y + s2 - nz, nz + xy * 0.577350269);\n"
+                     "    vec2 oxy = fn_dadd(ro.x, ro.y);\n"
+                     "    vec2 os2 = fn_dmul(oxy, -0.211324865);\n"
+                     "    vec2 onz = fn_dmul(ro.z, 0.577350269);\n"
+                     "    FnO3 oq = FnO3(fn_dadd(fn_dadd(ro.x, os2), -onz), fn_dadd(fn_dadd(ro.y, os2), -onz),\n"
+                     "        fn_dadd(onz, fn_dmul(oxy, 0.577350269)));\n";
             } else {
                 b += "    float xz = r.x + r.z;\n"
                      "    float s2 = xz * -0.211324865;\n"
                      "    float ny = r.y * 0.577350269;\n"
-                     "    vec3 q = vec3(r.x + s2 - ny, ny + xz * 0.577350269, r.z + s2 - ny);\n";
+                     "    vec3 q = vec3(r.x + s2 - ny, ny + xz * 0.577350269, r.z + s2 - ny);\n"
+                     "    vec2 oxz = fn_dadd(ro.x, ro.z);\n"
+                     "    vec2 os2 = fn_dmul(oxz, -0.211324865);\n"
+                     "    vec2 ony = fn_dmul(ro.y, 0.577350269);\n"
+                     "    FnO3 oq = FnO3(fn_dadd(fn_dadd(ro.x, os2), -ony), fn_dadd(ony, fn_dmul(oxz, 0.577350269)),\n"
+                     "        fn_dadd(fn_dadd(ro.z, os2), -ony));\n";
             }
-            ret(call(lookup(n, "Source"), 3, "q"));
+            ret(call(lookup(n, "Source"), 3, "q", "seed", "oq"));
         } else {
             return !fail(type + " (not ported to GLSL yet)").empty();
         }
@@ -601,7 +751,7 @@ bool treeToGlsl(const std::string& encoded, const GlslOptions& options, std::str
         const std::string f = e.node(root, dim);
         if (f.empty()) break;
         entries += std::string("float ") + options.name + "(" + vecType(dim) + " p, int seed) { return " + f +
-                   "(p, seed); }\n";
+                   "(p, " + (dim == 2 ? "FN_ORIGIN2" : "FN_ORIGIN3") + ", seed); }\n";
     }
     if (!e.error.empty()) {
         error = e.error;

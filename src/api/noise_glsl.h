@@ -13,6 +13,15 @@
 // (the shared noise maths behind an include guard, so several fields can go
 // in one shader) and compiles to SPIR-V like any other shader.
 //
+// Far from zero (a planet's 6371 km) a float p is too coarse for the
+// lattices, so p may be relative to an origin, as FastNoise2's double
+// offsets are (genUniformGrid / genPositionArray): define FN_ORIGIN2 and
+// FN_ORIGIN3 before the source as FnO2 / FnO3 expressions, each axis a
+// double-float vec2(hi, lo) (hi the float nearest it, lo the rest), e.g.
+//   #define FN_ORIGIN2 FnO2(u.originX, u.originZ)
+// and the field's value at p is FastNoise2's at origin + p, its fine octaves
+// kept. Without them the origin is 0 and costs nothing.
+//
 // Not yet ported: SuperSimplex, the Cellular nodes, the domain warps, and
 // 4D (a 3D field through AddDimension). Not a field: ConvertRGBA8 (a colour
 // packed in the float's bits, NaNs among them, which a GPU need not keep).
