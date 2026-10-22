@@ -22,6 +22,15 @@
 // and the field's value at p is FastNoise2's at origin + p, its fine octaves
 // kept. Without them the origin is 0 and costs nothing.
 //
+// A field sampled on a grid coarser than its finest detail (a far tile's
+// texels) aliases: each sample a point of detail the grid cannot carry.
+// Define FN_FOOTPRINT (a float expression: the samples' spacing in p's
+// units) and every lattice noise whose cells are near that spacing or
+// finer fades to its mean (its output range's middle; a ridged fractal's
+// octave to its mean ridge), the fractals' fine octaves with it, so the
+// field is the one the grid can hold. Without it the field is as above;
+// sampled under a fifth of its finest cells apart, the same to rounding.
+//
 // Not yet ported: SuperSimplex, the Cellular nodes, the domain warps, and
 // 4D (a 3D field through AddDimension). Not a field: ConvertRGBA8 (a colour
 // packed in the float's bits, NaNs among them, which a GPU need not keep).

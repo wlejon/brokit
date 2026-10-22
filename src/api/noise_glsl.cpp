@@ -11,6 +11,7 @@
 #include <FastNoise/FastNoise.h>
 #include <FastNoise/Metadata.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +43,15 @@ const int FN_HASH = int(0xB7E0A5F5u);
 const float FN_PERLIN_G = 2.41421356237;   // 1 + sqrt(2)
 
 float fn_lerp(float a, float b, float t) { return fma(t, b - a, a); }
+// The share of a lattice noise's detail a field sampled fp lattice cells
+// apart keeps (FN_FOOTPRINT): all of it under a fifth of a cell, none past
+// 0.6, where its features would alias.
+float fn_band(float fp) { return 1.0 - smoothstep(0.2, 0.6, fp); }
+// v kept that share, the rest its mean (exactly v while it is all kept).
+float fn_banded(float mean, float v, float fp) {
+    float w = fn_band(fp);
+    return w >= 1.0 ? v : fn_lerp(mean, v, w);
+}
 float fn_hermite(float t) { return t * t * fma(-t, 2.0, 3.0); }
 float fn_quintic(float t) { return t * t * t * fma(t, fma(t, 6.0, -15.0), 10.0); }
 
@@ -174,6 +184,10 @@ float fn_wrap(float p, vec2 o, vec2 inv, float period) { return p; }
 #endif
 #ifndef FN_ORIGIN3
 #define FN_ORIGIN3 FnO3(vec2(0.0), vec2(0.0), vec2(0.0))
+#endif
+// The spacing the field is sampled at, in its positions' units (0: a point).
+#ifndef FN_FOOTPRINT
+#define FN_FOOTPRINT 0.0
 #endif
 
 float fn_value(int seed, vec2 p, FnO2 o) {
@@ -352,7 +366,8 @@ public:
         names_[key] = name;
         std::string body;
         if (!emitBody(*n, dim, body)) return "";
-        code += "float " + name + "(" + vecType(dim) + " p, " + originType(dim) + " o, int seed) {\n" + body + "}\n";
+        code += "float " + name + "(" + vecType(dim) + " p, " + originType(dim) + " o, int seed, float fp) {\n" + body +
+                "}\n";
         return name;
     }
 
@@ -386,11 +401,11 @@ private:
         return nullptr;
     }
     /// A source's value at (p, seed), p relative to the origin o, in `dim`
-    /// dimensions.
+    /// dimensions, sampled fp apart (in p's units).
     std::string call(const NodeData* src, int dim, const std::string& p = "p", const std::string& seed = "seed",
                      const std::string& o = "o") {
         const std::string f = node(src, dim);
-        return f.empty() ? "0.0" : f + "(" + p + ", " + o + ", " + seed + ")";
+        return f.empty() ? "0.0" : f + "(" + p + ", " + o + ", " + seed + ", fp)";
     }
     std::string source(const NodeData& n, std::string_view name, int dim) {
         const NodeData* src = lookup(n, name);
@@ -419,11 +434,30 @@ private:
         const float k = (1.0f / (hi - lo)) * rangeScale;
         return "fma(" + lit(k) + ", " + raw + " - " + lit(lo) + ", " + lit(rangeMin) + ")";
     }
+    // A lattice noise's value `v` (its output range's) band-limited to the
+    // footprint: toward the range's middle, its mean, as fp (scaled to the
+    // noise's cells) nears a cell; `cells` its features' period in cells.
+    static std::string band(const NodeData& n, const std::string& v, float cells = 1.0f) {
+        const float mid = 0.5f * (fvar(n, "Output Min", -1.0f) + fvar(n, "Output Max", 1.0f));
+        return "fn_banded(" + lit(mid) + ", " + v + ", fp * " + lit(1.0f / cells) + ")";
+    }
+    // E|v| of a lattice noise node over its default output range (-1..1)
+    // (measured with FastNoise2: 200,000 points); 0 for any other node or
+    // range, whose ridges are then not kept at their mean as they fade.
+    static float absMean(const NodeData* n, int dim) {
+        if (!n || fvar(*n, "Output Min", -1.0f) != -1.0f || fvar(*n, "Output Max", 1.0f) != 1.0f) return 0.0f;
+        const std::string_view type = n->metadata->name;
+        if (type == "Simplex") return dim == 2 ? 0.4761f : 0.3635f;
+        if (type == "Perlin") return dim == 2 ? 0.2660f : 0.2127f;
+        if (type == "Value") return dim == 2 ? 0.3557f : 0.3015f;
+        return 0.0f;
+    }
     // ScalableGenerator::ScalePositions and Seeded's offset.
     static std::string scaleAndSeed(const NodeData& n, bool seeded) {
         const float frequency = 1.0f / fvar(n, "Feature Scale", 100.0f);
         std::string s = "    p *= " + lit(frequency) + ";\n";
         s += "    o = fn_oscale(o, " + lit(frequency) + ");\n";
+        s += "    fp *= " + lit(frequency) + ";\n";
         if (seeded) s += "    seed += " + lit(ivar(n, "Seed Offset", 0)) + ";\n";
         return s;
     }
@@ -479,7 +513,7 @@ private:
             std::string v = "(int(roundEven(q.x)) + c.x) ^ (int(roundEven(q.y)) + c.y)";
             if (dim == 3) v += " ^ (int(roundEven(q.z)) + c.z)";
             b += "    float raw = ((" + v + ") & 1) != 0 ? 2.0 : 0.0;\n";
-            ret(scaleOutput(n, "raw", 0.0f, 2.0f));
+            ret(band(n, scaleOutput(n, "raw", 0.0f, 2.0f), 2.0f));
         } else if (type == "SineWave") {
             b += scaleAndSeed(n, false);
             const double inv = 1.0 / 6.283185307179586;
@@ -489,7 +523,7 @@ private:
             for (int i = 0; i < dim; ++i)
                 b += std::string("    float s") + axis(i) + " = sin(fn_wrap(p." + axis(i) + ", o." + axis(i) + ", " +
                      wrap + "));\n";
-            ret(scaleOutput(n, dim == 2 ? "(sx * sy)" : "(sx * (sy * sz))", -1.0f, 1.0f));
+            ret(band(n, scaleOutput(n, dim == 2 ? "(sx * sy)" : "(sx * (sy * sz))", -1.0f, 1.0f), 6.28318531f));
         } else if (type == "Value" || type == "Perlin" || type == "Simplex") {
             b += scaleAndSeed(n, true);
             float bound;
@@ -497,7 +531,7 @@ private:
             else if (type == "Perlin") bound = dim == 2 ? 1.726796627044677734375f : static_cast<float>(1.0363423824310302734375);
             else bound = dim == 2 ? 0.0261208079755306243896484375f : 0.030586399137973785400390625f;
             const std::string fn = type == "Value" ? "fn_value" : type == "Perlin" ? "fn_perlin" : "fn_simplex";
-            ret(scaleOutput(n, fn + "(seed, p, o)", -bound, bound));
+            ret(band(n, scaleOutput(n, fn + "(seed, p, o)", -bound, bound)));
         } else if (type == "Gradient") {
             std::vector<std::string> off;
             for (int i = 0; i < dim; ++i) off.push_back(hybrid(n, "Offset", dim, i));
@@ -524,7 +558,16 @@ private:
             b += "    float gain = " + hybrid(n, "Gain", dim) + ";\n";
             b += "    float weighted = " + hybrid(n, "Weighted Strength", dim) + ";\n";
             b += "    float amp = 1.0;\n";
-            const std::string sample = ridged ? "abs(" + call(src, dim) + ")" : call(src, dim);
+            // A ridged octave fading out (its source toward 0) is kept at
+            // its mean, E|source|, not at its ridges' tops.
+            std::string sample = call(src, dim);
+            if (ridged) {
+                const float mean = absMean(src, dim);
+                sample = "abs(" + sample + ")";
+                if (mean > 0.0f)
+                    sample += " + (1.0 - fn_band(fp * " + lit(1.0f / fvar(*src, "Feature Scale", 100.0f)) + ")) * " +
+                              lit(mean);
+            }
             const std::string term = ridged ? "(noise * -2.0 + 1.0) * amp" : "noise * amp";
             b += "    float noise = " + sample + ";\n";
             b += "    float sum = " + term + ";\n";
@@ -535,6 +578,7 @@ private:
             b += "        amp *= gain;\n";
             b += "        p *= " + lit(fvar(n, "Lacunarity", 2.0f)) + ";\n";
             b += "        o = fn_oscale(o, " + lit(fvar(n, "Lacunarity", 2.0f)) + ");\n";
+            b += "        fp *= " + lit(fvar(n, "Lacunarity", 2.0f)) + ";\n";
             b += "        noise = " + sample + ";\n";
             b += "        sum += " + term + ";\n";
             b += "    }\n";
@@ -583,8 +627,13 @@ private:
         } else if (type == "DomainScale") {
             b += "    p *= " + lit(fvar(n, "Scaling", 1.0f)) + ";\n";
             b += "    o = fn_oscale(o, " + lit(fvar(n, "Scaling", 1.0f)) + ");\n";
+            b += "    fp *= " + lit(std::abs(fvar(n, "Scaling", 1.0f))) + ";\n";
             ret(source(n, "Source", dim));
         } else if (type == "DomainAxisScale") {
+            // (The footprint by the most stretched axis'.)
+            float most = 0.0f;
+            for (int i = 0; i < dim; ++i) most = std::max(most, std::abs(fvar(n, "Scaling", 1.0f, i)));
+            b += "    fp *= " + lit(most) + ";\n";
             for (int i = 0; i < dim; ++i) {
                 const std::string k = lit(fvar(n, "Scaling", 1.0f, i));
                 b += std::string("    p.") + axis(i) + " *= " + k + ";\n";
@@ -751,7 +800,7 @@ bool treeToGlsl(const std::string& encoded, const GlslOptions& options, std::str
         const std::string f = e.node(root, dim);
         if (f.empty()) break;
         entries += std::string("float ") + options.name + "(" + vecType(dim) + " p, int seed) { return " + f +
-                   "(p, " + (dim == 2 ? "FN_ORIGIN2" : "FN_ORIGIN3") + ", seed); }\n";
+                   "(p, " + (dim == 2 ? "FN_ORIGIN2" : "FN_ORIGIN3") + ", seed, FN_FOOTPRINT); }\n";
     }
     if (!e.error.empty()) {
         error = e.error;
