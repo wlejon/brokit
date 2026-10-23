@@ -137,13 +137,13 @@ static bronze::Value load_file_module(const std::string& spec)
 
     Runtime rt;
     bool ok = rt.eval(wrapped, file);
-    bronze::Value cacheAfter = ev::getGlobal("__brokit_module_cache");
+    ev::Persistent cacheAfter(ev::getGlobal("__brokit_module_cache"));
     if (!ok) {
-        if (ev::isObject(cacheAfter)) ev::setProperty(cacheAfter, file, ev::undefined());
+        if (ev::isObject(cacheAfter.get())) ev::setProperty(cacheAfter.get(), file, ev::undefined());
         return ev::throwError("Failed to evaluate module '" + file + "'");
     }
 
-    bronze::Value finalExports = ev::isObject(cacheAfter) ? ev::getProperty(cacheAfter, file) : ev::undefined();
+    bronze::Value finalExports = ev::isObject(cacheAfter.get()) ? ev::getProperty(cacheAfter.get(), file) : ev::undefined();
     return finalExports;
 }
 
