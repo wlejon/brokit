@@ -104,7 +104,8 @@ void HostClass::install(const char* name, uint32_t arity, ev::NativeFn body,
     ev::registerGlobal(name, s.ctor->get());
     ev::GlobalValue gt = ev::globalValue("globalThis");
     if (gt.found && !gt.value.isUndefined() && ev::isObject(gt.value)) {
-        ev::setProperty(gt.value, name, s.ctor->get());
+        ev::Persistent gtP(gt.value);
+        ev::setProperty(gtP.get(), name, s.ctor->get());
     }
 }
 
@@ -114,7 +115,8 @@ void HostClass::alias(const char* name) const {
     ev::registerGlobal(name, s->ctor->get());
     ev::GlobalValue gt = ev::globalValue("globalThis");
     if (gt.found && !gt.value.isUndefined() && ev::isObject(gt.value)) {
-        ev::setProperty(gt.value, name, s->ctor->get());
+        ev::Persistent gtP(gt.value);
+        ev::setProperty(gtP.get(), name, s->ctor->get());
     }
 }
 
@@ -144,7 +146,8 @@ Value HostClass::make(void* data, ev::HandleDestructor dtor, ev::Finalize when) 
 void HostClass::setStatic(const char* name, Value v) const {
     const Slots* s = slotsIfAny();
     if (!s || !s->ctor) return;
-    s->ctor->set(ev::setProperty(s->ctor->get(), name, v));
+    ev::Persistent valP(v);
+    s->ctor->set(ev::setProperty(s->ctor->get(), name, valP.get()));
 }
 
 Value HostClass::prototype() const {
