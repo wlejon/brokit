@@ -6,7 +6,9 @@
 
 #include <FastNoise/FastNoise.h>
 #include <FastNoise/Metadata.h>
+#include <brass/codegen/kernel_jit.hpp>
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 #include <cstdint>
@@ -326,6 +328,64 @@ static bronze::Value fast_noise_gen_single3_d(bronze::Value thisVal, std::span<c
     return ev::fromDouble(w->node->GenSingle3D(x, y, z, seed));
 }
 
+// Threshold for dispatching 2D/3D noise grids and position arrays across
+// brass's persistent DOALL worker pool (64x64 = 4096 samples).
+static constexpr size_t kParallelGridThreshold = 64 * 64;
+
+static void genUniformGrid2DParallel(const FastNoise::SmartNode<>& node,
+                                     float* dest, double xOffset, double yOffset,
+                                     int32_t xSize, int32_t ySize, float step, int32_t seed)
+{
+    const size_t total = static_cast<size_t>(xSize) * static_cast<size_t>(ySize);
+    if (total < kParallelGridThreshold || ySize < 4) {
+        node->GenUniformGrid2D(dest, static_cast<float>(xOffset), static_cast<float>(yOffset),
+                               xSize, ySize, step, step, seed);
+        return;
+    }
+    const int64_t rowsPerChunk = std::max<int64_t>(4, 4096 / std::max<int64_t>(1, xSize));
+    const int64_t numChunks = (static_cast<int64_t>(ySize) + rowsPerChunk - 1) / rowsPerChunk;
+    brass::codegen::parallel_for(0, numChunks, [&](int64_t c0, int64_t c1) {
+        for (int64_t c = c0; c < c1; ++c) {
+            const int32_t y0 = static_cast<int32_t>(c * rowsPerChunk);
+            const int32_t y1 = static_cast<int32_t>(std::min<int64_t>(ySize, (c + 1) * rowsPerChunk));
+            const int32_t rows = y1 - y0;
+            float* slice = dest + static_cast<size_t>(y0) * static_cast<size_t>(xSize);
+            const double sliceYOff = static_cast<double>(static_cast<float>(yOffset) + static_cast<float>(y0) * step);
+            node->GenUniformGrid2D(slice, static_cast<float>(xOffset), sliceYOff,
+                                   xSize, rows, step, step, seed);
+        }
+    }, 1);
+}
+
+static void genUniformGrid3DParallel(const FastNoise::SmartNode<>& node,
+                                     float* dest, double xOff, double yOff, double zOff,
+                                     int32_t xSize, int32_t ySize, int32_t zSize,
+                                     float step, int32_t seed)
+{
+    const size_t plane = static_cast<size_t>(xSize) * static_cast<size_t>(ySize);
+    const size_t total = plane * static_cast<size_t>(zSize);
+    if (total < kParallelGridThreshold || zSize < 2) {
+        node->GenUniformGrid3D(dest, static_cast<float>(xOff), static_cast<float>(yOff),
+                               static_cast<float>(zOff), xSize, ySize, zSize,
+                               step, step, step, seed);
+        return;
+    }
+    const int64_t slicesPerChunk = std::max<int64_t>(1, 4096 / std::max<int64_t>(1, static_cast<int64_t>(plane)));
+    const int64_t numChunks = (static_cast<int64_t>(zSize) + slicesPerChunk - 1) / slicesPerChunk;
+    brass::codegen::parallel_for(0, numChunks, [&](int64_t c0, int64_t c1) {
+        for (int64_t c = c0; c < c1; ++c) {
+            const int32_t z0 = static_cast<int32_t>(c * slicesPerChunk);
+            const int32_t z1 = static_cast<int32_t>(std::min<int64_t>(zSize, (c + 1) * slicesPerChunk));
+            const int32_t zCount = z1 - z0;
+            float* slice = dest + static_cast<size_t>(z0) * plane;
+            const double sliceZOff = static_cast<double>(static_cast<float>(zOff) + static_cast<float>(z0) * step);
+            node->GenUniformGrid3D(slice, static_cast<float>(xOff), static_cast<float>(yOff),
+                                   sliceZOff, xSize, ySize, zCount,
+                                   step, step, step, seed);
+        }
+    }, 1);
+}
+
 static bronze::Value fast_noise_gen_uniform_grid2_d(bronze::Value thisVal, std::span<const bronze::Value> args)
 {
     auto* w = getNoise(thisVal);
@@ -349,9 +409,7 @@ static bronze::Value fast_noise_gen_uniform_grid2_d(bronze::Value thisVal, std::
     if (!gridCount({xSize, ySize}, kMaxGridFloats, &count))
         return ev::throwRangeError("genUniformGrid2D: grid too large");
     std::vector<float> output(count);
-    w->node->GenUniformGrid2D(output.data(),
-                               static_cast<float>(xOffset), static_cast<float>(yOffset),
-                               xSize, ySize, step, step, seed);
+    genUniformGrid2DParallel(w->node, output.data(), xOffset, yOffset, xSize, ySize, step, seed);
     return make_float32_array(output.data(), count);
 }
 
@@ -383,9 +441,7 @@ static bronze::Value fast_noise_gen_uniform_grid2_d_into(bronze::Value thisVal, 
                                    std::to_string(ySize) + " floats required");
 
     float step = static_cast<float>(frequency);
-    w->node->GenUniformGrid2D(dest,
-                               static_cast<float>(xOffset), static_cast<float>(yOffset),
-                               xSize, ySize, step, step, seed);
+    genUniformGrid2DParallel(w->node, dest, xOffset, yOffset, xSize, ySize, step, seed);
     return ev::undefined();
 }
 
@@ -414,11 +470,7 @@ static bronze::Value fast_noise_gen_uniform_grid3_d(bronze::Value thisVal, std::
     if (!gridCount({xSize, ySize, zSize}, kMaxGridFloats, &count))
         return ev::throwRangeError("genUniformGrid3D: grid too large");
     std::vector<float> output(count);
-    w->node->GenUniformGrid3D(output.data(),
-                               static_cast<float>(xOff), static_cast<float>(yOff),
-                               static_cast<float>(zOff),
-                               xSize, ySize, zSize,
-                               step, step, step, seed);
+    genUniformGrid3DParallel(w->node, output.data(), xOff, yOff, zOff, xSize, ySize, zSize, step, seed);
     return make_float32_array(output.data(), count);
 }
 
@@ -453,11 +505,7 @@ static bronze::Value fast_noise_gen_uniform_grid3_d_into(bronze::Value thisVal, 
                                    " floats required");
     
     float step = static_cast<float>(frequency);
-    w->node->GenUniformGrid3D(dest,
-                               static_cast<float>(xOff), static_cast<float>(yOff),
-                               static_cast<float>(zOff),
-                               xSize, ySize, zSize,
-                               step, step, step, seed);
+    genUniformGrid3DParallel(w->node, dest, xOff, yOff, zOff, xSize, ySize, zSize, step, seed);
     return ev::undefined();
 }
 
@@ -489,10 +537,23 @@ static bronze::Value fast_noise_gen_position_array2_d(bronze::Value thisVal, std
         return ev::throwRangeError("dest too small: " + std::to_string(count) + " floats required");
     if (count > static_cast<size_t>(INT32_MAX))
         return ev::throwRangeError("position count exceeds INT_MAX");
-    
-    w->node->GenPositionArray2D(dest, static_cast<int>(count), xs, ys,
-                                 static_cast<float>(x_off), static_cast<float>(y_off),
-                                 seed);
+
+    const float fxOff = static_cast<float>(x_off);
+    const float fyOff = static_cast<float>(y_off);
+    if (count >= kParallelGridThreshold) {
+        constexpr int64_t kChunk = 4096; // multiple of SIMD register width (16)
+        const int64_t numChunks = (static_cast<int64_t>(count) + kChunk - 1) / kChunk;
+        brass::codegen::parallel_for(0, numChunks, [&](int64_t c0, int64_t c1) {
+            for (int64_t c = c0; c < c1; ++c) {
+                const size_t start = static_cast<size_t>(c * kChunk);
+                const size_t end = std::min<size_t>(count, start + static_cast<size_t>(kChunk));
+                w->node->GenPositionArray2D(dest + start, static_cast<int>(end - start),
+                                            xs + start, ys + start, fxOff, fyOff, seed);
+            }
+        }, 1);
+    } else {
+        w->node->GenPositionArray2D(dest, static_cast<int>(count), xs, ys, fxOff, fyOff, seed);
+    }
     return ev::undefined();
 }
 
@@ -530,10 +591,26 @@ static bronze::Value fast_noise_gen_position_array3_d(bronze::Value thisVal, std
         return ev::throwRangeError("dest too small: " + std::to_string(count) + " floats required");
     if (count > static_cast<size_t>(INT32_MAX))
         return ev::throwRangeError("position count exceeds INT_MAX");
-    
-    w->node->GenPositionArray3D(dest, static_cast<int>(count), xs, ys, zs,
-                                 static_cast<float>(x_off), static_cast<float>(y_off),
-                                 static_cast<float>(z_off), seed);
+
+    const float fxOff = static_cast<float>(x_off);
+    const float fyOff = static_cast<float>(y_off);
+    const float fzOff = static_cast<float>(z_off);
+    if (count >= kParallelGridThreshold) {
+        constexpr int64_t kChunk = 4096; // multiple of SIMD register width (16)
+        const int64_t numChunks = (static_cast<int64_t>(count) + kChunk - 1) / kChunk;
+        brass::codegen::parallel_for(0, numChunks, [&](int64_t c0, int64_t c1) {
+            for (int64_t c = c0; c < c1; ++c) {
+                const size_t start = static_cast<size_t>(c * kChunk);
+                const size_t end = std::min<size_t>(count, start + static_cast<size_t>(kChunk));
+                w->node->GenPositionArray3D(dest + start, static_cast<int>(end - start),
+                                            xs + start, ys + start, zs + start,
+                                            fxOff, fyOff, fzOff, seed);
+            }
+        }, 1);
+    } else {
+        w->node->GenPositionArray3D(dest, static_cast<int>(count), xs, ys, zs,
+                                    fxOff, fyOff, fzOff, seed);
+    }
     return ev::undefined();
 }
 

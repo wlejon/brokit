@@ -170,6 +170,7 @@ if(BROKIT_ENABLE_NOISE)
     target_compile_features(brokit_noise_glsl PUBLIC cxx_std_17)
 
     target_link_libraries(brokit_api PUBLIC FastNoise brokit_noise_glsl)
+    target_link_libraries(brokit_api PRIVATE brass)
     target_compile_definitions(brokit_api PUBLIC BROKIT_HAS_NOISE)
 endif()
 
