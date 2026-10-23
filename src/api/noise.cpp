@@ -20,10 +20,14 @@ namespace brokit::api {
 // so encode() can hand the tree on as the string NewFromEncodedNodeTree
 // reads: to another thread or process, or to a file. A source's data is
 // held by the node it is set on.
+struct NoiseDataNode {
+    std::shared_ptr<FastNoise::NodeData> data;
+    std::vector<std::shared_ptr<NoiseDataNode>> lookups, hybrids;   // the sources' data trees, a slot each
+};
+
 struct NoiseWrapper {
     FastNoise::SmartNode<> node;
-    std::shared_ptr<FastNoise::NodeData> data;
-    std::vector<std::shared_ptr<FastNoise::NodeData>> lookups, hybrids;   // the sources' data, a slot each
+    std::shared_ptr<NoiseDataNode> tree;
 };
 
 static HostClass g_fastNoiseClass;
@@ -42,8 +46,8 @@ static NoiseWrapper* getNoise(bronze::Value v)
 
 static bronze::Value wrap(NoiseWrapper* w)
 {
-    w->lookups.resize(w->data->nodeLookups.size());
-    w->hybrids.resize(w->data->hybrids.size());
+    w->tree->lookups.resize(w->tree->data->nodeLookups.size());
+    w->tree->hybrids.resize(w->tree->data->hybrids.size());
     return g_fastNoiseClass.make(w, fastNoiseDtor);
 }
 
@@ -62,7 +66,8 @@ static bronze::Value wrapNode(FastNoise::SmartNode<> node)
         meta.memberVariables[vi].setFunc(node.get(), data->variables[vi]);
     for (size_t hi = 0; hi < meta.memberHybrids.size(); hi++)
         meta.memberHybrids[hi].setValueFunc(node.get(), data->hybrids[hi].second);
-    return wrap(new NoiseWrapper{std::move(node), std::move(data), {}, {}});
+    auto tree = std::make_shared<NoiseDataNode>(NoiseDataNode{std::move(data), {}, {}});
+    return wrap(new NoiseWrapper{std::move(node), std::move(tree)});
 }
 
 static bronze::Value make_float32_array(const float* data, size_t count)
@@ -169,7 +174,7 @@ static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronz
     const auto& meta = w->node->GetMetadata();
     bronze::Value val = args[1];
     using Value = FastNoise::Metadata::MemberVariable::ValueUnion;
-    FastNoise::NodeData& data = *w->data;
+    FastNoise::NodeData& data = *w->tree->data;
 
     for (size_t vi = 0; vi < meta.memberVariables.size(); vi++) {
         const auto& mv = meta.memberVariables[vi];
@@ -216,8 +221,8 @@ static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronz
         if (!sw) return ev::throwTypeError("Node input requires a FastNoise node");
         if (!mn.setFunc(w->node.get(), sw->node))
             return ev::throwTypeError("Failed to set node source (type mismatch)");
-        data.nodeLookups[ni] = sw->data.get();
-        w->lookups[ni] = sw->data;
+        data.nodeLookups[ni] = sw->tree->data.get();
+        w->tree->lookups[ni] = sw->tree;
         return ev::undefined();
     }
     for (size_t hi = 0; hi < meta.memberHybrids.size(); hi++) {
@@ -227,8 +232,8 @@ static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronz
         if (sw) {
             if (!mh.setNodeFunc(w->node.get(), sw->node))
                 return ev::throwTypeError("Failed to set hybrid node source");
-            data.hybrids[hi].first = sw->data.get();
-            w->hybrids[hi] = sw->data;
+            data.hybrids[hi].first = sw->tree->data.get();
+            w->tree->hybrids[hi] = sw->tree;
             return ev::undefined();
         }
         if (!ev::isDouble(val)) return ev::throwTypeError("expected number");
@@ -236,7 +241,7 @@ static bronze::Value fast_noise_set(bronze::Value thisVal, std::span<const bronz
         if (!mh.setValueFunc(w->node.get(), static_cast<float>(d)))
             return ev::throwTypeError("Failed to set hybrid value");
         data.hybrids[hi] = {nullptr, static_cast<float>(d)};
-        w->hybrids[hi].reset();
+        w->tree->hybrids[hi].reset();
         return ev::undefined();
     }
     return ev::throwError("No member '" + name + "' on this node type");
@@ -561,7 +566,7 @@ static bronze::Value fast_noise_encode(bronze::Value thisVal, std::span<const br
 {
     auto* w = getNoise(thisVal);
     if (!w) return ev::throwTypeError("receiver is not a FastNoise instance");
-    std::string encoded = FastNoise::Metadata::SerialiseNodeData(w->data.get());
+    std::string encoded = FastNoise::Metadata::SerialiseNodeData(w->tree->data.get());
     if (encoded.empty()) return ev::throwError("encode: the node tree has an unset source");
     return ev::fromUtf8(encoded);
 }
@@ -573,7 +578,7 @@ static bronze::Value fast_noise_glsl(bronze::Value thisVal, std::span<const bron
 {
     auto* w = getNoise(thisVal);
     if (!w) return ev::throwTypeError("receiver is not a FastNoise instance");
-    std::string encoded = FastNoise::Metadata::SerialiseNodeData(w->data.get());
+    std::string encoded = FastNoise::Metadata::SerialiseNodeData(w->tree->data.get());
     if (encoded.empty()) return ev::throwError("glsl: the node tree has an unset source");
     brokit::noise::GlslOptions options;
     if (!args.empty() && ev::isObject(args[0])) {
@@ -618,7 +623,9 @@ static bronze::Value js_fast_noise_constructor(bronze::Value, std::span<const br
     if (!node || !root)
         return ev::throwTypeError("FastNoise: invalid encoded node tree");
 
-    return wrap(new NoiseWrapper{std::move(node), std::shared_ptr<FastNoise::NodeData>(owned, root), {}, {}});
+    auto tree = std::make_shared<NoiseDataNode>(
+        NoiseDataNode{std::shared_ptr<FastNoise::NodeData>(owned, root), {}, {}});
+    return wrap(new NoiseWrapper{std::move(node), std::move(tree)});
 }
 
 void installNoise()
