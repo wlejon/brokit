@@ -109,9 +109,14 @@ struct FnO3 { vec2 x; vec2 y; vec2 z; };
 // a * k, a + b (Dekker's products and Knuth's sums; fma fused). Every step
 // is precise: a compiler free to reassociate would cancel the error terms.
 vec2 fn_dmul(vec2 a, float k) {
+    precise float ca = a.x * 4097.0;
+    precise float ah = ca - (ca - a.x);
+    precise float al = a.x - ah;
+    precise float ck = k * 4097.0;
+    precise float kh = ck - (ck - k);
+    precise float kl = k - kh;
     precise float p = a.x * k;
-    precise float e = fma(a.x, k, -p);
-    e = fma(a.y, k, e);
+    precise float e = ((ah * kh - p) + ah * kl + al * kh) + (al * kl + a.y * k);
     precise float s = p + e;
     precise float r = e - (s - p);
     return vec2(s, r);
@@ -598,7 +603,7 @@ private:
             else ret("a - trunc(a / c) * c");
         } else if (type == "PowFloat") {
             b += "    float v = abs(" + hybrid(n, "Value", dim) + ");\n";
-            ret("pow(v, " + hybrid(n, "Pow", dim) + ")");
+            ret("v > 0.0 ? pow(v, " + hybrid(n, "Pow", dim) + ") : 0.0");
         } else if (type == "PowInt") {
             b += "    float v = " + source(n, "Value", dim) + ";\n";
             b += "    float r = v * v;\n";
@@ -618,11 +623,10 @@ private:
             b += "    float fadeMin = " + hybrid(n, "Fade Min", dim) + ";\n";
             b += "    float fadeMax = " + hybrid(n, "Fade Max", dim) + ";\n";
             b += "    float fadeRange = fadeMax - fadeMin;\n";
-            b += "    fade = max(0.0, min(1.0, (fade - fadeMin) / fadeRange));\n";
+            b += "    fade = fadeRange == 0.0 ? 0.5 : max(0.0, min(1.0, (fade - fadeMin) / fadeRange));\n";
             const int interp = ivar(n, "Interpolation", 0);
             if (interp == 1) b += "    fade = fn_hermite(fade);\n";
             else if (interp == 2) b += "    fade = fn_quintic(fade);\n";
-            b += "    fade = fadeRange == 0.0 ? 0.5 : fade;\n";
             ret("fn_lerp(" + source(n, "A", dim) + ", " + source(n, "B", dim) + ", fade)");
         } else if (type == "DomainScale") {
             b += "    p *= " + lit(fvar(n, "Scaling", 1.0f)) + ";\n";
