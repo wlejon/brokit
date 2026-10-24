@@ -59,9 +59,14 @@ static bronze::Value load_file_module(const std::string& spec)
 
     const std::string s = p.string();
     fs::path found;
-    for (const std::string& cand : {s, s + ".js", s + ".json",
-                                    (p / "index.js").string()}) {
+    for (const std::string& cand : {s, s + ".js", s + ".ts", s + ".json",
+                                    (p / "index.js").string(),
+                                    (p / "index.ts").string()}) {
         if (fs::is_regular_file(cand, ec)) { found = cand; break; }
+    }
+    if (found.empty() && s.size() > 3 && s.compare(s.size() - 3, 3, ".js") == 0) {
+        const std::string tsCand = s.substr(0, s.size() - 3) + ".ts";
+        if (fs::is_regular_file(tsCand, ec)) found = tsCand;
     }
     if (found.empty()) {
         return ev::throwError("Cannot find module '" + spec + "'");
