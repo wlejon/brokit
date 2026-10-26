@@ -16,6 +16,7 @@
 // with "0.0.0.0" / "::" / a concrete interface address.
 
 #include "api/api.h"
+#include "api/access_policy.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
 
@@ -328,6 +329,9 @@ static bronze::Value js_net_tcp_listen(bronze::Value, std::span<const bronze::Va
     ArgReader reader(args);
     int port = reader.getInt(0, 0);
     std::string host = reader.getString(1, "127.0.0.1");
+    // http.createServer and WebSocketServer listen through here too.
+    if (auto r = checkNetAccess(socketUrl("tcp-listen", host, port)); !r.empty())
+        return throwAccessError(r, kNetDeniedCode);
 
     std::string err;
     addrinfo* res = resolve(host, port, AF_UNSPEC, SOCK_STREAM, true, err);
@@ -374,6 +378,8 @@ static bronze::Value js_net_tcp_connect(bronze::Value, std::span<const bronze::V
     ArgReader reader(args);
     std::string host = reader.getString(0, "");
     int port = reader.getInt(1, 0);
+    if (auto r = checkNetAccess(socketUrl("tcp", host, port)); !r.empty())
+        return throwAccessError(r, kNetDeniedCode);
 
     std::string err;
     addrinfo* res = resolve(host, port, AF_UNSPEC, SOCK_STREAM, false, err);
@@ -503,6 +509,8 @@ static bronze::Value js_net_udp_bind(bronze::Value, std::span<const bronze::Valu
     int port = reader.getInt(1, 0);
     std::string defaultHost = h->ipv6 ? "::1" : "127.0.0.1";
     std::string host = reader.getString(2, defaultHost);
+    if (auto r = checkNetAccess(socketUrl("udp-bind", host, port)); !r.empty())
+        return throwAccessError(r, kNetDeniedCode);
 
     std::string err;
     addrinfo* res = resolve(host, port, h->ipv6 ? AF_INET6 : AF_INET,
@@ -534,6 +542,9 @@ static bronze::Value js_net_udp_send(bronze::Value, std::span<const bronze::Valu
 
     int port = reader.getInt(2, 0);
     std::string host = reader.getString(3, "");
+    // Asked per datagram: a UDP socket has no connection to ask about once.
+    if (auto r = checkNetAccess(socketUrl("udp", host, port)); !r.empty())
+        return throwAccessError(r, kNetDeniedCode);
 
     std::string err;
     addrinfo* res = resolve(host, port, h->ipv6 ? AF_INET6 : AF_INET,

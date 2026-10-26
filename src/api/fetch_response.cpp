@@ -69,6 +69,44 @@ bool isBlobUrl(const std::string& url)
     return url.size() >= 5 && url.compare(0, 5, "blob:") == 0;
 }
 
+bool isFileUrl(const std::string& url)
+{
+    return url.size() >= 5 && url.compare(0, 5, "file:") == 0;
+}
+
+std::string fileUrlToPath(const std::string& url)
+{
+    std::string rest = url.substr(5);
+    if (rest.compare(0, 2, "//") == 0) {
+        rest = rest.substr(2);
+        // An authority of "localhost" (or none) is this machine.
+        if (rest.compare(0, 9, "localhost") == 0) rest = rest.substr(9);
+    }
+    const size_t cut = rest.find_first_of("?#");
+    if (cut != std::string::npos) rest.resize(cut);
+
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string path;
+    path.reserve(rest.size());
+    for (size_t i = 0; i < rest.size(); ++i) {
+        if (rest[i] == '%' && i + 2 < rest.size() &&hexVal(rest[i + 1]) >= 0 && hexVal(rest[i + 2]) >= 0) {
+            path += static_cast<char>((hexVal(rest[i + 1]) << 4) | hexVal(rest[i + 2]));
+            i += 2;
+        } else {
+            path += rest[i];
+        }
+    }
+    // "/C:/dir" names a drive.
+    if (path.size() >= 3 && path[0] == '/' && std::isalpha(static_cast<unsigned char>(path[1])) && path[2] == ':')
+        path.erase(0, 1);
+    return path;
+}
+
 static std::string detectMimeType(const std::string& path)
 {
     auto dot = path.rfind('.');

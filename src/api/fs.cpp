@@ -1,4 +1,5 @@
 #include "api/api.h"
+#include "api/access_policy.h"
 #include "api/arg_reader.h"
 #include "api/fs_async.h"
 #include "api/object_builder.h"
@@ -273,6 +274,7 @@ static bronze::Value js_readFileSync(bronze::Value, std::span<const bronze::Valu
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
     std::string encoding = getEncoding(a, 1);
+    if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
 
     std::ifstream f(u8p(resolved), std::ios::in | std::ios::binary);
     if (!f) {
@@ -327,6 +329,10 @@ static bronze::Value js_mkdtempSync(bronze::Value, std::span<const bronze::Value
     if (a.empty() || !ev::isString(a[0])) return ev::throwTypeError("mkdtempSync: prefix must be a string");
     const std::string prefix = ev::toUtf8(a[0]);
     const std::string resolved = resolveFsPath(prefix.c_str(), /*forCreate=*/true);
+    // The directory made is the prefix and six characters, a sibling of the
+    // prefix's last component rather than a child of it.
+    if (auto r = fsRefusal(resolved + "XXXXXX", FsAccess::Write); !r.empty())
+        return throwFsDenied(r, resolved + "XXXXXX");
     std::error_code ec;
     const std::string suffix = makeTempDir(resolved, ec);
     if (ec) return throwFsError("mkdtemp", (prefix + "XXXXXX").c_str(), ec);
@@ -340,6 +346,7 @@ static bronze::Value js_writeFileSync(bronze::Value, std::span<const bronze::Val
 
     std::string rawPath = ev::toUtf8(a[0]);
     std::string pathStr = resolveFsPath(rawPath.c_str(), /*forCreate=*/true);
+    if (auto r = fsRefusal(pathStr, FsAccess::Write); !r.empty()) return throwFsDenied(r, pathStr);
 
     std::string data;
     if (ev::isString(a[1])) {
@@ -374,6 +381,7 @@ static bronze::Value js_appendFileSync(bronze::Value, std::span<const bronze::Va
 
     std::string rawPath = ev::toUtf8(a[0]);
     std::string pathStr = resolveFsPath(rawPath.c_str(), /*forCreate=*/true);
+    if (auto r = fsRefusal(pathStr, FsAccess::Write); !r.empty()) return throwFsDenied(r, pathStr);
 
     std::string data;
     if (ev::isString(a[1])) {
@@ -405,6 +413,8 @@ static bronze::Value js_statSync(bronze::Value, std::span<const bronze::Value> a
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
 
+    if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
+
     StatFields sf;
     std::error_code ec;
     if (!statPathFields(resolved, /*follow=*/true, sf, ec)) {
@@ -420,6 +430,8 @@ static bronze::Value js_lstatSync(bronze::Value, std::span<const bronze::Value> 
 
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
+
+    if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
 
     StatFields sf;
     std::error_code ec;
@@ -442,6 +454,8 @@ static bronze::Value js_readdirSync(bronze::Value, std::span<const bronze::Value
         bronze::Value wft = ev::getProperty(a[1], "withFileTypes");
         withFileTypes = ev::isBool(wft) && ev::toBool(wft);
     }
+
+    if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
 
     std::error_code ec;
     auto iter = fs::directory_iterator(u8p(resolved), ec);
@@ -473,6 +487,9 @@ static bronze::Value js_existsSync(bronze::Value, std::span<const bronze::Value>
     if (a.empty()) return ev::fromBool(false);
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
+    // A path the program may not read does not exist as far as it can tell,
+    // as Node's existsSync answers false for one it cannot stat.
+    if (!fsRefusal(resolved, FsAccess::Read).empty()) return ev::fromBool(false);
     std::error_code ec;
     return ev::fromBool(fs::exists(u8p(resolved), ec));
 }
@@ -490,6 +507,8 @@ static bronze::Value js_mkdirSync(bronze::Value, std::span<const bronze::Value> 
         bronze::Value rec = ev::getProperty(a[1], "recursive");
         recursive = ev::isBool(rec) && ev::toBool(rec);
     }
+
+    if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
 
     std::error_code ec;
     if (recursive) {
@@ -512,6 +531,8 @@ static bronze::Value js_rmdirSync(bronze::Value, std::span<const bronze::Value> 
 
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
+
+    if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
 
     std::error_code ec;
     fs::remove(u8p(resolved), ec);
@@ -537,6 +558,10 @@ static bronze::Value js_rmSync(bronze::Value, std::span<const bronze::Value> a)
         bronze::Value f = ev::getProperty(a[1], "force");
         force = ev::isBool(f) && ev::toBool(f);
     }
+
+    // Asked before the existence test, so `force` does not make a refused
+    // path read as quietly absent.
+    if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
 
     std::error_code ec;
     const fs::path p = u8p(resolved);
@@ -564,6 +589,8 @@ static bronze::Value js_unlinkSync(bronze::Value, std::span<const bronze::Value>
     std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
 
+    if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
+
     std::error_code ec;
     fs::remove(u8p(resolved), ec);
     if (ec) {
@@ -579,6 +606,9 @@ static bronze::Value js_renameSync(bronze::Value, std::span<const bronze::Value>
 
     std::string oldResolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
     std::string newResolved = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
+    // Both ends are written: the source goes away.
+    if (auto r = fsRefusal(oldResolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, oldResolved);
+    if (auto r = fsRefusal(newResolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, newResolved);
 
     std::error_code ec;
     fs::rename(u8p(oldResolved), u8p(newResolved), ec);
@@ -595,6 +625,8 @@ static bronze::Value js_copyFileSync(bronze::Value, std::span<const bronze::Valu
 
     std::string srcResolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
     std::string destResolved = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
+    if (auto r = fsRefusal(srcResolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, srcResolved);
+    if (auto r = fsRefusal(destResolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, destResolved);
 
     std::error_code ec;
     fs::copy_file(u8p(srcResolved), u8p(destResolved), fs::copy_options::overwrite_existing, ec);
@@ -611,6 +643,7 @@ static bronze::Value js_chmodSync(bronze::Value, std::span<const bronze::Value> 
 
     std::string resolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
     int mode = i32At(a, 1);
+    if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
 
 #ifdef _WIN32
     int wmode = 0;
@@ -634,6 +667,7 @@ static bronze::Value js_realpathSync(bronze::Value, std::span<const bronze::Valu
     if (a.empty()) return ev::throwTypeError("realpathSync: path required");
 
     std::string resolved = resolveFsPath(ev::toUtf8(a[0]).c_str());
+    if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
     std::error_code ec;
     auto canonical = fs::canonical(u8p(resolved), ec);
     if (ec) {
@@ -656,6 +690,7 @@ static bronze::Value js_utimesSync(bronze::Value, std::span<const bronze::Value>
     if (!std::isfinite(atimeSec) || !std::isfinite(mtimeSec)) {
         return ev::throwTypeError("utimesSync: atime and mtime must be finite numbers");
     }
+    if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
 
     std::error_code ec = utimesPath(resolved, atimeSec, mtimeSec, follow);
     if (ec) return throwFsError(syscall, resolved.c_str(), ec);
@@ -671,6 +706,7 @@ static bronze::Value js_truncateSync(bronze::Value, std::span<const bronze::Valu
     int64_t len = (a.size() >= 2 && !ev::isUndefined(a[1]) && !ev::isNull(a[1]))
                       ? saturateI64(ev::toDouble(a[1]))
                       : 0;
+    if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
     if (len < 0) {
         return throwFsError("truncate", resolved.c_str(), std::make_error_code(std::errc::invalid_argument));
     }
@@ -689,6 +725,9 @@ static bronze::Value js_symlinkSync(bronze::Value, std::span<const bronze::Value
     std::string target = ev::toUtf8(a[0]);
     std::string resolvedPath = resolveFsPath(ev::toUtf8(a[1]).c_str(), /*forCreate=*/true);
     std::string type = (a.size() >= 3 && ev::isString(a[2])) ? ev::toUtf8(a[2]) : "";
+    // The link is what is written. Its target is not opened here, and what is
+    // later opened through the link is asked of by its canonical path.
+    if (auto r = fsRefusal(resolvedPath, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolvedPath);
 
     bool isDir = (type == "dir" || type == "junction");
     if (!isDir && type != "file") {

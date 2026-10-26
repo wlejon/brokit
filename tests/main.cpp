@@ -1,8 +1,12 @@
 #include "runtime/runtime.h"
 #include "api/api.h"
+#include "api/object_builder.h"
 #include <curl/curl.h>
 
+#include <cctype>
 #include <chrono>
+#include <memory>
+#include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -29,6 +33,123 @@ struct TestResult {
 // The most recent console/runtime log line, readable from a test through
 // __test_lastLog() so console formatting can be asserted.
 static std::string g_lastLog;
+
+// ---- A test access policy ----------------------------------------------------
+//
+// __test_setAccessPolicy({ fsDenyUnder: [dirs], fsReadOnlyUnder: [dirs],
+// spawn: true, net: true | [substrings] }) installs a policy refusing what it
+// names (relative dirs are taken against the working directory);
+// __test_clearAccessPolicy() removes it, and the harness removes it after
+// every file. __test_accessLog() lists what the hooks were asked, as
+// "fs:read:<path>", "fs:write:<path>", "spawn:<line>" or "net:<url>", since
+// the policy was set.
+
+namespace {
+
+struct TestPolicy {
+    std::vector<std::string> fsDenyUnder, fsReadOnlyUnder, netDeny;
+    bool spawnDeny = false;
+    bool netDenyAll = false;
+};
+
+std::mutex g_accessLogMu;
+std::vector<std::string> g_accessLog;
+
+void logAccess(std::string entry) {
+    std::lock_guard lock(g_accessLogMu);
+    g_accessLog.push_back(std::move(entry));
+}
+
+// A comparable form of an absolute path: generic separators, and on Windows
+// one case, as the filesystem has.
+std::string comparablePath(const std::string& p) {
+    std::u8string u = fs::absolute(fs::path(std::u8string(p.begin(), p.end()))).lexically_normal().generic_u8string();
+    std::string s(u.begin(), u.end());
+#ifdef _WIN32
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+#endif
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    return s;
+}
+
+bool isUnder(const std::string& path, const std::vector<std::string>& dirs) {
+    const std::string p = comparablePath(path);
+    for (const auto& d : dirs) {
+        if (p.compare(0, d.size(), d) == 0 && (p.size() == d.size() || p[d.size()] == '/')) return true;
+    }
+    return false;
+}
+
+std::vector<std::string> stringList(bronze::Value obj, const char* name) {
+    namespace ev = bronze::embed;
+    std::vector<std::string> out;
+    ev::Persistent arr{ev::getProperty(obj, name)};
+    if (!ev::isObject(arr.get())) return out;
+    const uint32_t len = static_cast<uint32_t>(ev::toDouble(ev::getProperty(arr.get(), "length")));
+    for (uint32_t i = 0; i < len; ++i) {
+        bronze::Value v = ev::getElement(arr.get(), i);
+        if (ev::isString(v)) out.push_back(ev::toUtf8(v));
+    }
+    return out;
+}
+
+bronze::Value js_setAccessPolicy(bronze::Value, std::span<const bronze::Value> a) {
+    namespace ev = bronze::embed;
+    auto cfg = std::make_shared<TestPolicy>();
+    if (!a.empty() && ev::isObject(a[0])) {
+        for (const auto& d : stringList(a[0], "fsDenyUnder")) cfg->fsDenyUnder.push_back(comparablePath(d));
+        for (const auto& d : stringList(a[0], "fsReadOnlyUnder")) cfg->fsReadOnlyUnder.push_back(comparablePath(d));
+        bronze::Value sp = ev::getProperty(a[0], "spawn");
+        cfg->spawnDeny = ev::isBool(sp) && ev::toBool(sp);
+        bronze::Value net = ev::getProperty(a[0], "net");
+        if (ev::isBool(net)) cfg->netDenyAll = ev::toBool(net);
+        else cfg->netDeny = stringList(a[0], "net");
+    }
+    {
+        std::lock_guard lock(g_accessLogMu);
+        g_accessLog.clear();
+    }
+
+    brokit::api::AccessPolicy policy;
+    policy.fs = [cfg](const std::string& path, brokit::api::FsAccess access) -> std::string {
+        const bool write = access == brokit::api::FsAccess::Write;
+        logAccess(std::string(write ? "fs:write:" : "fs:read:") + path);
+        if (isUnder(path, cfg->fsDenyUnder)) return "No file access to " + path;
+        if (write && isUnder(path, cfg->fsReadOnlyUnder)) return "No write access to " + path;
+        return {};
+    };
+    policy.spawn = [cfg](const std::string& command) -> std::string {
+        logAccess("spawn:" + command);
+        return cfg->spawnDeny ? "Not allowed to run " + command : std::string();
+    };
+    policy.net = [cfg](const std::string& url) -> std::string {
+        logAccess("net:" + url);
+        bool deny = cfg->netDenyAll;
+        for (const auto& s : cfg->netDeny) deny = deny || url.find(s) != std::string::npos;
+        return deny ? "No network access to " + url : std::string();
+    };
+    brokit::api::setAccessPolicy(std::move(policy));
+    return ev::undefined();
+}
+
+bronze::Value js_clearAccessPolicy(bronze::Value, std::span<const bronze::Value>) {
+    brokit::api::setAccessPolicy({});
+    return bronze::embed::undefined();
+}
+
+bronze::Value js_accessLog(bronze::Value, std::span<const bronze::Value>) {
+    namespace ev = bronze::embed;
+    std::vector<std::string> log;
+    {
+        std::lock_guard lock(g_accessLogMu);
+        log = g_accessLog;
+    }
+    brokit::api::ArrayBuilder arr;
+    for (const auto& entry : log) arr.push(ev::fromUtf8(entry));
+    return arr.get();
+}
+
+} // namespace
 
 static void captureLog(brokit::Runtime::LogLevel level, const std::string& msg) {
     g_lastLog = msg;
@@ -58,6 +179,9 @@ static TestResult runTestFile(const std::string& path) {
         }
         return bronze::embed::fromUtf8(info->ssl_version);
     });
+    bronze::embed::setGlobalFunction("__test_setAccessPolicy", 1, js_setAccessPolicy);
+    bronze::embed::setGlobalFunction("__test_clearAccessPolicy", 0, js_clearAccessPolicy);
+    bronze::embed::setGlobalFunction("__test_accessLog", 0, js_accessLog);
 
     // Install test helpers: assert, test registration
     const char* testHarness = R"JS(
@@ -323,6 +447,9 @@ int main(int argc, char* argv[]) {
 
     for (auto& file : testFiles) {
         auto result = runTestFile(file);
+        // A file that set a policy and failed before clearing it must not
+        // refuse the next file's work.
+        brokit::api::setAccessPolicy({});
         totalPassed += result.passed;
         totalFailed += result.failed;
 

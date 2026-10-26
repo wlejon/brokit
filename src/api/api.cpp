@@ -1,4 +1,5 @@
 #include "api/api.h"
+#include "api/access_policy.h"
 #include "runtime/runtime.h"
 
 #include <filesystem>
@@ -74,6 +75,12 @@ static bronze::Value load_file_module(const std::string& spec)
     found = fs::weakly_canonical(found, ec);
     const std::string file = found.string();
     const std::string dir = found.parent_path().string();
+
+    // Loading a module reads its file. Asked before the cache too: a module
+    // loaded while it was allowed is not handed out once it no longer is.
+    const std::u8string fileU8 = found.u8string();
+    const std::string fileUtf8(fileU8.begin(), fileU8.end());
+    if (auto r = fsRefusal(fileUtf8, FsAccess::Read); !r.empty()) return throwFsDenied(r, fileUtf8);
 
     ev::Persistent cache{ev::getGlobal("__brokit_module_cache")};
     if (!ev::isObject(cache.get())) {

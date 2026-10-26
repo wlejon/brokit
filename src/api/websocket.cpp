@@ -1,4 +1,5 @@
 #include "api/api.h"
+#include "api/access_policy.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
 
@@ -55,6 +56,11 @@ struct WSConnection {
 
     struct curl_slist* headers = nullptr;
 
+    // The access policy's word on the redirects curl follows during the
+    // upgrade: the last URL it allowed, and the refusal that stopped one.
+    std::string checkedUrl;
+    std::string refusal;
+
     ~WSConnection() {
         if (headers) curl_slist_free_all(headers);
     }
@@ -74,6 +80,24 @@ static size_t wsWriteCallback(char*, size_t size, size_t nmemb, void*)
     return size * nmemb;
 }
 
+// ws_connect asks the policy for the URL it was given; this asks it for a
+// redirect curl follows during the upgrade, before the request is sent, on
+// the JS thread that runs __brokit_ws_tick.
+static int wsPrereqCallback(void* clientp, char*, char*, int, int)
+{
+    auto* conn = static_cast<WSConnection*>(clientp);
+    char* url = nullptr;
+    curl_easy_getinfo(conn->easy, CURLINFO_EFFECTIVE_URL, &url);
+    if (!url || conn->checkedUrl == url) return CURL_PREREQFUNC_OK;
+    std::string refusal = checkNetAccess(url);
+    if (!refusal.empty()) {
+        conn->refusal = std::move(refusal);
+        return CURL_PREREQFUNC_ABORT;
+    }
+    conn->checkedUrl = url;
+    return CURL_PREREQFUNC_OK;
+}
+
 // ---------------------------------------------------------------------------
 // __brokit_ws_connect(url, protocols?) → { id, promise }
 // ---------------------------------------------------------------------------
@@ -85,14 +109,21 @@ static bronze::Value js_ws_connect(bronze::Value, std::span<const bronze::Value>
 
     std::string protocols = reader.getString(1, "");
 
+    if (auto r = checkNetAccess(url); !r.empty()) return throwAccessError(r, kNetDeniedCode);
+
     auto* conn = new WSConnection();
     conn->id = g_ws_nextId++;
     conn->state = 0; // connecting
+    conn->checkedUrl = url;
 
     conn->easy = curl_easy_init();
     if (!conn->easy) {
         delete conn;
         return ev::throwError("ws_connect: curl_easy_init failed");
+    }
+    if (accessPolicyActive()) {
+        curl_easy_setopt(conn->easy, CURLOPT_PREREQFUNCTION, wsPrereqCallback);
+        curl_easy_setopt(conn->easy, CURLOPT_PREREQDATA, conn);
     }
 
     curl_easy_setopt(conn->easy, CURLOPT_URL, url.c_str());
@@ -358,10 +389,12 @@ static bronze::Value js_ws_tick(bronze::Value, std::span<const bronze::Value>)
                 }
             } else {
                 conn->state = 3; // closed (failed)
-                conn->errorMsg = curl_easy_strerror(msg->data.result);
+                const bool refused = !conn->refusal.empty();
+                conn->errorMsg = refused ? conn->refusal : curl_easy_strerror(msg->data.result);
                 if (conn->promise.valid()) {
-                    bronze::Value err = newError("Error", conn->errorMsg);
-                    ev::rejectPromise(conn->promise.get(), err);
+                    ev::Persistent err{refused ? newAccessError(conn->errorMsg, kNetDeniedCode)
+                                               : newError("Error", conn->errorMsg)};
+                    ev::rejectPromise(conn->promise.get(), err.get());
                     conn->promise.reset();
                 }
             }

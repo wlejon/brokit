@@ -2,6 +2,7 @@
 // `sqlite` / `node:sqlite` module (js/sqlite.js).
 
 #include "api/api.h"
+#include "api/access_policy.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
 
@@ -20,6 +21,41 @@ namespace {
 
 static thread_local std::unordered_map<int, sqlite3*> g_dbs;
 static thread_local int g_nextDbId = 1;
+
+// SQL can open files of its own: ATTACH names one, and VACUUM INTO writes
+// one through an ATTACH of its own. The authorizer sees each as
+// SQLITE_ATTACH with the file name, so the access policy is asked there,
+// during prepare, and the refusal it gave is kept for the error thrown when
+// the statement fails. A name that is not a literal (a bound parameter, an
+// expression) cannot be checked, so under a policy it is refused.
+static thread_local std::string t_attachRefusal;
+
+bool exemptDbPath(const std::string& path) { return path.empty() || path == ":memory:"; }
+
+int sqliteAuthorizer(void*, int action, const char* arg1, const char*, const char*, const char*) {
+    if (action != SQLITE_ATTACH || !accessPolicyActive()) return SQLITE_OK;
+    if (!arg1) {
+        t_attachRefusal = "ATTACH of a database named by an expression is not allowed under an access policy";
+        return SQLITE_DENY;
+    }
+    const std::string name(arg1);
+    if (exemptDbPath(name)) return SQLITE_OK;
+    std::string refusal = fsRefusal(resolveAssetPath(name), FsAccess::Write);
+    if (refusal.empty()) return SQLITE_OK;
+    t_attachRefusal = std::move(refusal);
+    return SQLITE_DENY;
+}
+
+// The error a failed statement throws: the policy's refusal when one caused
+// it, else SQLite's own message.
+bronze::Value throwSqliteError(const std::string& prefix, const std::string& sqliteMessage) {
+    if (!t_attachRefusal.empty()) {
+        std::string refusal = std::move(t_attachRefusal);
+        t_attachRefusal.clear();
+        return throwAccessError(refusal, kFsDeniedCode);
+    }
+    return ev::throwError(prefix + sqliteMessage);
+}
 
 sqlite3* getDb(int id) {
     auto it = g_dbs.find(id);
@@ -142,6 +178,10 @@ static bronze::Value js_sqlite_open(bronze::Value, std::span<const bronze::Value
     std::string path = strAt(args, 0);
     if (path.empty()) path = ":memory:";
     else if (path != ":memory:") path = resolveAssetPath(path);
+    // A database file is opened read-write and created when missing.
+    if (!exemptDbPath(path)) {
+        if (auto r = fsRefusal(path, FsAccess::Write); !r.empty()) return throwFsDenied(r, path);
+    }
 
     sqlite3* db = nullptr;
     int rc = sqlite3_open(path.c_str(), &db);
@@ -150,6 +190,7 @@ static bronze::Value js_sqlite_open(bronze::Value, std::span<const bronze::Value
         if (db) sqlite3_close(db);
         return ev::throwError("SQLite open failed: " + msg);
     }
+    sqlite3_set_authorizer(db, sqliteAuthorizer, nullptr);
 
     sqlite3_busy_timeout(db, 5000);
     sqlite3_exec(db, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);
@@ -176,11 +217,12 @@ static bronze::Value js_sqlite_exec(bronze::Value, std::span<const bronze::Value
 
     std::string sql = strAt(args, 1);
     char* errMsg = nullptr;
+    t_attachRefusal.clear();
     int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
     if (rc != SQLITE_OK) {
         std::string err = errMsg ? errMsg : sqlite3_errmsg(db);
         if (errMsg) sqlite3_free(errMsg);
-        return ev::throwError("SQLite error: " + err);
+        return throwSqliteError("SQLite error: ", err);
     }
     return ev::undefined();
 }
@@ -195,10 +237,11 @@ static bronze::Value js_sqlite_query(bronze::Value, std::span<const bronze::Valu
     ev::Persistent params{argAt(args, 3)};
 
     sqlite3_stmt* stmt = nullptr;
+    t_attachRefusal.clear();
     int rc = sqlite3_prepare_v2(db, sql.c_str(), static_cast<int>(sql.size()), &stmt, nullptr);
     if (rc != SQLITE_OK || !stmt) {
         std::string err = sqlite3_errmsg(db);
-        return ev::throwError("SQLite prepare error: " + err);
+        return throwSqliteError("SQLite prepare error: ", err);
     }
 
     std::string bindErr;
@@ -212,7 +255,7 @@ static bronze::Value js_sqlite_query(bronze::Value, std::span<const bronze::Valu
         if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
             std::string err = sqlite3_errmsg(db);
             sqlite3_finalize(stmt);
-            return ev::throwError("SQLite step error: " + err);
+            return throwSqliteError("SQLite step error: ", err);
         }
         int changes = sqlite3_changes(db);
         sqlite3_int64 lastId = sqlite3_last_insert_rowid(db);
@@ -234,7 +277,7 @@ static bronze::Value js_sqlite_query(bronze::Value, std::span<const bronze::Valu
         if (rc != SQLITE_DONE) {
             std::string err = sqlite3_errmsg(db);
             sqlite3_finalize(stmt);
-            return ev::throwError("SQLite step error: " + err);
+            return throwSqliteError("SQLite step error: ", err);
         }
         sqlite3_finalize(stmt);
         return ev::undefined();
@@ -248,7 +291,7 @@ static bronze::Value js_sqlite_query(bronze::Value, std::span<const bronze::Valu
     if (rc != SQLITE_DONE) {
         std::string err = sqlite3_errmsg(db);
         sqlite3_finalize(stmt);
-        return ev::throwError("SQLite step error: " + err);
+        return throwSqliteError("SQLite step error: ", err);
     }
     sqlite3_finalize(stmt);
     return rows.get();

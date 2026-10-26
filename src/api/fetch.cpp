@@ -1,4 +1,5 @@
 #include "api/api.h"
+#include "api/access_policy.h"
 #include "api/arg_reader.h"
 #include "api/fetch_internal.h"
 #include "api/object_builder.h"
@@ -50,6 +51,12 @@ struct FetchRequest {
     // itself so an abort that lands between the call and the tick still wins.
     PersistentSlot localResponse;
 
+    // The access policy's word on the redirects curl follows: the last URL it
+    // allowed (so a request is asked of once), and the refusal that stopped
+    // one, for the rejection.
+    std::string checkedUrl;
+    std::string refusal;
+
     ~FetchRequest() {
         if (requestHeaders) curl_slist_free_all(requestHeaders);
     }
@@ -86,6 +93,25 @@ void removeLocalPending(FetchState& s, int streamId) {
 
 // Response construction — the fetch_helpers.js bridge, headers and the
 // file:, data: and blob: responses — lives in fetch_response.cpp.
+
+// fetch() asks the policy for the URL it was given; this asks it for each
+// redirect curl follows, so an allowed URL cannot hand the request on to one
+// that is not. curl calls it before it sends a request (once connected), on
+// the JS thread that runs __brokit_fetch_tick.
+static int prereqCallback(void* clientp, char*, char*, int, int)
+{
+    auto* req = static_cast<FetchRequest*>(clientp);
+    char* url = nullptr;
+    curl_easy_getinfo(req->easy, CURLINFO_EFFECTIVE_URL, &url);
+    if (!url || req->checkedUrl == url) return CURL_PREREQFUNC_OK;
+    std::string refusal = checkNetAccess(url);
+    if (!refusal.empty()) {
+        req->refusal = std::move(refusal);
+        return CURL_PREREQFUNC_ABORT;
+    }
+    req->checkedUrl = url;
+    return CURL_PREREQFUNC_OK;
+}
 
 // ---------------------------------------------------------------------------
 // curl callbacks and HTTP responses
@@ -408,6 +434,13 @@ static bronze::Value js_fetch_tick(bronze::Value, std::span<const bronze::Value>
                     ev::resolvePromise(req->promise.get(), response);
                     req->promise.reset();
                 }
+            } else if (!req->refusal.empty()) {
+                // A redirect the access policy refused.
+                if (req->promise.valid()) {
+                    ev::Persistent err{newAccessError(req->refusal, kNetDeniedCode)};
+                    ev::rejectPromise(req->promise.get(), err.get());
+                    req->promise.reset();
+                }
             } else {
                 // A network error rejects fetch() with a TypeError (Fetch
                 // spec; the blob: path above does the same).
@@ -488,20 +521,35 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
                 return p.get();
             }
         } else {
-            std::string resolved = resolveLocalPath(url);
+            // A local path or a file: URL: an fs Read, never network.
+            const std::string target = isFileUrl(url) ? fileUrlToPath(url) : url;
+            std::string resolved = resolveLocalPath(target);
+            if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty())
+                return rejectedAccessPromise(r, kFsDeniedCode, absoluteFsPath(resolved));
             response = buildFileResponse(url, resolved);
         }
         return queueLocalResponse(s, url, response, signal.get());
     }
 
+    if (auto r = checkNetAccess(url); !r.empty()) return rejectedAccessPromise(r, kNetDeniedCode);
+
     auto req = std::make_unique<FetchRequest>();
     req->url = url;
+    req->checkedUrl = url;
     req->streamId = s.nextStreamId++;
 
     req->easy = curl_easy_init();
     if (!req->easy) {
         return ev::throwError("fetch: curl_easy_init failed");
     }
+    if (accessPolicyActive()) {
+        curl_easy_setopt(req->easy, CURLOPT_PREREQFUNCTION, prereqCallback);
+        curl_easy_setopt(req->easy, CURLOPT_PREREQDATA, req.get());
+    }
+    // http and https only, redirects included: curl's other schemes (file:,
+    // ftp:, ...) would reach past both the policy's net and fs checks.
+    curl_easy_setopt(req->easy, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(req->easy, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
 
     curl_easy_setopt(req->easy, CURLOPT_URL, req->url.c_str());
     curl_easy_setopt(req->easy, CURLOPT_WRITEFUNCTION, writeCallback);

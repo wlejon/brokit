@@ -1,4 +1,5 @@
 #include "api/fs_watch.h"
+#include "api/access_policy.h"
 #include "api/api.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
@@ -108,6 +109,8 @@ static bronze::Value js_fs_watch_create(bronze::Value, std::span<const bronze::V
     std::string resolved = resolveAssetPath(rawPath);
 
     bool recursive = a.size() >= 2 && ev::isBool(a[1]) && ev::toBool(a[1]);
+    // Watching reads what changes: names and timing of the files under it.
+    if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
 
     std::error_code ec;
     fs::path canonical = fs::weakly_canonical(resolved, ec);

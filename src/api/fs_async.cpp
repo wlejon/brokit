@@ -10,6 +10,7 @@
 // pretended, with an already-settled promise.
 
 #include "api/fs_async.h"
+#include "api/access_policy.h"
 #include "api/api.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
@@ -328,23 +329,35 @@ std::string argBytes(std::span<const bronze::Value> a, size_t i)
 }
 
 // __brokit_fs_async(op, a, b, c) -> Promise. The arguments are read and the
-// paths resolved here, on the JS thread; the work closure owns copies.
+// paths resolved here, on the JS thread; the work closure owns copies. The
+// access policy is asked here too, before anything is queued: its hook may
+// need this thread (to ask the user), and a refused call must never reach
+// the pool. The first refusal wins and rejects the promise.
 bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
 {
     const std::string op = argString(a, 0);
     std::function<Result()> work;
+    std::string refusal, refusedPath;
+    auto ask = [&](const std::string& path, FsAccess access) {
+        if (!refusal.empty()) return;
+        refusal = fsRefusal(path, access);
+        if (!refusal.empty()) refusedPath = path;
+    };
 
     if (op == "readFile") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Read);
         const bool text = !argString(a, 2).empty();
         work = [p, text] { return readFile(p, text); };
     } else if (op == "writeFile" || op == "appendFile") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), true);
+        ask(p, FsAccess::Write);
         std::string data = argBytes(a, 2);
         const bool append = op == "appendFile";
         work = [p, data = std::move(data), append] { return writeFile(p, data, append); };
     } else if (op == "stat" || op == "lstat") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Read);
         const bool follow = op == "stat";
         work = [p, follow] { return statPath(p, follow); };
     } else if (op == "fstat") {
@@ -358,10 +371,12 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         }
     } else if (op == "readdir") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Read);
         const bool types = argBool(a, 2);
         work = [p, types] { return readDir(p, types); };
     } else if (op == "mkdir") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), true);
+        ask(p, FsAccess::Write);
         const bool recursive = argBool(a, 2);
         work = [p, recursive]() -> Result {
             std::error_code ec;
@@ -372,6 +387,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         };
     } else if (op == "rm" || op == "rmdir" || op == "unlink") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Write);
         const bool recursive = op == "rm" && argBool(a, 2);
         const bool force = op == "rm" && argBool(a, 3);
         const std::string syscall = op;
@@ -390,6 +406,9 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         const std::string from = resolveFsPathOnThread(argString(a, 1), false);
         const std::string to = resolveFsPathOnThread(argString(a, 2), true);
         const bool copy = op == "copyFile";
+        // A rename writes both ends (the source goes away); a copy reads one.
+        ask(from, copy ? FsAccess::Read : FsAccess::Write);
+        ask(to, FsAccess::Write);
         work = [from, to, copy]() -> Result {
             std::error_code ec;
             if (copy) fs::copy_file(u8p(from), u8p(to), fs::copy_options::overwrite_existing, ec);
@@ -399,6 +418,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         };
     } else if (op == "realpath") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Read);
         work = [p]() -> Result {
             std::error_code ec;
             auto c = fs::canonical(u8p(p), ec);
@@ -407,6 +427,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         };
     } else if (op == "access") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Read);
         work = [p]() -> Result {
             std::error_code ec;
             if (!fs::exists(u8p(p), ec)) return errorOf("ENOENT", "access", p, "no such file or directory");
@@ -432,6 +453,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         }
     } else if (op == "utimes" || op == "lutimes") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Write);
         const double atimeSec = a.size() > 2 ? ev::toDouble(a[2]) : 0.0;
         const double mtimeSec = a.size() > 3 ? ev::toDouble(a[3]) : 0.0;
         const bool follow = (op == "utimes");
@@ -458,6 +480,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         }
     } else if (op == "truncate") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
+        ask(p, FsAccess::Write);
         const int64_t len = (a.size() > 2 && !ev::isUndefined(a[2]) && !ev::isNull(a[2]))
                                 ? saturateI64(ev::toDouble(a[2]))
                                 : 0;
@@ -486,6 +509,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
         const std::string target = argString(a, 1);
         const std::string resolvedTarget = resolveFsPathOnThread(target, false);
         const std::string linkPath = resolveFsPathOnThread(argString(a, 2), true);
+        ask(linkPath, FsAccess::Write);
         const std::string type = argString(a, 3);
         work = [target, resolvedTarget, linkPath, type]() -> Result {
             bool isDir = (type == "dir" || type == "junction");
@@ -502,6 +526,7 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
     } else if (op == "mkdtemp") {
         const std::string prefix = argString(a, 1);
         const std::string p = resolveFsPathOnThread(prefix, true);
+        ask(p + "XXXXXX", FsAccess::Write);
         work = [prefix, p]() -> Result {
             std::error_code ec;
             std::string suffix = makeTempDir(p, ec);
@@ -511,6 +536,8 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
     } else {
         return ev::throwTypeError(("fs: no asynchronous '" + op + "'").c_str());
     }
+
+    if (!refusal.empty()) return rejectedAccessPromise(refusal, kFsDeniedCode, absoluteFsPath(refusedPath));
 
     Pending& pend = pending();
     const uint64_t id = pend.next++;

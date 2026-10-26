@@ -1,4 +1,5 @@
 #include "api/api.h"
+#include "api/access_policy.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
 #include "api/signals.h"
@@ -900,6 +901,7 @@ static bronze::Value js_execSync(bronze::Value, std::span<const bronze::Value> a
     if (a.empty()) return ev::throwTypeError("execSync: command required");
 
     std::string command = ev::toUtf8(a[0]);
+    if (auto r = checkSpawnAccess(command); !r.empty()) return throwAccessError(r, kSpawnDeniedCode);
     auto opts = parseOptions(a, 1);
 
     ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
@@ -939,6 +941,7 @@ static bronze::Value js_cp_exec(bronze::Value, std::span<const bronze::Value> a)
     if (a.empty()) return ev::throwTypeError("exec: command required");
 
     std::string command = ev::toUtf8(a[0]);
+    if (auto r = checkSpawnAccess(command); !r.empty()) return throwAccessError(r, kSpawnDeniedCode);
     auto opts = parseOptions(a, 1);
 
     ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
@@ -988,6 +991,13 @@ static bronze::Value js_spawnSync(bronze::Value, std::span<const bronze::Value> 
         }
     }
 
+    // Thrown rather than reported on the result as a failed start is: the
+    // program asked for something it may not do, which is not a spawn error.
+    const std::string line = opts.shell
+        ? command
+        : commandLineFor(childArgv[0], std::vector<std::string>(childArgv.begin() + 1, childArgv.end()));
+    if (auto r = checkSpawnAccess(line); !r.empty()) return throwAccessError(r, kSpawnDeniedCode);
+
     ExecResult res = runCommand(command, opts.cwd, opts.input, opts.timeout, opts.maxBuffer,
                                 opts.hasEnv ? &opts.env : nullptr,
                                 opts.shell ? nullptr : &childArgv);
@@ -1029,6 +1039,16 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
 
     size_t optIdx = (a.size() >= 2 && ev::isObject(a[1]) && ev::isDouble(ev::getProperty(a[1], "length"))) ? 2 : 1;
     auto opts = parseOptions(a, optIdx);
+
+    // A shell command is the line the shell parses; otherwise the argv.
+    std::string line;
+    if (opts.shell) {
+        line = file;
+        for (const auto& arg : args) { line += ' '; line += arg; }
+    } else {
+        line = commandLineFor(file, args);
+    }
+    if (auto r = checkSpawnAccess(line); !r.empty()) return throwAccessError(r, kSpawnDeniedCode);
 
     auto handle = std::make_unique<ChildHandle>();
 

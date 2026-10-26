@@ -1,4 +1,5 @@
 #include "api/fs_async.h"
+#include "api/access_policy.h"
 #include "api/arg_reader.h"
 #include "api/object_builder.h"
 
@@ -358,6 +359,14 @@ static bronze::Value js_openSync(bronze::Value, std::span<const bronze::Value> a
     }
 
     std::string resolved = resolveFsPathOnThread(rawPath, forCreate);
+    // Asked for what the descriptor can do, so every later read or write
+    // through it was granted here.
+    if (readable) {
+        if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
+    }
+    if (writable) {
+        if (auto r = fsRefusal(resolved, FsAccess::Write); !r.empty()) return throwFsDenied(r, resolved);
+    }
 
     std::error_code existsEc;
     if (excl && fs::exists(u8p(resolved), existsEc)) {

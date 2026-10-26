@@ -237,4 +237,58 @@ bool blobByObjectURL(const std::string& url, bronze::Value* outBlob);
 using HostTaskPoster = std::function<void(std::function<void()>)>;
 void setHostTaskPoster(HostTaskPoster poster);
 
+// ---- Access policy -----------------------------------------------------------
+//
+// What the program may touch outside itself is the host's decision, not
+// brokit's: the host knows which app is running and what it was granted.
+// brokit asks at the point the power is exercised (opening the file,
+// spawning the process, connecting the socket), never only at the JS
+// surface, because a reference kept from before a check would get past a
+// check made there. With no policy set, everything is allowed.
+
+enum class FsAccess { Read, Write };
+
+/// Each hook answers "" to allow, or the sentence the refusal throws with
+/// (naming what the app lacks and the path or URL). A hook may block to ask
+/// the user, so brokit calls it on the JS thread that made the request,
+/// synchronously, before any work is queued. Hooks run on every thread a
+/// realm runs on (Workers included) and must be thread-safe.
+struct AccessPolicy {
+    /// `path` is absolute and has had brokit's mounts and base paths applied;
+    /// the host canonicalizes it (symlinks, `..`) before deciding. Removing,
+    /// renaming away, truncating or changing the metadata of a file is Write.
+    std::function<std::string(const std::string& path, FsAccess access)> fs;
+    /// `command` is the program and its arguments as one line, for the
+    /// message (child_process in every form).
+    std::function<std::string(const std::string& command)> spawn;
+    /// `url` names the endpoint: the request URL for fetch, XMLHttpRequest,
+    /// EventSource and WebSocket (http, https, ws, wss), and
+    /// `tcp://host:port`, `udp://host:port`, `tcp-listen://host:port`,
+    /// `udp-bind://host:port` or `ipc://<path>` for raw sockets and servers
+    /// (an IPv6 host bracketed: `tcp://[::1]:80`). A UDP send asks for each
+    /// datagram; an http server or WebSocketServer listens through
+    /// `tcp-listen`. A redirect fetch or WebSocket follows is asked for too.
+    /// brokit itself opens no `ipc` sockets; the form is for a host's own.
+    /// localhost is network. `file:`, `data:` and `blob:` are never network
+    /// (a `file:` fetch is an fs Read of its path instead).
+    std::function<std::string(const std::string& url)> net;
+};
+
+/// What the program sees of a refusal: an Error whose `message` is exactly the
+/// hook's sentence and whose `code` is EACCES for fs (with `path` set to the
+/// absolute path asked about), EACCES for spawn, and ERR_ACCESS_DENIED for
+/// net. A synchronous call throws it; fs.promises, fetch and the callback
+/// forms reject or call back with it. fs.existsSync answers false instead.
+
+/// Install the process-wide policy before any realm runs. It may be replaced
+/// later (a revoked grant, a test); calls already inside a hook finish with
+/// the policy they started with. A policy with no hooks clears it.
+void setAccessPolicy(AccessPolicy policy);
+
+/// The checks themselves, for a host's own natives that read files or open
+/// connections on the program's behalf: "" when allowed, else the refusal.
+std::string checkFsAccess(const std::string& path, FsAccess access);
+std::string checkSpawnAccess(const std::string& command);
+std::string checkNetAccess(const std::string& url);
+
 } // namespace brokit::api

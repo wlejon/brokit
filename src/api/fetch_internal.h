@@ -23,6 +23,11 @@ bronze::Value buildHeaders(const std::vector<std::string>& headers);
 bool isHttpUrl(const std::string& url);
 bool isDataUrl(const std::string& url);
 bool isBlobUrl(const std::string& url);
+bool isFileUrl(const std::string& url);
+
+// The local path a file: URL names, percent-decoded ("file:///C:/x" is
+// "C:/x" on Windows, "file:///etc/x" is "/etc/x").
+std::string fileUrlToPath(const std::string& url);
 
 // A local fetch target resolved against the prefix mounts and the base paths.
 std::string resolveLocalPath(const std::string& url);
