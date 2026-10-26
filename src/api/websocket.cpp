@@ -61,7 +61,13 @@ struct WSConnection {
     std::string checkedUrl;
     std::string refusal;
 
+    // Held open under the access gate (access_policy.h), and the error name a
+    // revocation gives the program's error event.
+    uint64_t held = 0;
+    std::string errorName;
+
     ~WSConnection() {
+        releaseHeldAccess(held);
         if (headers) curl_slist_free_all(headers);
     }
 };
@@ -96,6 +102,33 @@ static int wsPrereqCallback(void* clientp, char*, char*, int, int)
     }
     conn->checkedUrl = url;
     return CURL_PREREQFUNC_OK;
+}
+
+// The grant the connection was opened under was taken back: a connecting one
+// fails its open with the refusal, an open one is cut (close code 1008,
+// policy violation) after an error event naming why.
+static void revokeConnection(int id, const std::string& refusal)
+{
+    auto it = g_ws_conns.find(id);
+    if (it == g_ws_conns.end()) return;
+    WSConnection* conn = it->second;
+    if (conn->state == 3) return;
+    if (conn->easy && g_ws_multi) curl_multi_remove_handle(g_ws_multi, conn->easy);
+    for (auto it2 = g_ws_connecting.begin(); it2 != g_ws_connecting.end(); ++it2) {
+        if (*it2 == conn) { g_ws_connecting.erase(it2); break; }
+    }
+    if (conn->easy) { curl_easy_cleanup(conn->easy); conn->easy = nullptr; }
+    conn->state = 3;
+    conn->closeCode = 1008;
+    conn->closeReason = refusalText(refusal);
+    if (conn->promise.valid()) {
+        ev::Persistent err{newAccessError(refusal, kNetDeniedCode)};
+        ev::rejectPromise(conn->promise.get(), err.get());
+        conn->promise.reset();
+    } else {
+        conn->errorMsg = refusalText(refusal);
+        conn->errorName = refusalName(refusal);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +183,9 @@ static bronze::Value js_ws_connect(bronze::Value, std::span<const bronze::Value>
     curl_multi_add_handle(g_ws_multi, conn->easy);
     g_ws_connecting.push_back(conn);
     g_ws_conns[conn->id] = conn;
+    const int id = conn->id;
+    conn->held = holdGatedAccess(ev::AccessKind::Net, url,
+                                 [id](const std::string& refusal) { revokeConnection(id, refusal); });
 
     // Return { id, promise }
     ObjectBuilder result;
@@ -313,7 +349,12 @@ static bronze::Value js_ws_recv(bronze::Value, std::span<const bronze::Value> ar
         ObjectBuilder result;
         result.set("type", "error");
         result.set("data", conn->errorMsg);
+        if (!conn->errorName.empty()) {
+            result.set("name", conn->errorName);
+            result.set("code", kNetDeniedCode);
+        }
         conn->errorMsg.clear();
+        conn->errorName.clear();
         return result.build();
     }
 

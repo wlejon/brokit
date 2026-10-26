@@ -77,6 +77,11 @@ struct ChildHandle {
     std::mutex stdinMutex;         // serializes childWrite / closeStdin
     bool exitReported = false;     // childPoll already handed the code to JS
 
+    // Held under the access gate while it runs (access_policy.h); a grant
+    // taken back kills it, and its exit reports the refusal.
+    uint64_t held = 0;
+    std::string revokedBy;
+
     // Readers poll with a short timeout and re-check `closing` each pass, so
     // teardown is deterministic even when a surviving grandchild holds a write
     // end open (the classic reason a blocking-read drain never sees EOF).
@@ -98,6 +103,7 @@ struct ChildHandle {
     }
 
     ~ChildHandle() {
+        releaseHeldAccess(held);
         stopReaders();
         closeStdin();
 #ifdef _WIN32
@@ -866,6 +872,9 @@ static ExecOptions parseOptions(std::span<const bronze::Value> a, size_t optIdx)
             }
         }
     }
+    // Inheriting: the environment as process.env shows the program, with
+    // the changes the access gate kept out of the real one (process.cpp).
+    if (!opts.hasEnv && envOverlayForChild(opts.env)) opts.hasEnv = true;
 
     bronze::Value soV = ev::getProperty(val, "stdoutFile");
     if (ev::isString(soV)) opts.stdoutFile = ev::toUtf8(soV);
@@ -1017,6 +1026,8 @@ static bronze::Value js_spawnSync(bronze::Value, std::span<const bronze::Value> 
 }
 
 // __brokit_cp_spawnAsync(file, args, options)
+static void revokeChild(int id, const std::string& refusal);
+
 static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value> a)
 {
     if (a.empty()) return ev::throwTypeError("spawnAsync: file required");
@@ -1291,6 +1302,8 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     int id = g_nextChildId.fetch_add(1);
     int pidVal = (int)handle->pid;
     bool piped = handle->piped;
+    handle->held = holdGatedAccess(ev::AccessKind::Spawn, line,
+                                   [id](const std::string& refusal) { revokeChild(id, refusal); });
     {
         std::lock_guard<std::mutex> lock(g_childMutex);
         g_children[id] = std::move(handle);
@@ -1301,6 +1314,24 @@ static bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value>
     obj.set("pid", ev::fromDouble(pidVal));
     obj.set("piped", ev::fromBool(piped));
     return obj.get();
+}
+
+// The grant the child was started under was taken back: it is killed, and
+// its exit carries the refusal (ChildProcess emits it as 'error').
+static void revokeChild(int id, const std::string& refusal)
+{
+    std::lock_guard<std::mutex> lock(g_childMutex);
+    auto it = g_children.find(id);
+    if (it == g_children.end()) return;
+    ChildHandle* h = it->second.get();
+    h->held = 0;
+    if (h->exitReported) return;
+    h->revokedBy = refusal;
+#ifdef _WIN32
+    if (h->process) TerminateProcess(h->process, 1);
+#else
+    if (h->pid > 0) ::kill(h->pid, SIGKILL);
+#endif
 }
 
 // __brokit_cp_childPoll(id)
@@ -1324,6 +1355,7 @@ static bronze::Value js_childPoll(bronze::Value, std::span<const bronze::Value> 
         obj.set("exitCode", ev::fromDouble(code));
         if (sig.empty()) obj.set("signal", ev::null());
         else             obj.set("signal", ev::fromUtf8(sig));
+        if (!h->revokedBy.empty()) obj.set("revoked", newAccessError(h->revokedBy, kSpawnDeniedCode));
         return obj.get();
     };
 
@@ -1359,6 +1391,7 @@ static bronze::Value js_childPoll(bronze::Value, std::span<const bronze::Value> 
     h->exitCode = exitCode;
     h->signal = sig;
     h->exitReported = true;
+    releaseHeldAccess(h->held);
 
     bronze::Value obj = exitInfo(exitCode, sig);
 

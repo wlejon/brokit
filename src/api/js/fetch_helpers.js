@@ -156,7 +156,10 @@
                             return;
                         }
                         if (result.done) {
-                            controller.close();
+                            // Cut off because the host took back the grant
+                            // it was made under: the body errors with it.
+                            if (result.error) controller.error(result.error);
+                            else controller.close();
                             resolve();
                             return;
                         }

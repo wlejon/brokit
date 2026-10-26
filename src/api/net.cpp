@@ -158,6 +158,8 @@ struct NetEvent {
     int connId = 0;              // Accept: id of the new connection handle
     std::string message;         // Error text
     bool hadError = false;       // Close
+    std::string errorName;       // Error: "PermissionRevoked" when the grant was taken back
+    std::string errorCode;       // Error: the refusal's code
 };
 
 struct NetHandle {
@@ -186,6 +188,11 @@ struct NetHandle {
     bool ipv6 = false; // UDP family
 
     int closedSweeps = 0;
+
+    // Held open under the access gate (access_policy.h): the URL it was
+    // allowed for, which a listener's accepted connections are held under too.
+    std::string accessSubject;
+    uint64_t held = 0;
 };
 
 // thread_local: each JS thread owns and pumps only its own sockets
@@ -221,6 +228,7 @@ void hardClose(NetHandle* h)
         h->fd = BROKIT_INVALID_SOCKET;
     }
     h->closed = true;
+    releaseHeldAccess(h->held);
 }
 
 void queueClose(NetHandle* h, bool hadError)
@@ -241,6 +249,31 @@ void failHandle(NetHandle* h, const std::string& msg)
     h->events.push_back(std::move(ev));
     hardClose(h);
     queueClose(h, true);
+}
+
+// The grant the socket was opened under was taken back: it errors with the
+// refusal (a PermissionRevoked for a revoked grant) and closes.
+void revokeHandle(int id, const std::string& refusal)
+{
+    NetHandle* h = findHandle(id);
+    if (!h || h->closed) return;
+    h->errored = true;
+    NetEvent ev;
+    ev.type = NetEvent::Type::Error;
+    ev.message = refusalText(refusal);
+    ev.errorName = refusalName(refusal);
+    ev.errorCode = kNetDeniedCode;
+    h->events.push_back(std::move(ev));
+    hardClose(h);
+    queueClose(h, true);
+}
+
+void holdNet(NetHandle* h, std::string subject)
+{
+    h->accessSubject = subject;
+    const int id = h->id;
+    h->held = holdGatedAccess(ev::AccessKind::Net, std::move(subject),
+                              [id](const std::string& refusal) { revokeHandle(id, refusal); });
 }
 
 // data: string | ArrayBuffer | any TypedArray/DataView → bytes.
@@ -330,7 +363,8 @@ static bronze::Value js_net_tcp_listen(bronze::Value, std::span<const bronze::Va
     int port = reader.getInt(0, 0);
     std::string host = reader.getString(1, "127.0.0.1");
     // http.createServer and WebSocketServer listen through here too.
-    if (auto r = checkNetAccess(socketUrl("tcp-listen", host, port)); !r.empty())
+    const std::string url = socketUrl("tcp-listen", host, port);
+    if (auto r = checkNetAccess(url); !r.empty())
         return throwAccessError(r, kNetDeniedCode);
 
     std::string err;
@@ -364,6 +398,8 @@ static bronze::Value js_net_tcp_listen(bronze::Value, std::span<const bronze::Va
     h->fd = fd;
     cacheLocalInfo(h);
     g_handles[h->id] = h;
+    // Held under the port it got (port 0 asks for any).
+    holdNet(h, port == 0 && h->localPort ? socketUrl("tcp-listen", host, h->localPort) : url);
     return ev::fromDouble(h->id);
 }
 
@@ -378,7 +414,8 @@ static bronze::Value js_net_tcp_connect(bronze::Value, std::span<const bronze::V
     ArgReader reader(args);
     std::string host = reader.getString(0, "");
     int port = reader.getInt(1, 0);
-    if (auto r = checkNetAccess(socketUrl("tcp", host, port)); !r.empty())
+    const std::string url = socketUrl("tcp", host, port);
+    if (auto r = checkNetAccess(url); !r.empty())
         return throwAccessError(r, kNetDeniedCode);
 
     std::string err;
@@ -415,6 +452,7 @@ static bronze::Value js_net_tcp_connect(bronze::Value, std::span<const bronze::V
         }
     }
     g_handles[h->id] = h;
+    if (!h->closed) holdNet(h, url);
     return ev::fromDouble(h->id);
 }
 
@@ -509,7 +547,8 @@ static bronze::Value js_net_udp_bind(bronze::Value, std::span<const bronze::Valu
     int port = reader.getInt(1, 0);
     std::string defaultHost = h->ipv6 ? "::1" : "127.0.0.1";
     std::string host = reader.getString(2, defaultHost);
-    if (auto r = checkNetAccess(socketUrl("udp-bind", host, port)); !r.empty())
+    const std::string url = socketUrl("udp-bind", host, port);
+    if (auto r = checkNetAccess(url); !r.empty())
         return throwAccessError(r, kNetDeniedCode);
 
     std::string err;
@@ -523,6 +562,8 @@ static bronze::Value js_net_udp_bind(bronze::Value, std::span<const bronze::Valu
         return ev::throwError("udp bind " + host + ":" + std::to_string(port) + ": " +
                               sockErrorString(lastSockError()));
     cacheLocalInfo(h);
+    releaseHeldAccess(h->held);
+    holdNet(h, port == 0 && h->localPort ? socketUrl("udp-bind", host, h->localPort) : url);
     return ev::fromBool(true);
 }
 
@@ -650,6 +691,8 @@ static bronze::Value js_net_poll(bronze::Value, std::span<const bronze::Value> a
     case NetEvent::Type::Error:
         obj.set("type", "error");
         obj.set("message", evNet.message);
+        if (!evNet.errorName.empty()) obj.set("name", evNet.errorName);
+        if (!evNet.errorCode.empty()) obj.set("code", evNet.errorCode);
         break;
     case NetEvent::Type::Close:
         obj.set("type", "close");
@@ -699,6 +742,8 @@ static bronze::Value js_net_tick(bronze::Value, std::span<const bronze::Value>)
                 cacheLocalInfo(c);
                 g_handles[c->id] = c;
                 ids.push_back(c->id);
+                // Served under the listener's grant: revoked with it.
+                if (h->held) holdNet(c, h->accessSubject);
 
                 NetEvent evNet;
                 evNet.type = NetEvent::Type::Accept;

@@ -98,6 +98,16 @@
         w._emit('change', type, filename);
     };
 
+    // The host took back the grant the watcher was opened under: the native
+    // watcher is already stopped; the refusal (a PermissionRevoked) is its
+    // 'error', then it closes.
+    globalThis.__brokit_fs_watch_revoked = function (id, err) {
+        var w = registry[id];
+        if (!w || w._closed) return;
+        w._emit('error', err);
+        w.close();
+    };
+
     // ── fs.watch wiring ──────────────────────────────────────────────────────
     // Patches the existing __brokit_fs object (created by fs.js, which runs
     // before this file) to expose `fs.watch`.

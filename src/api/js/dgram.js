@@ -42,7 +42,7 @@
                     size: ev.data.length
                 });
             } else if (ev.type === 'error') {
-                self.emit('error', new Error(ev.message));
+                self.emit('error', globalThis.__brokit_net_error(ev));
             } else if (ev.type === 'close') {
                 globalThis.__brokit_net_unregister(self._id);
                 self._id = -1;

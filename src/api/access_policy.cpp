@@ -1,37 +1,19 @@
-// The process-wide access policy (api.h, "Access policy") and the helpers
-// brokit's natives use to ask it.
-//
-// The policy is set before realms run, but every realm's thread reads it, and
-// a test harness (or a host that revokes a grant) may replace it while they
-// do. So it lives behind a shared_ptr swapped under a mutex: a check copies
-// the pointer under the lock and calls the hook outside it, so a hook that
-// blocks to ask the user holds no lock, and a replaced policy stays alive
-// until the calls already in it return. The flag spares the common case,
-// no policy at all, the lock.
+// brokit's side of bronze's access gate (api.h, "Access"; embed/embed_access.h):
+// the checks brokit's natives make, and the helpers that turn a refusal into
+// the Error the program sees. The gate itself, and what is held open under
+// it, are bronze's: one hook the host installs for every library.
 
 #include "api/access_policy.h"
 
-#include <atomic>
+#include "embed/embed_access.h"
+
 #include <filesystem>
-#include <memory>
-#include <mutex>
 
 namespace fs = std::filesystem;
 
 namespace brokit::api {
 
 namespace {
-
-std::mutex g_policyMu;
-std::shared_ptr<const AccessPolicy> g_policy;
-std::atomic<bool> g_policyActive{false};
-
-std::shared_ptr<const AccessPolicy> currentPolicy()
-{
-    if (!g_policyActive.load(std::memory_order_acquire)) return nullptr;
-    std::lock_guard lock(g_policyMu);
-    return g_policy;
-}
 
 fs::path u8p(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
 std::string u8s(const fs::path& p)
@@ -42,39 +24,24 @@ std::string u8s(const fs::path& p)
 
 }  // namespace
 
-void setAccessPolicy(AccessPolicy policy)
-{
-    const bool any = policy.fs || policy.spawn || policy.net;
-    auto next = any ? std::make_shared<const AccessPolicy>(std::move(policy)) : nullptr;
-    std::lock_guard lock(g_policyMu);
-    g_policy = std::move(next);
-    g_policyActive.store(any, std::memory_order_release);
-}
-
 bool accessPolicyActive()
 {
-    return g_policyActive.load(std::memory_order_acquire);
+    return ev::accessGateActive();
 }
 
 std::string checkFsAccess(const std::string& path, FsAccess access)
 {
-    auto p = currentPolicy();
-    if (!p || !p->fs) return {};
-    return p->fs(path, access);
+    return ev::checkAccess(access == FsAccess::Write ? ev::AccessKind::Write : ev::AccessKind::Read, path);
 }
 
 std::string checkSpawnAccess(const std::string& command)
 {
-    auto p = currentPolicy();
-    if (!p || !p->spawn) return {};
-    return p->spawn(command);
+    return ev::checkAccess(ev::AccessKind::Spawn, command);
 }
 
 std::string checkNetAccess(const std::string& url)
 {
-    auto p = currentPolicy();
-    if (!p || !p->net) return {};
-    return p->net(url);
+    return ev::checkAccess(ev::AccessKind::Net, url);
 }
 
 std::string absoluteFsPath(const std::string& path)
@@ -93,23 +60,12 @@ std::string fsRefusal(const std::string& resolved, FsAccess access)
 
 bronze::Value newAccessError(const std::string& message, const char* code, const std::string& path)
 {
-    ev::Persistent err{newError("Error", message)};
-    if (ev::isObject(err.get())) {
-        // Each value is made in a statement of its own: built inside the call,
-        // it could move the receiver after err.get() was read.
-        ev::Persistent codeVal{ev::fromUtf8(code)};
-        err.set(ev::setProperty(err.get(), "code", codeVal.get()));
-        if (!path.empty()) {
-            ev::Persistent pathVal{ev::fromUtf8(path)};
-            err.set(ev::setProperty(err.get(), "path", pathVal.get()));
-        }
-    }
-    return err.get();
+    return ev::newAccessError(message, code, path);
 }
 
 bronze::Value throwAccessError(const std::string& message, const char* code, const std::string& path)
 {
-    return ev::throwValue(newAccessError(message, code, path));
+    return ev::throwAccessError(message, code, path);
 }
 
 bronze::Value throwFsDenied(const std::string& refusal, const std::string& resolved)
@@ -119,10 +75,7 @@ bronze::Value throwFsDenied(const std::string& refusal, const std::string& resol
 
 bronze::Value rejectedAccessPromise(const std::string& message, const char* code, const std::string& path)
 {
-    ev::Persistent promise{ev::createPromise()};
-    ev::Persistent err{newAccessError(message, code, path)};
-    ev::rejectPromise(promise.get(), err.get());
-    return promise.get();
+    return ev::rejectedAccessPromise(message, code, path);
 }
 
 std::string commandLineFor(const std::string& file, const std::vector<std::string>& args)
@@ -148,6 +101,29 @@ std::string socketUrl(const char* scheme, const std::string& host, int port)
 {
     const bool v6 = host.find(':') != std::string::npos && (host.empty() || host.front() != '[');
     return std::string(scheme) + "://" + (v6 ? "[" + host + "]" : host) + ":" + std::to_string(port);
+}
+
+uint64_t holdGatedAccess(ev::AccessKind kind, std::string subject, std::function<void(const std::string&)> revoke)
+{
+    if (!ev::accessGateActive()) return 0;
+    return ev::holdAccess(kind, std::move(subject), std::move(revoke));
+}
+
+void releaseHeldAccess(uint64_t& id)
+{
+    if (id == 0) return;
+    ev::releaseAccess(id);
+    id = 0;
+}
+
+std::string refusalText(const std::string& refusal)
+{
+    return ev::refusalMessage(refusal);
+}
+
+const char* refusalName(const std::string& refusal)
+{
+    return ev::isRevokedRefusal(refusal) ? "PermissionRevoked" : "Error";
 }
 
 }  // namespace brokit::api

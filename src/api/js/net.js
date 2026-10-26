@@ -22,6 +22,15 @@
     // dgram Socket) by handle id. dgram.js registers into this same registry.
     var _drains = Object.create(null);
 
+    // An error event as an Error: a socket whose grant the host took back
+    // carries name "PermissionRevoked" and the refusal's code.
+    globalThis.__brokit_net_error = function(ev) {
+        var e = new Error(ev.message);
+        if (ev.name) e.name = ev.name;
+        if (ev.code) e.code = ev.code;
+        return e;
+    };
+
     globalThis.__brokit_net_register = function(id, fn) { _drains[id] = fn; };
     globalThis.__brokit_net_unregister = function(id) { delete _drains[id]; };
 
@@ -105,7 +114,7 @@
             } else if (ev.type === 'end') {
                 self.emit('end');
             } else if (ev.type === 'error') {
-                self._lastError = new Error(ev.message);
+                self._lastError = globalThis.__brokit_net_error(ev);
                 self.emit('error', self._lastError);
             } else if (ev.type === 'close') {
                 globalThis.__brokit_net_unregister(id);
@@ -228,7 +237,7 @@
                 sock._attach(ev.connId, true);
                 self.emit('connection', sock);
             } else if (ev.type === 'error') {
-                self.emit('error', new Error(ev.message));
+                self.emit('error', globalThis.__brokit_net_error(ev));
             } else if (ev.type === 'close') {
                 globalThis.__brokit_net_unregister(self._id);
                 self._id = -1;

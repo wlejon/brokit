@@ -8,9 +8,15 @@
 
 extern "C" void bronze_process_main();
 
+#include "api/access_policy.h"
+#include "embed/embed_access.h"
+
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 #ifdef _WIN32
@@ -196,77 +202,162 @@ Value js_process_exit(Value, std::span<const Value> a) {
     return ev::undefined();
 }
 
+// ---- process.env and the access gate ------------------------------------------
+//
+// Each variable is read through the gate (EnvRead, by name); a refused one
+// reads as unset. A variable that is not set at all is answered without
+// asking, so probing for an unset DEBUG never prompts. A change the gate
+// refuses (EnvWrite) goes to this process's own view instead of the real
+// environment: process.env shows it, child processes are given it
+// (envOverlayForChild), and nothing else in the process sees it. A variable
+// deleted that way is a tombstone in the view.
+
+std::mutex g_envOverlayMu;
+std::map<std::string, std::optional<std::string>>& envOverlay() {
+    static auto* m = new std::map<std::string, std::optional<std::string>>();
+    return *m;
+}
+
+bool overlayLookup(const std::string& key, std::optional<std::string>& out) {
+    std::lock_guard lock(g_envOverlayMu);
+    auto it = envOverlay().find(key);
+    if (it == envOverlay().end()) return false;
+    out = it->second;
+    return true;
+}
+
+bool realEnvGet(const std::string& key, std::string& out) {
+#ifdef _WIN32
+    return envGet(key, out);
+#else
+    const char* val = getenv(key.c_str());
+    if (!val) return false;
+    out = val;
+    return true;
+#endif
+}
+
+std::vector<std::string> realEnvKeys() {
+    std::vector<std::string> keys;
+#ifdef _WIN32
+    wchar_t* block = GetEnvironmentStringsW();
+    if (block) {
+        for (wchar_t* p = block; *p; p += wcslen(p) + 1) {
+            if (p[0] == L'=') continue;
+            const wchar_t* eq = wcschr(p, L'=');
+            if (!eq) continue;
+            keys.push_back(narrow(p, static_cast<size_t>(eq - p)));
+        }
+        FreeEnvironmentStringsW(block);
+    }
+#else
+    for (char** e = environ; e && *e; e++) {
+        const char* eq = strchr(*e, '=');
+        if (!eq) continue;
+        keys.emplace_back(*e, static_cast<size_t>(eq - *e));
+    }
+#endif
+    return keys;
+}
+
+// The variable as the program sees it.
+bool visibleEnvGet(const std::string& key, std::string& out) {
+    std::optional<std::string> over;
+    if (overlayLookup(key, over)) {
+        if (!over) return false;
+        out = *over;
+        return true;
+    }
+    if (!realEnvGet(key, out)) return false;
+    return ev::checkAccess(ev::AccessKind::EnvRead, key).empty();
+}
+
+// On Windows both the process block (what a child inherits, what
+// GetEnvironmentVariable reads) and the CRT's copy (what a library's getenv
+// reads) are kept in step.
+void realEnvSet(const std::string& key, const std::optional<std::string>& val) {
+#ifdef _WIN32
+    const std::wstring wkey = widen(key);
+    if (val) {
+        const std::wstring wval = widen(*val);
+        SetEnvironmentVariableW(wkey.c_str(), wval.c_str());
+        _wputenv_s(wkey.c_str(), wval.c_str());
+    } else {
+        SetEnvironmentVariableW(wkey.c_str(), nullptr);
+        _wputenv_s(wkey.c_str(), L"");
+    }
+#else
+    if (val) setenv(key.c_str(), val->c_str(), 1);
+    else unsetenv(key.c_str());
+#endif
+}
+
+void visibleEnvSet(const std::string& key, const std::optional<std::string>& val) {
+    if (ev::checkAccess(ev::AccessKind::EnvWrite, key).empty()) {
+        realEnvSet(key, val);
+        std::lock_guard lock(g_envOverlayMu);
+        envOverlay().erase(key);
+        return;
+    }
+    std::lock_guard lock(g_envOverlayMu);
+    envOverlay()[key] = val;
+}
+
 Value makeEnvProxy() {
     HostProxyTraps traps;
     traps.get = [](const std::string& key, Value& out) -> bool {
-#ifdef _WIN32
         std::string val;
-        if (!envGet(key, val)) return false;
+        if (!visibleEnvGet(key, val)) return false;
         out = ev::fromUtf8(val);
         return true;
-#else
-        const char* val = getenv(key.c_str());
-        if (!val) return false;
-        out = ev::fromUtf8(val);
-        return true;
-#endif
     };
-    // On Windows both the process block (what a child inherits, what
-    // GetEnvironmentVariable reads) and the CRT's copy (what a library's
-    // getenv reads) are kept in step.
-    traps.set = [](const std::string& key, Value v) {
-        std::string val = ev::toUtf8(v);
-#ifdef _WIN32
-        const std::wstring wkey = widen(key), wval = widen(val);
-        SetEnvironmentVariableW(wkey.c_str(), wval.c_str());
-        _wputenv_s(wkey.c_str(), wval.c_str());
-#else
-        setenv(key.c_str(), val.c_str(), 1);
-#endif
-    };
-    traps.remove = [](const std::string& key) {
-#ifdef _WIN32
-        const std::wstring wkey = widen(key);
-        SetEnvironmentVariableW(wkey.c_str(), nullptr);
-        _wputenv_s(wkey.c_str(), L"");
-#else
-        unsetenv(key.c_str());
-#endif
-    };
+    traps.set = [](const std::string& key, Value v) { visibleEnvSet(key, ev::toUtf8(v)); };
+    traps.remove = [](const std::string& key) { visibleEnvSet(key, std::nullopt); };
     traps.has = [](const std::string& key) -> bool {
-#ifdef _WIN32
         std::string val;
-        return envGet(key, val);
-#else
-        return getenv(key.c_str()) != nullptr;
-#endif
+        return visibleEnvGet(key, val);
     };
     traps.ownKeys = []() -> std::vector<std::string> {
         std::vector<std::string> keys;
-#ifdef _WIN32
-        wchar_t* block = GetEnvironmentStringsW();
-        if (block) {
-            for (wchar_t* p = block; *p; p += wcslen(p) + 1) {
-                if (p[0] == L'=') continue;
-                const wchar_t* eq = wcschr(p, L'=');
-                if (!eq) continue;
-                keys.push_back(narrow(p, static_cast<size_t>(eq - p)));
-            }
-            FreeEnvironmentStringsW(block);
+        // Listing them all is one question; refused, each name is answered
+        // from what is decided (a variable the host always shows), never by
+        // asking once per variable.
+        const bool all = ev::checkAccess(ev::AccessKind::EnvRead, "").empty();
+        std::map<std::string, std::optional<std::string>> overlay;
+        {
+            std::lock_guard lock(g_envOverlayMu);
+            overlay = envOverlay();
         }
-#else
-        for (char** e = environ; e && *e; e++) {
-            const char* eq = strchr(*e, '=');
-            if (!eq) continue;
-            keys.emplace_back(*e, static_cast<size_t>(eq - *e));
+        for (std::string& k : realEnvKeys()) {
+            if (overlay.count(k)) continue;
+            if (all || ev::checkAccessWithoutAsking(ev::AccessKind::EnvRead, k).empty()) keys.push_back(std::move(k));
         }
-#endif
+        for (const auto& [k, v] : overlay)
+            if (v) keys.push_back(k);
         return keys;
     };
     return makeHostProxy(std::move(traps));
 }
 
 } // namespace
+
+bool envOverlayForChild(std::vector<std::pair<std::string, std::string>>& out) {
+    std::map<std::string, std::optional<std::string>> overlay;
+    {
+        std::lock_guard lock(g_envOverlayMu);
+        if (envOverlay().empty()) return false;
+        overlay = envOverlay();
+    }
+    out.clear();
+    for (const std::string& k : realEnvKeys()) {
+        if (overlay.count(k)) continue;
+        std::string v;
+        if (realEnvGet(k, v)) out.emplace_back(k, v);
+    }
+    for (const auto& [k, v] : overlay)
+        if (v) out.emplace_back(k, *v);
+    return true;
+}
 
 void installProcess() {
     ObjectBuilder process;

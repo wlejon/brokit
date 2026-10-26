@@ -449,6 +449,9 @@
             this.exitCode = exit.exitCode;
             this.signal = exit.signal;
             this._exitAt = Date.now();
+            // Killed because the host took back the grant it ran under: the
+            // refusal (a PermissionRevoked) comes first, as 'error'.
+            if (exit.revoked) emitAll(this._listeners.error, [exit.revoked], 'error');
             emitAll(this._listeners.exit, [exit.exitCode, exit.signal], 'exit');
             // Without pipes the native side already released the handle, and
             // there is nothing left to drain.

@@ -1,8 +1,10 @@
 #include "runtime/runtime.h"
 #include "api/api.h"
 #include "api/object_builder.h"
+#include "embed/embed_access.h"
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <memory>
@@ -41,15 +43,21 @@ static std::string g_lastLog;
 // names (relative dirs are taken against the working directory);
 // __test_clearAccessPolicy() removes it, and the harness removes it after
 // every file. __test_accessLog() lists what the hooks were asked, as
-// "fs:read:<path>", "fs:write:<path>", "spawn:<line>" or "net:<url>", since
-// the policy was set.
+// "fs:read:<path>", "fs:write:<path>", "spawn:<line>", "net:<url>",
+// "env:read:<name>" or "env:write:<name>", since the policy was set. The
+// policy is bronze's access gate (embed/embed_access.h), as a host installs
+// it. envHide: [names] refuses those variables ([] with anything in it also
+// refuses listing them all); revoked: true makes every refusal a revoked one.
+// __test_accessChanged() is a host's grant change: it revalidates what this
+// thread holds open and returns how many were closed.
 
 namespace {
 
 struct TestPolicy {
-    std::vector<std::string> fsDenyUnder, fsReadOnlyUnder, netDeny;
+    std::vector<std::string> fsDenyUnder, fsReadOnlyUnder, netDeny, envHide;
     bool spawnDeny = false;
     bool netDenyAll = false;
+    bool revoked = false;   // refusals say the grant was taken back
 };
 
 std::mutex g_accessLogMu;
@@ -104,37 +112,67 @@ bronze::Value js_setAccessPolicy(bronze::Value, std::span<const bronze::Value> a
         bronze::Value net = ev::getProperty(a[0], "net");
         if (ev::isBool(net)) cfg->netDenyAll = ev::toBool(net);
         else cfg->netDeny = stringList(a[0], "net");
+        cfg->envHide = stringList(a[0], "envHide");
+        bronze::Value rv = ev::getProperty(a[0], "revoked");
+        cfg->revoked = ev::isBool(rv) && ev::toBool(rv);
     }
     {
         std::lock_guard lock(g_accessLogMu);
         g_accessLog.clear();
     }
 
-    brokit::api::AccessPolicy policy;
-    policy.fs = [cfg](const std::string& path, brokit::api::FsAccess access) -> std::string {
-        const bool write = access == brokit::api::FsAccess::Write;
-        logAccess(std::string(write ? "fs:write:" : "fs:read:") + path);
-        if (isUnder(path, cfg->fsDenyUnder)) return "No file access to " + path;
-        if (write && isUnder(path, cfg->fsReadOnlyUnder)) return "No write access to " + path;
-        return {};
-    };
-    policy.spawn = [cfg](const std::string& command) -> std::string {
-        logAccess("spawn:" + command);
-        return cfg->spawnDeny ? "Not allowed to run " + command : std::string();
-    };
-    policy.net = [cfg](const std::string& url) -> std::string {
-        logAccess("net:" + url);
-        bool deny = cfg->netDenyAll;
-        for (const auto& s : cfg->netDeny) deny = deny || url.find(s) != std::string::npos;
-        return deny ? "No network access to " + url : std::string();
-    };
-    brokit::api::setAccessPolicy(std::move(policy));
+    ev::setAccessGate([cfg](const ev::AccessRequest& r) -> std::string {
+        const std::string subject(r.subject);
+        const std::string prefix = cfg->revoked ? std::string(ev::kPermissionRevokedPrefix) : std::string();
+        switch (r.kind) {
+            case ev::AccessKind::Read:
+            case ev::AccessKind::Write: {
+                const bool write = r.kind == ev::AccessKind::Write;
+                logAccess(std::string(write ? "fs:write:" : "fs:read:") + subject);
+                if (isUnder(subject, cfg->fsDenyUnder)) return prefix + "No file access to " + subject;
+                if (write && isUnder(subject, cfg->fsReadOnlyUnder)) return prefix + "No write access to " + subject;
+                return {};
+            }
+            case ev::AccessKind::Spawn:
+                logAccess("spawn:" + subject);
+                return cfg->spawnDeny ? prefix + "Not allowed to run " + subject : std::string();
+            case ev::AccessKind::Net: {
+                logAccess("net:" + subject);
+                bool deny = cfg->netDenyAll;
+                for (const auto& s : cfg->netDeny) deny = deny || subject.find(s) != std::string::npos;
+                return deny ? prefix + "No network access to " + subject : std::string();
+            }
+            case ev::AccessKind::EnvRead:
+            case ev::AccessKind::EnvWrite: {
+                const bool write = r.kind == ev::AccessKind::EnvWrite;
+                logAccess(std::string(write ? "env:write:" : "env:read:") + subject);
+                const bool hidden = subject.empty() ? !cfg->envHide.empty()
+                                                    : std::find(cfg->envHide.begin(), cfg->envHide.end(), subject) !=
+                                                          cfg->envHide.end();
+                return hidden ? prefix + "No environment access to " + (subject.empty() ? "*" : subject) : std::string();
+            }
+            default:
+                return {};
+        }
+    });
     return ev::undefined();
 }
 
 bronze::Value js_clearAccessPolicy(bronze::Value, std::span<const bronze::Value>) {
-    brokit::api::setAccessPolicy({});
+    bronze::embed::setAccessGate(nullptr);
     return bronze::embed::undefined();
+}
+
+// __test_accessChanged() -> how many held resources this thread lost: what a
+// host does after replacing the policy while the program runs.
+bronze::Value js_accessChanged(bronze::Value, std::span<const bronze::Value>) {
+    bronze::embed::accessChanged();
+    return bronze::embed::fromDouble(bronze::embed::revalidateHeldAccess());
+}
+
+// __test_heldAccessCount() -> resources this thread holds open under the gate.
+bronze::Value js_heldAccessCount(bronze::Value, std::span<const bronze::Value>) {
+    return bronze::embed::fromDouble(static_cast<double>(bronze::embed::heldAccessCount()));
 }
 
 bronze::Value js_accessLog(bronze::Value, std::span<const bronze::Value>) {
@@ -181,6 +219,8 @@ static TestResult runTestFile(const std::string& path) {
     });
     bronze::embed::setGlobalFunction("__test_setAccessPolicy", 1, js_setAccessPolicy);
     bronze::embed::setGlobalFunction("__test_clearAccessPolicy", 0, js_clearAccessPolicy);
+    bronze::embed::setGlobalFunction("__test_accessChanged", 0, js_accessChanged);
+    bronze::embed::setGlobalFunction("__test_heldAccessCount", 0, js_heldAccessCount);
     bronze::embed::setGlobalFunction("__test_accessLog", 0, js_accessLog);
 
     // Install test helpers: assert, test registration
@@ -449,7 +489,7 @@ int main(int argc, char* argv[]) {
         auto result = runTestFile(file);
         // A file that set a policy and failed before clearing it must not
         // refuse the next file's work.
-        brokit::api::setAccessPolicy({});
+        bronze::embed::setAccessGate(nullptr);
         totalPassed += result.passed;
         totalFailed += result.failed;
 

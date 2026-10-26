@@ -56,7 +56,8 @@
                 self._dispatch(event);
             }
         }).catch(function(err) {
-            self._handleError(err.message || 'Connection failed');
+            self._handleError(err.message || 'Connection failed',
+                              err.name === 'PermissionRevoked' ? err.name : undefined, err.code);
             self.readyState = CLOSED;
             var closeEvent = {
                 type: 'close',
@@ -166,8 +167,15 @@
         }
     };
 
-    WebSocket.prototype._handleError = function(msg) {
+    // A connection whose grant the host took back carries the Error (name
+    // "PermissionRevoked") on its error event as `error`.
+    WebSocket.prototype._handleError = function(msg, name, code) {
         var event = { type: 'error', message: msg };
+        if (name) {
+            event.error = new Error(msg);
+            event.error.name = name;
+            if (code) event.error.code = code;
+        }
         if (this._onerror) { try { this._onerror(event); } catch (e) {} }
         this._dispatch(event);
     };
@@ -197,7 +205,7 @@
                 if (this._onmessage) { try { this._onmessage(event); } catch (e) {} }
                 this._dispatch(event);
             } else if (msg.type === 'error') {
-                this._handleError(msg.data);
+                this._handleError(msg.data, msg.name, msg.code);
             } else if (msg.type === 'close') {
                 this.readyState = CLOSED;
                 this._id = -1;

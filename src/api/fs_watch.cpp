@@ -84,6 +84,11 @@ namespace {
 
 struct CtxState {
     std::unordered_map<int, std::unique_ptr<FsWatcher>> watchers;
+    // Each watcher is held under the access gate (access_policy.h); one whose
+    // grant was taken back is stopped at once and its refusal reported at the
+    // next tick.
+    std::unordered_map<int, uint64_t> held;
+    std::vector<std::pair<int, std::string>> revoked;
 };
 
 thread_local CtxState g_state;
@@ -129,6 +134,12 @@ static bronze::Value js_fs_watch_create(bronze::Value, std::span<const bronze::V
 
     int id = w->id();
     g_state.watchers[id] = std::move(w);
+    if (uint64_t h = holdGatedAccess(ev::AccessKind::Read, absoluteFsPath(resolved),
+                                     [id](const std::string& refusal) {
+                                         g_state.held.erase(id);
+                                         if (g_state.watchers.erase(id)) g_state.revoked.emplace_back(id, refusal);
+                                     }))
+        g_state.held[id] = h;
     return ev::fromDouble(id);
 }
 
@@ -138,12 +149,30 @@ static bronze::Value js_fs_watch_close(bronze::Value, std::span<const bronze::Va
     if (a.empty()) return ev::undefined();
     int id = i32At(a, 0);
     g_state.watchers.erase(id);
+    if (auto it = g_state.held.find(id); it != g_state.held.end()) {
+        releaseHeldAccess(it->second);
+        g_state.held.erase(it);
+    }
     return ev::undefined();
 }
 
 // __brokit_fs_watch_tick() — drain every watcher, fire JS callbacks.
 static bronze::Value js_fs_watch_tick(bronze::Value, std::span<const bronze::Value>)
 {
+    if (!g_state.revoked.empty()) {
+        auto revoked = std::move(g_state.revoked);
+        g_state.revoked.clear();
+        ev::Persistent onRevoked{ev::getGlobal("__brokit_fs_watch_revoked")};
+        if (ev::isFunction(onRevoked.get())) {
+            for (auto& [id, refusal] : revoked) {
+                ev::Persistent idVal{ev::fromDouble(id)};
+                ev::Persistent err{newAccessError(refusal, kFsDeniedCode)};
+                bronze::Value args[2] = { idVal.get(), err.get() };
+                ev::call(onRevoked.get(), ev::undefined(), std::span<const bronze::Value>(args, 2));
+            }
+        }
+    }
+
     bronze::Value dispatch = ev::getGlobal("__brokit_fs_watch_dispatch");
     if (!ev::isFunction(dispatch)) return ev::undefined();
 
@@ -173,7 +202,7 @@ static bronze::Value js_fs_watch_tick(bronze::Value, std::span<const bronze::Val
 // __brokit_fs_watch_has_pending() -> bool.
 static bronze::Value js_fs_watch_has_pending(bronze::Value, std::span<const bronze::Value>)
 {
-    return ev::fromBool(!g_state.watchers.empty());
+    return ev::fromBool(!g_state.watchers.empty() || !g_state.revoked.empty());
 }
 
 void installFSWatch()
@@ -189,6 +218,9 @@ void installFSWatch()
 void uninstallFSWatch()
 {
     g_state.watchers.clear();
+    for (auto& [id, h] : g_state.held) releaseHeldAccess(h);
+    g_state.held.clear();
+    g_state.revoked.clear();
 }
 
 } // namespace brokit::api

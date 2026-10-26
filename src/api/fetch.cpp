@@ -57,7 +57,14 @@ struct FetchRequest {
     std::string checkedUrl;
     std::string refusal;
 
+    // Held under the access gate while the transfer runs (access_policy.h);
+    // a grant taken back ends it, and revokedBy is what the body's reader
+    // then errors with.
+    uint64_t held = 0;
+    std::string revokedBy;
+
     ~FetchRequest() {
+        releaseHeldAccess(held);
         if (requestHeaders) curl_slist_free_all(requestHeaders);
     }
 };
@@ -218,6 +225,7 @@ static bronze::Value js_fetch_stream_read(bronze::Value, std::span<const bronze:
         ObjectBuilder obj;
         obj.set("done", true);
         obj.set("value", ev::undefined());
+        if (!req->revokedBy.empty()) obj.set("error", newAccessError(req->revokedBy, kNetDeniedCode));
         if (req->headersResolved && !req->easy) {
             s.streams.erase(it);
         }
@@ -261,12 +269,21 @@ static bool signalIsAborted(bronze::Value signal)
     return ev::isBool(abortedVal) && ev::toBool(abortedVal);
 }
 
-static void abortRequest(int streamId)
+// Abort the request: by its signal (an AbortError), or because the host took
+// back the grant it was made under (`refusal`: the access error, which a body
+// already being read errors with too).
+static void abortRequest(int streamId, const std::string& refusal = {})
 {
     auto& s = g_fetchState;
     auto it = s.streams.find(streamId);
     if (it == s.streams.end() || !it->second) return;
     FetchRequest* req = it->second.get();
+    if (!refusal.empty()) {
+        if (!req->easy) return;  // finished: nothing is held
+        req->held = 0;
+        req->revokedBy = refusal;
+    }
+    releaseHeldAccess(req->held);
 
     if (req->easy) {
         removePending(s, req);
@@ -282,8 +299,8 @@ static void abortRequest(int streamId)
     const bool hadPromise = !req->headersResolved;
     if (hadPromise) {
         if (req->promise.valid()) {
-            bronze::Value err = makeAbortError();
-            ev::rejectPromise(req->promise.get(), err);
+            ev::Persistent err{refusal.empty() ? makeAbortError() : newAccessError(refusal, kNetDeniedCode)};
+            ev::rejectPromise(req->promise.get(), err.get());
             req->promise.reset();
         }
         req->headersResolved = true;
@@ -462,6 +479,7 @@ static bronze::Value js_fetch_tick(bronze::Value, std::span<const bronze::Value>
 
         curl_easy_cleanup(easy);
         req->easy = nullptr;
+        releaseHeldAccess(req->held);
 
         if (!wasStreaming) {
             s.streams.erase(req->streamId);
@@ -675,6 +693,8 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
 
     s.streams.emplace(streamId, std::move(req));
     s.pending.push_back(raw);
+    raw->held = holdGatedAccess(ev::AccessKind::Net, url,
+                                [streamId](const std::string& refusal) { abortRequest(streamId, refusal); });
 
     attachAbortListener(signal.get(), streamId);
 
