@@ -71,7 +71,6 @@ endif()
 ## ── Library ──────────────────────────────────────────────────────────────────
 
 set(BROKIT_API_SOURCES
-    host_class.cpp
     host_proxy.cpp
     api.cpp
     access_policy.cpp
