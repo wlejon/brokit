@@ -176,6 +176,7 @@ std::string resolveLocalPath(const std::string& url)
         }
     }
 
+    std::string first;
     for (int i = static_cast<int>(g_fetchBasePaths.size()) - 1; i >= 0; i--) {
         std::string candidate = g_fetchBasePaths[i];
         if (!candidate.empty() && candidate.back() != '/' && candidate.back() != '\\')
@@ -183,9 +184,12 @@ std::string resolveLocalPath(const std::string& url)
         candidate += clean;
         std::ifstream test(candidate, std::ios::binary);
         if (test.good()) return candidate;
+        if (first.empty()) first = candidate;
     }
 
-    return clean;
+    // Found nowhere: a missing file of the app's (a 404 there), never one
+    // of the working directory's, which is not the app's to read.
+    return first.empty() ? clean : first;
 }
 
 // Build a Headers-like JS object from a flat header list ("name: value" lines).
