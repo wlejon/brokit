@@ -162,14 +162,7 @@ target_link_libraries(brokit_api PRIVATE llhttp)
 target_link_libraries(brokit_api PUBLIC bronze::runtime_shared)
 
 if(BROKIT_ENABLE_NOISE)
-    # FastNoise2 trees as GLSL (noise_glsl.h): its own target, needing only
-    # FastNoise, so a renderer can link it without the rest of brokit.
-    add_library(brokit_noise_glsl STATIC noise_glsl.cpp)
-    target_include_directories(brokit_noise_glsl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-    target_link_libraries(brokit_noise_glsl PUBLIC FastNoise)
-    target_compile_features(brokit_noise_glsl PUBLIC cxx_std_17)
-
-    target_link_libraries(brokit_api PUBLIC FastNoise brokit_noise_glsl)
+    target_link_libraries(brokit_api PUBLIC FastNoise)
     target_link_libraries(brokit_api PRIVATE brass)
     target_compile_definitions(brokit_api PUBLIC BROKIT_HAS_NOISE)
 endif()
