@@ -79,6 +79,7 @@ set(BROKIT_API_SOURCES
     url.cpp
     crypto.cpp
     crypto_subtle.cpp
+    crypto_subtle_kdf.cpp
     encoding.cpp
     treewalker.cpp
     abort.cpp
@@ -102,6 +103,7 @@ set(BROKIT_API_SOURCES
     fs_watch_macos.cpp
     fs_watch_windows.cpp
     child_process.cpp
+    child_process_spawn.cpp
     writable_stream.cpp
     websocket.cpp
     websocket_js.cpp
@@ -118,6 +120,7 @@ set(BROKIT_API_SOURCES
     util.cpp
     compression.cpp
     net.cpp
+    net_wait.cpp
     net_js.cpp
     websocket_server_js.cpp
     http.cpp
@@ -185,4 +188,3 @@ endif()
 if(APPLE)
     target_link_libraries(brokit_api PUBLIC "-framework CoreServices" "-framework CoreFoundation")
 endif()
-

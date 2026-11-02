@@ -15,47 +15,9 @@
 // explicit host is passed. Exposing a port to the network requires opting in
 // with "0.0.0.0" / "::" / a concrete interface address.
 
-#include "api/api.h"
-#include "api/access_policy.h"
-#include "api/arg_reader.h"
-#include "api/object_builder.h"
-
-#include <atomic>
-#include <cstdint>
-#include <cstring>
-#include <deque>
-#include <mutex>
-#include <string>
-#include <unordered_map>
-#include <vector>
-#include <span>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-typedef SOCKET socket_t;
-#define BROKIT_INVALID_SOCKET INVALID_SOCKET
-#define brokit_closesocket closesocket
-#else
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-typedef int socket_t;
-#define BROKIT_INVALID_SOCKET (-1)
-#define brokit_closesocket ::close
-#endif
+#include "api/net_internal.h"
 
 namespace brokit::api {
-
-namespace {
 
 // ---------------------------------------------------------------------------
 // Platform helpers
@@ -72,6 +34,28 @@ void ensureSocketsInit()
     }
 #endif
 }
+
+bool setNonBlocking(socket_t fd)
+{
+#ifdef _WIN32
+    u_long mode = 1;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+
+// thread_local: each JS thread owns and pumps only its own sockets
+static thread_local std::unordered_map<int, NetHandle*> g_handles;
+static thread_local int g_nextId = 1;
+
+std::unordered_map<int, NetHandle*>& netHandles()
+{
+    return g_handles;
+}
+
+namespace {
 
 int lastSockError()
 {
@@ -118,17 +102,6 @@ std::string sockErrorString(int e)
 #endif
 }
 
-bool setNonBlocking(socket_t fd)
-{
-#ifdef _WIN32
-    u_long mode = 1;
-    return ioctlsocket(fd, FIONBIO, &mode) == 0;
-#else
-    int flags = fcntl(fd, F_GETFL, 0);
-    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
-#endif
-}
-
 // Numeric address + port from a sockaddr.
 void describeAddr(const sockaddr* sa, socklen_t salen, std::string& address, int& port)
 {
@@ -143,61 +116,6 @@ void describeAddr(const sockaddr* sa, socklen_t salen, std::string& address, int
         port = 0;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Handle table
-// ---------------------------------------------------------------------------
-
-struct NetEvent {
-    enum class Type { Accept, Connect, Data, End, Message, Close, Error };
-    Type type;
-    std::vector<uint8_t> data;   // Data / Message payload
-    std::string address;         // Accept peer / Message source
-    int port = 0;
-    std::string family;          // Message: "IPv4" | "IPv6"
-    int connId = 0;              // Accept: id of the new connection handle
-    std::string message;         // Error text
-    bool hadError = false;       // Close
-    std::string errorName;       // Error: "PermissionRevoked" when the grant was taken back
-    std::string errorCode;       // Error: the refusal's code
-};
-
-struct NetHandle {
-    enum class Kind { TcpListener, TcpConn, Udp };
-    Kind kind = Kind::TcpConn;
-    int id = 0;
-    socket_t fd = BROKIT_INVALID_SOCKET;
-
-    // TCP connection lifecycle
-    bool connecting = false;   // nonblocking connect() in flight
-    bool peerEof = false;      // FIN received
-    bool endRequested = false; // end(): send FIN once outBuf drains
-    bool wroteShutdown = false;
-    bool closed = false;       // fd closed; handle lives until Close drained
-    bool errored = false;
-
-    std::vector<uint8_t> outBuf; // pending writes (backpressure-naive, unbounded)
-    std::deque<NetEvent> events;
-
-    // Cached endpoint info
-    std::string localAddress;
-    int localPort = 0;
-    std::string remoteAddress;
-    int remotePort = 0;
-
-    bool ipv6 = false; // UDP family
-
-    int closedSweeps = 0;
-
-    // Held open under the access gate (access_policy.h): the URL it was
-    // allowed for, which a listener's accepted connections are held under too.
-    std::string accessSubject;
-    uint64_t held = 0;
-};
-
-// thread_local: each JS thread owns and pumps only its own sockets
-thread_local std::unordered_map<int, NetHandle*> g_handles;
-thread_local int g_nextId = 1;
 
 NetHandle* findHandle(int id)
 {
@@ -896,164 +814,6 @@ static bronze::Value js_net_has_pending(bronze::Value, std::span<const bronze::V
         if (!h->events.empty()) return ev::fromBool(true);
     }
     return ev::fromBool(false);
-}
-
-// ---------------------------------------------------------------------------
-// Cross-thread wake pipe/socket + select() wait for event-driven hosts
-// ---------------------------------------------------------------------------
-namespace {
-
-std::atomic<bool> g_wakeSignaled{false};
-std::mutex g_wakeInitMu;
-socket_t g_wakeReadFd = BROKIT_INVALID_SOCKET;
-socket_t g_wakeWriteFd = BROKIT_INVALID_SOCKET;
-
-void ensureWakePipe()
-{
-    std::lock_guard<std::mutex> lk(g_wakeInitMu);
-    if (g_wakeReadFd != BROKIT_INVALID_SOCKET) return;
-    ensureSocketsInit();
-#ifdef _WIN32
-    socket_t s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s != BROKIT_INVALID_SOCKET) {
-        sockaddr_in addr = {};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
-        if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-            int len = sizeof(addr);
-            if (::getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len) == 0 &&
-                ::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-                setNonBlocking(s);
-                g_wakeReadFd = s;
-                g_wakeWriteFd = s;
-                return;
-            }
-        }
-        brokit_closesocket(s);
-    }
-#else
-    int p[2] = {-1, -1};
-    if (::pipe(p) == 0) {
-        fcntl(p[0], F_SETFD, FD_CLOEXEC);
-        fcntl(p[1], F_SETFD, FD_CLOEXEC);
-        setNonBlocking(p[0]);
-        setNonBlocking(p[1]);
-        g_wakeReadFd = p[0];
-        g_wakeWriteFd = p[1];
-    }
-#endif
-}
-
-void drainWakePipe()
-{
-    g_wakeSignaled.store(false, std::memory_order_release);
-    if (g_wakeReadFd == BROKIT_INVALID_SOCKET) return;
-    char buf[64];
-    for (;;) {
-#ifdef _WIN32
-        int n = ::recv(g_wakeReadFd, buf, sizeof(buf), 0);
-#else
-        ssize_t n = ::read(g_wakeReadFd, buf, sizeof(buf));
-#endif
-        if (n <= 0) break;
-    }
-}
-
-} // namespace
-
-void wakeNetWait()
-{
-    if (g_wakeSignaled.exchange(true, std::memory_order_acq_rel)) return;
-    socket_t wfd = g_wakeWriteFd;
-    if (wfd == BROKIT_INVALID_SOCKET) return;
-    const char b = 1;
-#ifdef _WIN32
-    ::send(wfd, &b, 1, 0);
-#else
-    auto ignored = ::write(wfd, &b, 1);
-    (void)ignored;
-#endif
-}
-
-bool waitForNetEvents(double timeoutMs)
-{
-    ensureWakePipe();
-    if (g_wakeSignaled.load(std::memory_order_acquire)) {
-        drainWakePipe();
-        return true;
-    }
-    for (auto& [id, h] : g_handles) {
-        if (!h->events.empty()) return true;
-    }
-    if (timeoutMs <= 0.0) return false;
-
-    fd_set rfds, wfds, efds;
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-    FD_ZERO(&efds);
-
-    int maxFd = -1;
-    bool hasRead = false;
-    bool hasWrite = false;
-    bool hasExcept = false;
-
-    auto addFd = [&](socket_t fd, fd_set& set, bool& flag) {
-        if (fd == BROKIT_INVALID_SOCKET) return;
-#ifndef _WIN32
-        if (fd < 0 || fd >= FD_SETSIZE) return;
-        if (static_cast<int>(fd) > maxFd) maxFd = static_cast<int>(fd);
-#endif
-        FD_SET(fd, &set);
-        flag = true;
-    };
-
-    if (g_wakeReadFd != BROKIT_INVALID_SOCKET) {
-        addFd(g_wakeReadFd, rfds, hasRead);
-    }
-
-    for (auto& [id, h] : g_handles) {
-        if (h->closed || h->fd == BROKIT_INVALID_SOCKET) continue;
-        switch (h->kind) {
-        case NetHandle::Kind::TcpListener:
-        case NetHandle::Kind::Udp:
-            addFd(h->fd, rfds, hasRead);
-            break;
-        case NetHandle::Kind::TcpConn:
-            if (h->connecting) {
-                addFd(h->fd, wfds, hasWrite);
-                addFd(h->fd, efds, hasExcept);
-            } else {
-                if (!h->peerEof) addFd(h->fd, rfds, hasRead);
-                if (!h->outBuf.empty()) addFd(h->fd, wfds, hasWrite);
-            }
-            break;
-        }
-    }
-
-    if (!hasRead && !hasWrite && !hasExcept) return false;
-
-    if (timeoutMs > 60000.0) timeoutMs = 60000.0;
-    long secs = static_cast<long>(timeoutMs / 1000.0);
-    long usecs = static_cast<long>((timeoutMs - static_cast<double>(secs) * 1000.0) * 1000.0);
-    if (usecs < 0) usecs = 0;
-    if (usecs >= 1000000) {
-        secs += usecs / 1000000;
-        usecs %= 1000000;
-    }
-    timeval tv = {secs, static_cast<decltype(tv.tv_usec)>(usecs)};
-
-    int rc = ::select(maxFd + 1,
-                      hasRead ? &rfds : nullptr,
-                      hasWrite ? &wfds : nullptr,
-                      hasExcept ? &efds : nullptr,
-                      &tv);
-
-    if ((g_wakeReadFd != BROKIT_INVALID_SOCKET && rc > 0 && FD_ISSET(g_wakeReadFd, &rfds)) ||
-        g_wakeSignaled.load(std::memory_order_acquire)) {
-        drainWakePipe();
-    }
-    return rc > 0;
 }
 
 // ---------------------------------------------------------------------------
