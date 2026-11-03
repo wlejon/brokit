@@ -16,6 +16,15 @@ namespace brokit::api {
 // ---------------------------------------------------------------------------
 
 static thread_local std::vector<std::filesystem::path> g_requireDirStack;
+// Where a relative require() resolves when no file is being run: a page's
+// script, or a timer or event handler it left behind, has no file of its own
+// on the stack. The host sets it to the app's directory; empty, the cwd.
+static thread_local std::filesystem::path g_requireBase;
+
+void setRequireBasePath(const std::filesystem::path& dir)
+{
+    g_requireBase = dir;
+}
 
 void pushRequireDir(const std::filesystem::path& dir)
 {
@@ -34,6 +43,9 @@ static std::filesystem::path caller_dir()
     namespace fs = std::filesystem;
     if (!g_requireDirStack.empty()) {
         return g_requireDirStack.back();
+    }
+    if (!g_requireBase.empty()) {
+        return g_requireBase;
     }
     std::error_code ec;
     return fs::current_path(ec);
@@ -125,8 +137,11 @@ static bronze::Value load_file_module(const std::string& spec)
         else if (c == '"') escapedFile += "\\\"";
         else escapedFile += c;
     }
+    // UTF-8 (what __brokit_require_in decodes), not the ANSI code page
+    // path::string() gives on Windows
+    const std::u8string dirU8 = found.parent_path().u8string();
     std::string escapedDir;
-    for (char c : dir) {
+    for (char c : std::string(dirU8.begin(), dirU8.end())) {
         if (c == '\\') escapedDir += "\\\\";
         else if (c == '"') escapedDir += "\\\"";
         else escapedDir += c;
@@ -140,9 +155,13 @@ static bronze::Value load_file_module(const std::string& spec)
         "  var exports = module.exports;\n"
         "  var __filename = __file;\n"
         "  var __dirname = __dir;\n"
+        // The module's own require, bound to its directory (as in Node): a
+        // require it makes later, from a function called after it loaded,
+        // still resolves against its own folder.
+        "  var __require = function require(spec) { return globalThis.__brokit_require_in(__dir, spec); };\n"
         "  (function(exports, require, module, __filename, __dirname) {\n"
         + src + "\n"
-        "  })(exports, globalThis.require, module, __filename, __dirname);\n"
+        "  })(exports, __require, module, __filename, __dirname);\n"
         "  globalThis.__brokit_module_cache[__file] = module.exports;\n"
         "  globalThis.__brokit_module_last_exports = module.exports;\n"
         "})();\n";
@@ -209,9 +228,23 @@ void installModuleRegistry()
     }
 }
 
+// __brokit_require_in(dir, spec): require(spec) as called from a file in dir;
+// each module's own require (load_file_module's envelope) calls it
+static bronze::Value js_require_in(bronze::Value, std::span<const bronze::Value> args)
+{
+    if (args.size() < 2 || !ev::isString(args[0])) {
+        return ev::throwTypeError("__brokit_require_in(dir, spec) expects a directory string");
+    }
+    const std::string dir = ev::toUtf8(args[0]);
+    const std::u8string dirU8(dir.begin(), dir.end());
+    RequireDirGuard guard{std::filesystem::path(dirU8)};
+    return js_require(ev::undefined(), args.subspan(1));
+}
+
 void installRequire()
 {
     ev::registerFunction("require", js_require);
+    ev::registerFunction("__brokit_require_in", js_require_in);
 }
 
 // ---------------------------------------------------------------------------

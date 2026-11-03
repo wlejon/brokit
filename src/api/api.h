@@ -87,6 +87,10 @@ inline bronze::Value throwDOMException(const std::string& message, const std::st
 
 void pushRequireDir(const std::filesystem::path& dir);
 void popRequireDir();
+/// Where a relative require() resolves when no file is being run (a page's
+/// script, and the handlers it leaves): the host's app directory. Per thread,
+/// like addFsBasePath; unset, the working directory.
+void setRequireBasePath(const std::filesystem::path& dir);
 
 struct RequireDirGuard {
     explicit RequireDirGuard(const std::filesystem::path& dir) {
