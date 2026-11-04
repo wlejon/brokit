@@ -119,7 +119,7 @@ static bool pumpInflate(CodecState* st, std::vector<uint8_t>& out, bool& streamE
         size_t written = sizeof(buf) - st->strm.avail_out;
         if (written > 0) {
             out.insert(out.end(), buf, buf + written);
-            st->crcOut = mz_crc32(st->crcOut, buf, written);
+            if (st->format == Format::Gzip) st->crcOut = mz_crc32(st->crcOut, buf, written); // only gzip's trailer checks it
             st->totalOut += written;
         }
         if (rc == MZ_STREAM_END) {
