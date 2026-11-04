@@ -14,7 +14,6 @@
 #include <mutex>
 #include <optional>
 #include <random>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -266,14 +265,14 @@ void addFetchPrefixMount(const std::string& prefix, const std::string& absPath)
     addFsPrefixMount(prefix, absPath);
 }
 
-// readFileSync(path[, encoding])
-static bronze::Value js_readFileSync(bronze::Value, std::span<const bronze::Value> a)
+static bronze::Value readFileSliceCommon(const std::string& rawPath, const std::string& encoding,
+                                         bool hasOffset, int64_t offset, bool hasLength, int64_t length,
+                                         const char* fnName)
 {
-    if (a.empty()) return ev::throwTypeError("readFileSync: path required");
+    if (offset < 0) return ev::throwRangeError(std::string(fnName) + ": offset must be >= 0");
+    if (length < 0) return ev::throwRangeError(std::string(fnName) + ": length must be >= 0");
 
-    std::string rawPath = ev::toUtf8(a[0]);
     std::string resolved = resolveFsPath(rawPath.c_str());
-    std::string encoding = getEncoding(a, 1);
     if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty()) return throwFsDenied(r, resolved);
 
     std::ifstream f(u8p(resolved), std::ios::in | std::ios::binary);
@@ -282,16 +281,172 @@ static bronze::Value js_readFileSync(bronze::Value, std::span<const bronze::Valu
                           ("ENOENT: no such file or directory, open '" + resolved + "'").c_str());
     }
 
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    std::string data = ss.str();
-    f.close();
+    f.seekg(0, std::ios::end);
+    const std::streamoff endPos = f.tellg();
+    const uint64_t actualOffset = hasOffset ? static_cast<uint64_t>(offset) : 0;
 
+    if (endPos > 0) {
+        const uint64_t fileSize = static_cast<uint64_t>(endPos);
+        if (actualOffset >= fileSize) {
+            return !encoding.empty() ? ev::fromUtf8("") : ev::createTypedArray(elements::Uint8, 0);
+        }
+        const uint64_t avail = fileSize - actualOffset;
+        const uint64_t toRead = hasLength ? (std::min)(avail, static_cast<uint64_t>(length)) : avail;
+        if (toRead == 0) {
+            return !encoding.empty() ? ev::fromUtf8("") : ev::createTypedArray(elements::Uint8, 0);
+        }
+        if (toRead > static_cast<uint64_t>(UINT32_MAX)) {
+            return ev::throwRangeError(std::string(fnName) + ": slice exceeds maximum size");
+        }
+
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(actualOffset), std::ios::beg);
+
+        if (!encoding.empty()) {
+            std::string data(static_cast<size_t>(toRead), '\0');
+            size_t totalRead = 0;
+            while (totalRead < data.size()) {
+                const std::streamsize chunk = static_cast<std::streamsize>(
+                    (std::min)(data.size() - totalRead, static_cast<size_t>(1u << 30)));
+                f.read(data.data() + totalRead, chunk);
+                const std::streamsize got = f.gcount();
+                if (got <= 0) break;
+                totalRead += static_cast<size_t>(got);
+            }
+            data.resize(totalRead);
+            return ev::fromUtf8(data);
+        }
+
+        bronze::Value arr = ev::createTypedArray(elements::Uint8, static_cast<uint32_t>(toRead));
+        auto info = ev::typedArrayInfo(arr);
+        if (!info) {
+            return ev::throwRangeError(std::string(fnName) + ": failed to allocate Uint8Array");
+        }
+        uint8_t* dst = info.data;
+        const size_t target = static_cast<size_t>(toRead);
+        size_t totalRead = 0;
+        while (totalRead < target) {
+            const std::streamsize chunk = static_cast<std::streamsize>(
+                (std::min)(target - totalRead, static_cast<size_t>(1u << 30)));
+            f.read(reinterpret_cast<char*>(dst + totalRead), chunk);
+            const std::streamsize got = f.gcount();
+            if (got <= 0) break;
+            totalRead += static_cast<size_t>(got);
+        }
+        if (totalRead < target) {
+            return makeU8(std::span<const uint8_t>(dst, totalRead));
+        }
+        return arr;
+    }
+
+    // endPos <= 0: empty regular file or non-seekable /proc virtual file
+    if (hasLength && length == 0) {
+        return !encoding.empty() ? ev::fromUtf8("") : ev::createTypedArray(elements::Uint8, 0);
+    }
+    f.clear();
+    f.seekg(0, std::ios::beg);
+    f.clear();
+
+    char buf[16384];
+    uint64_t remSkip = actualOffset;
+    while (remSkip > 0) {
+        const std::streamsize step = static_cast<std::streamsize>(
+            (std::min)(remSkip, static_cast<uint64_t>(sizeof(buf))));
+        f.read(buf, step);
+        const std::streamsize got = f.gcount();
+        if (got <= 0) break;
+        remSkip -= static_cast<uint64_t>(got);
+    }
+    if (remSkip > 0) {
+        return !encoding.empty() ? ev::fromUtf8("") : ev::createTypedArray(elements::Uint8, 0);
+    }
+
+    uint64_t remRead = hasLength ? static_cast<uint64_t>(length) : UINT64_MAX;
     if (!encoding.empty()) {
+        std::string data;
+        while (remRead > 0) {
+            const std::streamsize step = static_cast<std::streamsize>(
+                (std::min)(remRead, static_cast<uint64_t>(sizeof(buf))));
+            f.read(buf, step);
+            const std::streamsize got = f.gcount();
+            if (got <= 0) break;
+            data.append(buf, static_cast<size_t>(got));
+            remRead -= static_cast<uint64_t>(got);
+        }
         return ev::fromUtf8(data);
     }
 
-    return makeU8(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+    std::vector<uint8_t> data;
+    while (remRead > 0) {
+        const std::streamsize step = static_cast<std::streamsize>(
+            (std::min)(remRead, static_cast<uint64_t>(sizeof(buf))));
+        f.read(buf, step);
+        const std::streamsize got = f.gcount();
+        if (got <= 0) break;
+        data.insert(data.end(), reinterpret_cast<const uint8_t*>(buf),
+                    reinterpret_cast<const uint8_t*>(buf) + got);
+        remRead -= static_cast<uint64_t>(got);
+    }
+    return makeU8(data);
+}
+
+// readFileSync(path[, options])
+static bronze::Value js_readFileSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.empty()) return ev::throwTypeError("readFileSync: path required");
+
+    std::string rawPath = ev::toUtf8(a[0]);
+    std::string encoding = getEncoding(a, 1);
+    bool hasOffset = false;
+    bool hasLength = false;
+    int64_t offset = 0;
+    int64_t length = 0;
+
+    if (a.size() >= 2 && ev::isObject(a[1])) {
+        bronze::Value offVal = ev::getProperty(a[1], "offset");
+        if (!ev::isUndefined(offVal) && !ev::isNull(offVal)) {
+            double d = ev::isObject(offVal) ? -1.0 : ev::toDouble(offVal);
+            if (std::isnan(d) || d < 0) return ev::throwRangeError("readFileSync: offset must be >= 0");
+            offset = saturateI64(d);
+            hasOffset = true;
+        }
+        bronze::Value lenVal = ev::getProperty(a[1], "length");
+        if (!ev::isUndefined(lenVal) && !ev::isNull(lenVal)) {
+            double d = ev::isObject(lenVal) ? -1.0 : ev::toDouble(lenVal);
+            if (std::isnan(d) || d < 0) return ev::throwRangeError("readFileSync: length must be >= 0");
+            length = saturateI64(d);
+            hasLength = true;
+        }
+    }
+
+    return readFileSliceCommon(rawPath, encoding, hasOffset, offset, hasLength, length, "readFileSync");
+}
+
+// readFileSliceSync(path[, offset[, length]])
+static bronze::Value js_readFileSliceSync(bronze::Value, std::span<const bronze::Value> a)
+{
+    if (a.empty()) return ev::throwTypeError("readFileSliceSync: path required");
+
+    std::string rawPath = ev::toUtf8(a[0]);
+    bool hasOffset = false;
+    bool hasLength = false;
+    int64_t offset = 0;
+    int64_t length = 0;
+
+    if (a.size() >= 2 && !ev::isUndefined(a[1]) && !ev::isNull(a[1])) {
+        double d = ev::isObject(a[1]) ? -1.0 : ev::toDouble(a[1]);
+        if (std::isnan(d) || d < 0) return ev::throwRangeError("readFileSliceSync: offset must be >= 0");
+        offset = saturateI64(d);
+        hasOffset = true;
+    }
+    if (a.size() >= 3 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
+        double d = ev::isObject(a[2]) ? -1.0 : ev::toDouble(a[2]);
+        if (std::isnan(d) || d < 0) return ev::throwRangeError("readFileSliceSync: length must be >= 0");
+        length = saturateI64(d);
+        hasLength = true;
+    }
+
+    return readFileSliceCommon(rawPath, "", hasOffset, offset, hasLength, length, "readFileSliceSync");
 }
 
 std::string makeTempDir(const std::string& resolvedPrefix, std::error_code& ec)
@@ -349,14 +504,22 @@ static bronze::Value js_writeFileSync(bronze::Value, std::span<const bronze::Val
     if (auto r = fsRefusal(pathStr, FsAccess::Write); !r.empty()) return throwFsDenied(r, pathStr);
 
     std::string data;
+    const char* writePtr = nullptr;
+    size_t writeLen = 0;
     if (ev::isString(a[1])) {
         data = ev::toUtf8(a[1]);
+        writePtr = data.data();
+        writeLen = data.size();
     } else if (auto info = getBufferOrTypedArrayInfo(a[1])) {
-        data.assign(reinterpret_cast<const char*>(info->data), info->byteLength);
+        writePtr = reinterpret_cast<const char*>(info->data);
+        writeLen = info->byteLength;
     } else if (auto infoAb = ev::arrayBufferInfo(a[1])) {
-        data.assign(reinterpret_cast<const char*>(infoAb.data), infoAb.byteLength);
+        writePtr = reinterpret_cast<const char*>(infoAb.data);
+        writeLen = infoAb.byteLength;
     } else {
         data = ev::toUtf8(a[1]);
+        writePtr = data.data();
+        writeLen = data.size();
     }
 
     std::ofstream f(u8p(pathStr), std::ios::out | std::ios::binary | std::ios::trunc);
@@ -364,7 +527,7 @@ static bronze::Value js_writeFileSync(bronze::Value, std::span<const bronze::Val
         return throwErrno("open", pathStr.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + pathStr + "'").c_str());
     }
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    f.write(writePtr, static_cast<std::streamsize>(writeLen));
     if (!f) {
         return throwErrno("write", pathStr.c_str(), "ERR_FS",
                           ("ERR_FS: write failed '" + pathStr + "'").c_str());
@@ -384,14 +547,22 @@ static bronze::Value js_appendFileSync(bronze::Value, std::span<const bronze::Va
     if (auto r = fsRefusal(pathStr, FsAccess::Write); !r.empty()) return throwFsDenied(r, pathStr);
 
     std::string data;
+    const char* writePtr = nullptr;
+    size_t writeLen = 0;
     if (ev::isString(a[1])) {
         data = ev::toUtf8(a[1]);
+        writePtr = data.data();
+        writeLen = data.size();
     } else if (auto info = getBufferOrTypedArrayInfo(a[1])) {
-        data.assign(reinterpret_cast<const char*>(info->data), info->byteLength);
+        writePtr = reinterpret_cast<const char*>(info->data);
+        writeLen = info->byteLength;
     } else if (auto infoAb = ev::arrayBufferInfo(a[1])) {
-        data.assign(reinterpret_cast<const char*>(infoAb.data), infoAb.byteLength);
+        writePtr = reinterpret_cast<const char*>(infoAb.data);
+        writeLen = infoAb.byteLength;
     } else {
         data = ev::toUtf8(a[1]);
+        writePtr = data.data();
+        writeLen = data.size();
     }
 
     std::ofstream f(u8p(pathStr), std::ios::out | std::ios::binary | std::ios::app);
@@ -399,7 +570,7 @@ static bronze::Value js_appendFileSync(bronze::Value, std::span<const bronze::Va
         return throwErrno("open", pathStr.c_str(), "ENOENT",
                           ("ENOENT: no such file or directory, open '" + pathStr + "'").c_str());
     }
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    f.write(writePtr, static_cast<std::streamsize>(writeLen));
     f.close();
 
     return ev::undefined();
@@ -748,6 +919,7 @@ static bronze::Value js_symlinkSync(bronze::Value, std::span<const bronze::Value
 void installFS()
 {
     ev::setGlobalFunction("__brokit_fs_readFileSync", 2, js_readFileSync);
+    ev::setGlobalFunction("__brokit_fs_readFileSliceSync", 3, js_readFileSliceSync);
     ev::setGlobalFunction("__brokit_fs_writeFileSync", 3, js_writeFileSync);
     ev::setGlobalFunction("__brokit_fs_appendFileSync", 3, js_appendFileSync);
     ev::setGlobalFunction("__brokit_fs_statSync", 2, js_statSync);

@@ -51,6 +51,91 @@ fs.writeFileSync(binFile, binData);
 var binRead = fs.readFileSync(binFile, 'utf8');
 assertEqual(binRead, 'Hello', 'writeFileSync Uint8Array');
 
+// writeFileSync with subarray view (non-zero byteOffset) and ArrayBuffer
+var fullAb = new ArrayBuffer(10);
+var fullU8 = new Uint8Array(fullAb);
+for (var bi = 0; bi < 10; bi++) fullU8[bi] = 65 + bi; // 'A'..'J'
+var subView = fullU8.subarray(2, 7); // 'CDEFG'
+var subFile = testDir + '/subview.dat';
+fs.writeFileSync(subFile, subView);
+assertEqual(fs.readFileSync(subFile, 'utf8'), 'CDEFG', 'writeFileSync subarray view');
+
+var abFile = testDir + '/arraybuf.dat';
+fs.writeFileSync(abFile, fullAb);
+var abRead = fs.readFileSync(abFile);
+assertEqual(abRead.length, 10, 'writeFileSync ArrayBuffer length');
+assertEqual(abRead[0], 65, 'writeFileSync ArrayBuffer first byte');
+assertEqual(abRead[9], 74, 'writeFileSync ArrayBuffer last byte');
+
+// ── Positioned slice reads: readFileSync({ offset, length }) & readFileSliceSync ─
+var sliceMid = fs.readFileSync(abFile, { offset: 3, length: 4 });
+assert(sliceMid instanceof Uint8Array, 'readFileSync slice returns Uint8Array');
+assertEqual(sliceMid.length, 4, 'readFileSync slice middle length');
+assertEqual(sliceMid[0], 68, 'readFileSync slice middle[0] == D');
+assertEqual(sliceMid[3], 71, 'readFileSync slice middle[3] == G');
+
+var sliceText = fs.readFileSync(abFile, { encoding: 'utf8', offset: 2, length: 5 });
+assertEqual(sliceText, 'CDEFG', 'readFileSync slice with encoding');
+
+var sliceTail = fs.readFileSync(abFile, { offset: 7, length: 100 });
+assertEqual(sliceTail.length, 3, 'readFileSync slice clamped at EOF');
+assertEqual(sliceTail[0], 72, 'readFileSync slice tail[0] == H');
+assertEqual(sliceTail[2], 74, 'readFileSync slice tail[2] == J');
+
+var sliceOob = fs.readFileSync(abFile, { offset: 10, length: 5 });
+assert(sliceOob instanceof Uint8Array && sliceOob.length === 0, 'readFileSync out-of-bounds offset == fileSize returns empty Uint8Array');
+
+var sliceOob2 = fs.readFileSync(abFile, { offset: 50, length: 5 });
+assert(sliceOob2 instanceof Uint8Array && sliceOob2.length === 0, 'readFileSync out-of-bounds offset > fileSize returns empty Uint8Array');
+
+var sliceZeroLen = fs.readFileSync(abFile, { offset: 2, length: 0 });
+assert(sliceZeroLen instanceof Uint8Array && sliceZeroLen.length === 0, 'readFileSync length 0 returns empty Uint8Array');
+
+var fastSlice = fs.readFileSliceSync(abFile, 1, 3);
+assert(fastSlice instanceof Uint8Array, 'readFileSliceSync returns Uint8Array');
+assertEqual(fastSlice.length, 3, 'readFileSliceSync length');
+assertEqual(fastSlice[0], 66, 'readFileSliceSync[0] == B');
+assertEqual(fastSlice[2], 68, 'readFileSliceSync[2] == D');
+
+var fastSliceTail = fs.readFileSliceSync(abFile, 8, 50);
+assertEqual(fastSliceTail.length, 2, 'readFileSliceSync clamped at EOF');
+assertEqual(fastSliceTail[0], 73, 'readFileSliceSync tail[0] == I');
+
+var fastSliceOob = fs.readFileSliceSync(abFile, 100, 10);
+assertEqual(fastSliceOob.length, 0, 'readFileSliceSync out-of-bounds returns empty Uint8Array');
+
+// Negative offset / length throws RangeError
+threw = false;
+try { fs.readFileSync(abFile, { offset: -1, length: 4 }); } catch (e) {
+    threw = e instanceof RangeError;
+}
+assert(threw, 'readFileSync negative offset throws RangeError');
+
+threw = false;
+try { fs.readFileSync(abFile, { offset: 0, length: -2 }); } catch (e) {
+    threw = e instanceof RangeError;
+}
+assert(threw, 'readFileSync negative length throws RangeError');
+
+threw = false;
+try { fs.readFileSliceSync(abFile, -1, 4); } catch (e) {
+    threw = e instanceof RangeError;
+}
+assert(threw, 'readFileSliceSync negative offset throws RangeError');
+
+threw = false;
+try { fs.readFileSliceSync(abFile, 0, -1); } catch (e) {
+    threw = e instanceof RangeError;
+}
+assert(threw, 'readFileSliceSync negative length throws RangeError');
+
+// Empty file read
+var emptyFile = testDir + '/empty.dat';
+fs.writeFileSync(emptyFile, new Uint8Array(0));
+var emptyBuf = fs.readFileSync(emptyFile);
+assert(emptyBuf instanceof Uint8Array && emptyBuf.length === 0, 'readFileSync empty file');
+assertEqual(fs.readFileSync(emptyFile, 'utf8'), '', 'readFileSync empty file utf8');
+
 // ── appendFileSync ────────────────────────────────────────────────────────
 fs.appendFileSync(testFile, ' World!');
 var appended = fs.readFileSync(testFile, 'utf8');

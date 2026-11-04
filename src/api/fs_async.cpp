@@ -22,7 +22,6 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -74,7 +73,7 @@ struct DirentOut {
     std::string name;
     bool isFile = false, isDir = false, isLink = false;
 };
-struct Bytes { std::string data; };
+struct Bytes { std::vector<uint8_t> data; };
 struct Text { std::string data; };
 struct Names { std::vector<std::string> names; };
 struct Dirents { std::vector<DirentOut> entries; };
@@ -135,16 +134,116 @@ Result readDir(const std::string& path, bool withFileTypes)
     return names;
 }
 
-Result readFile(const std::string& path, bool asText)
+Result readFile(const std::string& path, bool asText,
+                bool hasOffset, int64_t offset, bool hasLength, int64_t length)
 {
     std::error_code ec;
     if (fs::is_directory(u8p(path), ec)) return errorOf("EISDIR", "read", path, "illegal operation on a directory");
     std::ifstream f(u8p(path), std::ios::in | std::ios::binary);
     if (!f) return errorOf("ENOENT", "open", path, "no such file or directory");
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    if (asText) return Text{ss.str()};
-    return Bytes{ss.str()};
+
+    f.seekg(0, std::ios::end);
+    const std::streamoff endPos = f.tellg();
+    const uint64_t actualOffset = hasOffset ? static_cast<uint64_t>(offset) : 0;
+
+    if (endPos > 0) {
+        const uint64_t fileSize = static_cast<uint64_t>(endPos);
+        if (actualOffset >= fileSize) {
+            if (asText) return Text{};
+            return Bytes{};
+        }
+        const uint64_t avail = fileSize - actualOffset;
+        const uint64_t toRead = hasLength ? (std::min)(avail, static_cast<uint64_t>(length)) : avail;
+        if (toRead == 0) {
+            if (asText) return Text{};
+            return Bytes{};
+        }
+        if (toRead > static_cast<uint64_t>(UINT32_MAX)) {
+            return errorOf("ERR_FS_FILE_TOO_LARGE", "read", path, "file slice exceeds maximum size");
+        }
+
+        f.clear();
+        f.seekg(static_cast<std::streamoff>(actualOffset), std::ios::beg);
+
+        if (asText) {
+            std::string out(static_cast<size_t>(toRead), '\0');
+            size_t totalRead = 0;
+            while (totalRead < out.size()) {
+                const std::streamsize chunk = static_cast<std::streamsize>(
+                    (std::min)(out.size() - totalRead, static_cast<size_t>(1u << 30)));
+                f.read(out.data() + totalRead, chunk);
+                const std::streamsize got = f.gcount();
+                if (got <= 0) break;
+                totalRead += static_cast<size_t>(got);
+            }
+            out.resize(totalRead);
+            return Text{std::move(out)};
+        }
+
+        std::vector<uint8_t> out(static_cast<size_t>(toRead));
+        size_t totalRead = 0;
+        while (totalRead < out.size()) {
+            const std::streamsize chunk = static_cast<std::streamsize>(
+                (std::min)(out.size() - totalRead, static_cast<size_t>(1u << 30)));
+            f.read(reinterpret_cast<char*>(out.data() + totalRead), chunk);
+            const std::streamsize got = f.gcount();
+            if (got <= 0) break;
+            totalRead += static_cast<size_t>(got);
+        }
+        out.resize(totalRead);
+        return Bytes{std::move(out)};
+    }
+
+    if (hasLength && length == 0) {
+        if (asText) return Text{};
+        return Bytes{};
+    }
+    f.clear();
+    f.seekg(0, std::ios::beg);
+    f.clear();
+
+    char buf[16384];
+    uint64_t remSkip = actualOffset;
+    while (remSkip > 0) {
+        const std::streamsize step = static_cast<std::streamsize>(
+            (std::min)(remSkip, static_cast<uint64_t>(sizeof(buf))));
+        f.read(buf, step);
+        const std::streamsize got = f.gcount();
+        if (got <= 0) break;
+        remSkip -= static_cast<uint64_t>(got);
+    }
+    if (remSkip > 0) {
+        if (asText) return Text{};
+        return Bytes{};
+    }
+
+    uint64_t remRead = hasLength ? static_cast<uint64_t>(length) : UINT64_MAX;
+    if (asText) {
+        std::string out;
+        while (remRead > 0) {
+            const std::streamsize step = static_cast<std::streamsize>(
+                (std::min)(remRead, static_cast<uint64_t>(sizeof(buf))));
+            f.read(buf, step);
+            const std::streamsize got = f.gcount();
+            if (got <= 0) break;
+            out.append(buf, static_cast<size_t>(got));
+            remRead -= static_cast<uint64_t>(got);
+        }
+        return Text{std::move(out)};
+    }
+
+    std::vector<uint8_t> out;
+    while (remRead > 0) {
+        const std::streamsize step = static_cast<std::streamsize>(
+            (std::min)(remRead, static_cast<uint64_t>(sizeof(buf))));
+        f.read(buf, step);
+        const std::streamsize got = f.gcount();
+        if (got <= 0) break;
+        out.insert(out.end(), reinterpret_cast<const uint8_t*>(buf),
+                   reinterpret_cast<const uint8_t*>(buf) + got);
+        remRead -= static_cast<uint64_t>(got);
+    }
+    return Bytes{std::move(out)};
 }
 
 Result writeFile(const std::string& path, const std::string& data, bool append)
@@ -281,7 +380,7 @@ bronze::Value resultToJs(const Result& r)
             return errorToJs(v);
         } else if constexpr (std::is_same_v<T, Bytes>) {
             bronze::Value u8 = ev::createTypedArray(elements::Uint8, static_cast<uint32_t>(v.data.size()));
-            ev::fillTypedArray(u8, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data.data()), v.data.size()));
+            ev::fillTypedArray(u8, std::span<const uint8_t>(v.data.data(), v.data.size()));
             return u8;
         } else if constexpr (std::is_same_v<T, Text>) {
             return ev::fromUtf8(v.data);
@@ -347,8 +446,36 @@ bronze::Value js_fs_async(bronze::Value, std::span<const bronze::Value> a)
     if (op == "readFile") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), false);
         ask(p, FsAccess::Read);
-        const bool text = !argString(a, 2).empty();
-        work = [p, text] { return readFile(p, text); };
+        bool text = false;
+        bool hasOffset = false;
+        bool hasLength = false;
+        int64_t offset = 0;
+        int64_t length = 0;
+        if (a.size() > 2 && !ev::isUndefined(a[2]) && !ev::isNull(a[2])) {
+            if (ev::isString(a[2])) {
+                text = !ev::toUtf8(a[2]).empty();
+            } else if (ev::isObject(a[2])) {
+                bronze::Value enc = ev::getProperty(a[2], "encoding");
+                if (ev::isString(enc)) text = !ev::toUtf8(enc).empty();
+                bronze::Value offVal = ev::getProperty(a[2], "offset");
+                if (!ev::isUndefined(offVal) && !ev::isNull(offVal)) {
+                    double d = ev::isObject(offVal) ? -1.0 : ev::toDouble(offVal);
+                    if (std::isnan(d) || d < 0) return ev::throwRangeError("readFile: offset must be >= 0");
+                    offset = saturateI64(d);
+                    hasOffset = true;
+                }
+                bronze::Value lenVal = ev::getProperty(a[2], "length");
+                if (!ev::isUndefined(lenVal) && !ev::isNull(lenVal)) {
+                    double d = ev::isObject(lenVal) ? -1.0 : ev::toDouble(lenVal);
+                    if (std::isnan(d) || d < 0) return ev::throwRangeError("readFile: length must be >= 0");
+                    length = saturateI64(d);
+                    hasLength = true;
+                }
+            }
+        }
+        work = [p, text, hasOffset, offset, hasLength, length] {
+            return readFile(p, text, hasOffset, offset, hasLength, length);
+        };
     } else if (op == "writeFile" || op == "appendFile") {
         const std::string p = resolveFsPathOnThread(argString(a, 1), true);
         ask(p, FsAccess::Write);

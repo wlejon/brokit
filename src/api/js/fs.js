@@ -80,6 +80,10 @@
         return globalThis.__brokit_fs_readFileSync(path, encoding);
     }
 
+    function readFileSliceSync(path, offset, length) {
+        return globalThis.__brokit_fs_readFileSliceSync(path, offset, length);
+    }
+
     function writeFileSync(path, data, encoding) {
         if (data && data._u8) data = data._u8;
         return globalThis.__brokit_fs_writeFileSync(path, data, encoding);
@@ -518,7 +522,9 @@
 
     var promises = {
         open:       openFileHandle,
-        readFile:   function(path, options) { return run('readFile', path, encodingOf(options)); },
+        readFile:   function(path, options) {
+            try { return run('readFile', path, options); } catch (err) { return Promise.reject(err); }
+        },
         writeFile:  function(path, data) { return run('writeFile', path, bytesOf(data)); },
         appendFile: function(path, data) { return run('appendFile', path, bytesOf(data)); },
         stat:       function(path) { return run('stat', path).then(wrapStats); },
@@ -652,8 +658,9 @@
 
     var fs = {
         // Sync
-        readFileSync:    readFileSync,
-        writeFileSync:   writeFileSync,
+        readFileSync:       readFileSync,
+        readFileSliceSync:  readFileSliceSync,
+        writeFileSync:      writeFileSync,
         appendFileSync:  appendFileSync,
         statSync:        statSync,
         lstatSync:       lstatSync,

@@ -19,6 +19,9 @@ assertEqual(settledInCall, false, 'fs.promises.mkdir has not settled inside the 
 var log = [];
 var errors = {};
 var bytes = null;
+var sliceBytes = null;
+var sliceText = null;
+var sliceOob = null;
 var dirents = null;
 var stats = null;
 var linkStats = null;
@@ -34,7 +37,11 @@ var chain = step('mkdir', fs.promises.mkdir(root + '/a/b', { recursive: true }))
     .then(function() { return step('appendFile', fs.promises.appendFile(root + '/a/one.txt', ' world')); })
     .then(function() { return step('writeBytes', fs.promises.writeFile(root + '/a/b/two.bin', new Uint8Array([1, 2, 3, 250]))); })
     .then(function() { return step('readFile', fs.promises.readFile(root + '/a/b/two.bin')); })
-    .then(function(b) { bytes = b; return step('readdir', fs.promises.readdir(root + '/a', { withFileTypes: true })); })
+    .then(function(b) { bytes = b; return step('readSlice', fs.promises.readFile(root + '/a/b/two.bin', { offset: 1, length: 2 })); })
+    .then(function(sb) { sliceBytes = sb; return step('readSliceText', fs.promises.readFile(root + '/a/one.txt', { encoding: 'utf8', offset: 6, length: 5 })); })
+    .then(function(st) { sliceText = st; return step('readSliceOob', fs.promises.readFile(root + '/a/b/two.bin', { offset: 99, length: 4 })); })
+    .then(function(so) { sliceOob = so; return fs.promises.readFile(root + '/a/b/two.bin', { offset: -1 }).catch(function(e) { errors.negOffset = e; }); })
+    .then(function() { return step('readdir', fs.promises.readdir(root + '/a', { withFileTypes: true })); })
     .then(function(d) { dirents = d; return step('stat', fs.promises.stat(root + '/a/one.txt')); })
     .then(function(s) { stats = s; return step('lstat', fs.promises.lstat(root + '/a/b')); })
     .then(function(s) { linkStats = s; return step('copyFile', fs.promises.copyFile(root + '/a/one.txt', root + '/a/copy.txt')); })
@@ -59,9 +66,13 @@ globalThis.__test_onDone = function() {
     assertEqual(settledInCall, true, 'the mkdir settled later');
     assert(!errors.chain, 'no step failed: ' + (errors.chain && errors.chain.message));
     assertEqual(log.join(','),
-        'mkdir,writeFile,appendFile,writeBytes,readFile,readdir,stat,lstat,copyFile,readCopy,rename,realpath,access,rmForce,unlink,rm',
+        'mkdir,writeFile,appendFile,writeBytes,readFile,readSlice,readSliceText,readSliceOob,readdir,stat,lstat,copyFile,readCopy,rename,realpath,access,rmForce,unlink,rm',
         'every step ran, in order');
     assert(bytes instanceof Uint8Array && bytes.length === 4 && bytes[3] === 250, 'readFile without an encoding answers bytes');
+    assert(sliceBytes instanceof Uint8Array && sliceBytes.length === 2 && sliceBytes[0] === 2 && sliceBytes[1] === 3, 'fs.promises.readFile slice bytes');
+    assertEqual(sliceText, 'world', 'fs.promises.readFile slice text');
+    assert(sliceOob instanceof Uint8Array && sliceOob.length === 0, 'fs.promises.readFile out-of-bounds offset answers empty Uint8Array');
+    assert(errors.negOffset instanceof RangeError, 'fs.promises.readFile negative offset rejects with RangeError');
     var names = (dirents || []).map(function(d) { return d.name + (d.isDirectory() ? '/' : ''); }).sort();
     assertEqual(names.join(' '), 'b/ one.txt', 'readdir withFileTypes answers dirents');
     assert(stats && stats.isFile() && stats.size === 11 && stats.mtimeMs > 0, 'stat: a file of 11 bytes, with an mtime');
