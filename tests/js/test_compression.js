@@ -139,6 +139,21 @@ var done = {};
            'incremental: decompressed output in multiple chunks (' + bigBack.chunkCount + ')');
     assert(bytesEqual(bigBack.bytes, big), 'incremental: 256K round-trip byte-equal');
 
+    // ── Compressible data inflated from many small writes: each write
+    // expands past one output buffer, so the codec's dictionary is left
+    // holding output while input is still pending (that input must not be
+    // dropped) ──
+    var text = new Uint8Array(1 << 20);
+    for (var ti = 0; ti < text.length; ti++) text[ti] = 97 + ((ti * 7 + (ti >> 9)) % 13);
+    for (var fmt of ['deflate-raw', 'deflate', 'gzip']) {
+        var packed = (await runThrough(new CompressionStream(fmt), [text])).bytes;
+        var pieces = [];
+        for (var po = 0; po < packed.length; po += 1024) pieces.push(packed.subarray(po, po + 1024));
+        assert(pieces.length > 2, fmt + ': compressible input spans several writes (' + pieces.length + ')');
+        var unpacked = await runThrough(new DecompressionStream(fmt), pieces);
+        assert(bytesEqual(unpacked.bytes, text), fmt + ': compressible 1M inflated from 1K writes byte-equal');
+    }
+
     // ── Chunk type flexibility: ArrayBuffer / DataView / Float-view ─────
     var abIn = fixtureBytes.slice().buffer;
     var viaAb = await runThrough(new CompressionStream('deflate'), [abIn]);

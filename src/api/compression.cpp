@@ -127,7 +127,11 @@ static bool pumpInflate(CodecState* st, std::vector<uint8_t>& out, bool& streamE
             return true;
         }
         if (rc != MZ_OK && rc != MZ_BUF_ERROR) return false;
-        if (st->strm.avail_out > 0) break;
+        // Done only when the input is used up and the output had room. A
+        // call that drains miniz's dictionary (left over from a full output
+        // buffer) returns with room to spare but consumes no input, so the
+        // input still pending must be pumped, not dropped.
+        if (st->strm.avail_out > 0 && (st->strm.avail_in == 0 || (rc == MZ_BUF_ERROR && written == 0))) break;
     }
     return true;
 }
