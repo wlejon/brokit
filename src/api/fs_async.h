@@ -71,5 +71,8 @@ std::string makeTempDir(const std::string& resolvedPrefix, std::error_code& ec);
 
 void installFSFd();
 void installFSAsync();
+/// Forget this thread's unsettled fs.promises / callback operations without
+/// settling them (resetPageState: their page is gone).
+void resetFSAsync();
 
 }  // namespace brokit::api

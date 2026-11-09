@@ -34,6 +34,11 @@
     globalThis.__brokit_net_register = function(id, fn) { _drains[id] = fn; };
     globalThis.__brokit_net_unregister = function(id) { delete _drains[id]; };
 
+    // The page these sockets and servers were opened for is gone (a reload;
+    // resetPageState has closed them natively): forget their wrappers, whose
+    // listeners are the old page's code, without delivering a 'close'.
+    globalThis.__brokit_net_reset = function() { _drains = Object.create(null); };
+
     globalThis.__brokit_net_drain_all = function() {
         for (var pass = 0; pass < 2; pass++) {
             var keys = Object.keys(_drains);

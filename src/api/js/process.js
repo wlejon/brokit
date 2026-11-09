@@ -179,6 +179,14 @@
         return process;
     };
 
+    // A reload's new page does not inherit the old one's listeners: one left
+    // here would be the old page's code, run by the new page's emit.
+    // process.env and the rest of process stay, as the process does.
+    globalThis.__brokit_process_reset = function() {
+        _events = Object.create(null);
+        process._events = _events;
+    };
+
     process.getMaxListeners = function() {
         return _maxListeners;
     };

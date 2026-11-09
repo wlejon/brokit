@@ -178,6 +178,8 @@ bronze::Value js_spawnAsync(bronze::Value, std::span<const bronze::Value> a)
     if (auto r = checkSpawnAccess(line); !r.empty()) return throwAccessError(r, kSpawnDeniedCode);
 
     auto handle = std::make_unique<ChildHandle>();
+    handle->owner = std::this_thread::get_id();
+    handle->detached = opts.detached;
 
 #ifdef _WIN32
     std::string cmdLine;
@@ -675,6 +677,43 @@ bronze::Value js_childKill(bronze::Value, std::span<const bronze::Value> a)
     ::kill(h->pid, sig);
 #endif
     return ev::fromBool(true);
+}
+
+void resetChildProcesses()
+{
+    const std::thread::id self = std::this_thread::get_id();
+    std::vector<std::unique_ptr<ChildHandle>> doomed;
+    {
+        std::lock_guard<std::mutex> lock(g_childMutex);
+        for (auto it = g_children.begin(); it != g_children.end();) {
+            if (it->second->owner != self) { ++it; continue; }
+            doomed.push_back(std::move(it->second));
+            it = g_children.erase(it);
+        }
+    }
+    // Killed outside the lock, and the handles destroyed there too: a piped
+    // child's destructor joins its reader threads.
+    for (auto& h : doomed) {
+        if (h->exitReported || h->detached) continue;
+#ifdef _WIN32
+        if (h->process) TerminateProcess(h->process, 1);
+#else
+        if (h->pid > 0 && ::kill(h->pid, SIGKILL) == 0) {
+            // Reaped off this thread: SIGKILL ends it promptly, but a child
+            // stuck in the kernel (a hung network mount) would hold a
+            // blocking wait here, and the reload with it. The handle's own
+            // non-blocking wait is skipped, so this thread is the only one
+            // that waits for the pid and cannot reap a reused one.
+            const pid_t pid = h->pid;
+            h->exitReported = true;
+            std::thread([pid] {
+                int status = 0;
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            }).detach();
+        }
+#endif
+    }
+    doomed.clear();
 }
 
 } // namespace brokit::api

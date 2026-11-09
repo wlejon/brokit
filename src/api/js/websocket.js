@@ -242,6 +242,13 @@
         }
     };
 
+    // The page these sockets were opened for is gone (a reload;
+    // resetPageState has closed them natively): drop them without a 'close'
+    // event, whose handlers would be the old page's code.
+    globalThis.__brokit_ws_reset = function() {
+        _instances = [];
+    };
+
     // Expose
     globalThis.WebSocket = WebSocket;
 

@@ -108,6 +108,13 @@
         w.close();
     };
 
+    // The page these watchers were made for is gone (a reload; brokit's
+    // resetPageState has stopped them natively): let go of every one without
+    // a 'close', whose listeners would be the old page's code.
+    globalThis.__brokit_fs_watch_reset = function () {
+        registry = Object.create(null);
+    };
+
     // ── fs.watch wiring ──────────────────────────────────────────────────────
     // Patches the existing __brokit_fs object (created by fs.js, which runs
     // before this file) to expose `fs.watch`.

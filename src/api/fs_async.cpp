@@ -699,6 +699,17 @@ bronze::Value js_fs_async_has_pending(bronze::Value, std::span<const bronze::Val
 
 }  // namespace
 
+void resetFSAsync()
+{
+    // The operations still run on the pool (a write already started is not
+    // undone); what they return finds no promise at the next tick and is
+    // dropped there, and the ids keep counting, so a later call cannot be
+    // handed an old result.
+    if (!t_pending) return;
+    for (auto& [id, promise] : t_pending->promises) delete promise;
+    t_pending->promises.clear();
+}
+
 void installFSAsync()
 {
     ev::setGlobalFunction("__brokit_fs_async", 4, js_fs_async);

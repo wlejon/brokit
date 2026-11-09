@@ -106,6 +106,18 @@ struct RequireDirGuard {
 /// Install all brokit APIs into the current thread's Bronze runtime.
 void installAll();
 
+/// The page running on this thread is going away (a reload) while the realm
+/// and brokit's installs stay: end everything asynchronous it started, so
+/// none of its callbacks or promise reactions runs after its code is gone.
+/// Fetches and WebSockets are dropped, raw sockets and servers closed, fs
+/// watchers stopped, pending fs.promises / callback operations forgotten,
+/// open sqlite databases closed, and the children it spawned killed (a
+/// detached one is let go); no promise is settled and no 'close' or 'error'
+/// is delivered for any of it. The JS facades forget the old wrappers and
+/// process's listeners. Only this thread's state is touched: a worker's
+/// brokit is its own. Timers and host tasks are the host's to clear.
+void resetPageState();
+
 // Individual API installers — consumers can pick and choose.
 /// The `globalThis.__brokit_modules` registry that `require()` consults.
 /// Idempotent; run it before any installer that registers a module.

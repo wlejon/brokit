@@ -1,5 +1,7 @@
 #include "api/api.h"
 #include "api/access_policy.h"
+#include "api/child_process_internal.h"
+#include "api/fs_async.h"
 #include "runtime/runtime.h"
 
 #include <filesystem>
@@ -313,6 +315,38 @@ void installAll()
 
     // require() must come last — after all modules are installed
     installRequire();
+}
+
+// ---------------------------------------------------------------------------
+// resetPageState — a page reload ends the page's asynchronous work
+// ---------------------------------------------------------------------------
+
+void resetPageState()
+{
+    // Native first: every resource the page opened on this thread is closed
+    // and every promise it is owed forgotten, without settling it or calling
+    // back. Settling would queue reactions in the old page's code, and its
+    // host is about to unload that code; an abort error would be no better.
+    uninstallFetch();          // requests, streaming bodies' readers, local responses
+    uninstallWebSocket();
+    uninstallNet();            // sockets, servers, UDP: net, dgram, http, WebSocketServer
+    uninstallFSWatch();
+    resetFSAsync();
+    resetChildProcesses();
+    cleanupSqlite();           // databases opened by the page, closed so their locks go
+
+    // Then the JS facades, which outlive the page with the realm: each lets
+    // go of the old page's wrappers (and with them its listeners), so neither
+    // a later tick nor the new page's own calls reach them. None runs page code.
+    static const char* const kResets[] = {
+        "__brokit_fs_watch_reset", "__brokit_ws_reset", "__brokit_net_reset",
+        "__brokit_cp_reset", "__brokit_process_reset",
+    };
+    for (const char* name : kResets) {
+        ev::Persistent fn{ev::getGlobal(name)};
+        if (!ev::isFunction(fn.get())) continue;
+        ev::call(fn.get(), ev::undefined(), {});
+    }
 }
 
 } // namespace brokit::api

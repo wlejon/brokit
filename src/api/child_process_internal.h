@@ -74,6 +74,13 @@ struct ChildHandle {
     uint64_t held = 0;
     std::string revokedBy;
 
+    // The JS thread that spawned it (a page's, or a worker's): the children
+    // table is process-wide, and resetChildProcesses ends only the calling
+    // thread's. `detached` is spawn's option: such a child was asked to
+    // outlive the app, so it outlives a page too.
+    std::thread::id owner;
+    bool detached = false;
+
     // Readers poll with a short timeout and re-check `closing` each pass, so
     // teardown is deterministic even when a surviving grandchild holds a write
     // end open (the classic reason a blocking-read drain never sees EOF).
@@ -169,5 +176,12 @@ bronze::Value js_childWrite(bronze::Value, std::span<const bronze::Value> a);
 bronze::Value js_childCloseStdin(bronze::Value, std::span<const bronze::Value> a);
 bronze::Value js_childRelease(bronze::Value, std::span<const bronze::Value> a);
 bronze::Value js_childKill(bronze::Value, std::span<const bronze::Value> a);
+
+/// The page that spawned this thread's children is going away (a reload):
+/// each child it started is ended, as a browser ends the work of a page it
+/// navigates from, except a detached one, which was asked to outlive the app
+/// and is let go instead. Either way its handle is dropped, so nothing of the
+/// old page polls it again. Children of other threads (workers) are untouched.
+void resetChildProcesses();
 
 } // namespace brokit::api

@@ -274,6 +274,9 @@
     // and keeps firing timers until it finishes.
     var liveChildren = 0;
     globalThis.__brokit_cp_has_pending = function () { return liveChildren > 0; };
+    // The page's children were ended with it (resetPageState); their
+    // ChildProcess objects never finish, so they stop counting here.
+    globalThis.__brokit_cp_reset = function () { liveChildren = 0; };
 
     function emitAll(listeners, args, what) {
         if (!listeners || !listeners.length) return;
