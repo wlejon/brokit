@@ -239,8 +239,6 @@ bool Runtime::loadFile(const std::string& path)
         /*timings=*/false,
         /*emitObj=*/false,
         /*hostGlobalsPath=*/globalsPath_,
-        /*inferStats=*/false,
-        /*statsOut=*/nullptr,
         /*moduleRoots=*/{},
         /*entrySymbol=*/{},
         /*emitShared=*/true
