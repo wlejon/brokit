@@ -4,6 +4,7 @@
 #include "api/fetch_internal.h"
 #include "api/object_builder.h"
 
+#include <filesystem>
 #include <string>
 #include <vector>
 #include <memory>
@@ -559,6 +560,13 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
             // Read, never network.
             std::string target = isFileUrl(url) ? fileUrlToPath(url) : url;
             if (std::string mounted = urlMountPath(url); !mounted.empty()) target = std::move(mounted);
+            // A URL's path is resolved lexically ("a.js/../b" is "b", as a
+            // browser's URL parser has it), never by the file system, which
+            // refuses ".." after a file.
+            if (target.find("..") != std::string::npos || target.find("/./") != std::string::npos) {
+                std::string normal = std::filesystem::path(target).lexically_normal().generic_string();
+                if (!normal.empty()) target = std::move(normal);
+            }
             std::string resolved = resolveLocalPath(target);
             if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty())
                 return rejectedAccessPromise(r, kFsDeniedCode, absoluteFsPath(resolved));

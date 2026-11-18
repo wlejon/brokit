@@ -13,13 +13,13 @@
 
 namespace bronze::embed {
 inline bool isDouble(Value v) { return isNumber(v); }
-// `val` must be fresh (nothing allocated since it was produced); it is rooted
-// before the globalThis lookup, which may allocate.
-inline void setGlobalValue(std::string_view name, Value val) {
-    Persistent v{val};
-    registerGlobal(name, v.get());
-    auto g = globalValue("globalThis");
-    if (g.found && isObject(g.value)) setProperty(g.value, name, v.get());
+// The registration defines the realm's global object property too; writing
+// it again afterwards would be a page's write, which makes bronze read the
+// name from the global object from then on. `kind` is what a page's write
+// does (GlobalKind::Readonly for a WebIDL readonly attribute such as
+// `crypto`).
+inline void setGlobalValue(std::string_view name, Value val, GlobalKind kind = GlobalKind::Replaceable) {
+    registerGlobal(name, val, kind);
 }
 inline void setGlobalFunction(std::string_view name, uint32_t arity, NativeFn fn) {
     setGlobalValue(name, makeFunction(std::move(fn), arity, name));

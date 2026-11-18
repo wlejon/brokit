@@ -98,7 +98,7 @@ void installCrypto()
     ObjectBuilder b(ev::isObject(existing) ? existing : ev::createObject());
     b.def("getRandomValues", 1, getRandomValues);
     b.def("randomUUID", 0, randomUUID);
-    ev::setGlobalValue("crypto", b.get());
+    ev::setGlobalValue("crypto", b.get(), ev::GlobalKind::Readonly);  // readonly attribute
 }
 
 } // namespace brokit::api

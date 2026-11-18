@@ -189,8 +189,8 @@ bronze::Value makeStorageValue(StorageState* st)
 
 void installStorage()
 {
-    ev::setGlobalValue("localStorage", makeStorageValue(&g_localStorage));
-    ev::setGlobalValue("sessionStorage", makeStorageValue(&g_sessionStorage));
+    ev::setGlobalValue("localStorage", makeStorageValue(&g_localStorage), ev::GlobalKind::Readonly);
+    ev::setGlobalValue("sessionStorage", makeStorageValue(&g_sessionStorage), ev::GlobalKind::Readonly);
 }
 
 void setStoragePath(const std::string& path)

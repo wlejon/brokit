@@ -908,7 +908,7 @@ void installSubtleCrypto()
     ev::Persistent crypto{ev::getGlobal("crypto")};
     if (!ev::isObject(crypto.get())) {
         crypto.set(ev::createObject());
-        ev::setGlobalValue("crypto", crypto.get());
+        ev::setGlobalValue("crypto", crypto.get(), ev::GlobalKind::Readonly);
     }
     crypto.set(ev::setProperty(crypto.get(), "subtle", subtle.get()));
 }
