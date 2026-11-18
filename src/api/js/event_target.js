@@ -71,6 +71,10 @@
 
         if (signal && signal.aborted) return;
 
+        // An object whose class inherits EventTarget.prototype without
+        // running this constructor (a host object: bro's Animation, a Text
+        // node) gets its list on first use.
+        if (!this._listeners) this._listeners = {};
         if (!this._listeners[type]) this._listeners[type] = [];
         // Deduplicate
         var list = this._listeners[type];
@@ -99,7 +103,7 @@
     };
 
     EventTarget.prototype.removeEventListener = function(type, listener, options) {
-        if (!this._listeners[type]) return;
+        if (!this._listeners || !this._listeners[type]) return;
         var capture = false;
         if (typeof options === 'boolean') capture = options;
         else if (options && typeof options === 'object') capture = !!options.capture;
@@ -119,7 +123,7 @@
     EventTarget.prototype.dispatchEvent = function(event) {
         event.target = this;
         event.currentTarget = this;
-        var list = this._listeners[event.type];
+        var list = this._listeners && this._listeners[event.type];
         if (!list) return !event.defaultPrevented;
         var handlers = list.slice(); // snapshot
         for (var i = 0; i < handlers.length; i++) {

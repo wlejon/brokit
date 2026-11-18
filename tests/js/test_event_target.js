@@ -152,3 +152,19 @@ tExc.addEventListener('test-err', function() {
 tExc.dispatchEvent(new Event('test-err'));
 assert(listener2Ran, 'remaining listener ran despite earlier listener throwing');
 
+
+// An object that inherits EventTarget.prototype without running its
+// constructor (a host class chained onto it, such as bro's Animation) can
+// still add, dispatch and remove.
+(function () {
+    var bare = Object.create(EventTarget.prototype);
+    var heard = 0;
+    var fn = function () { heard++; };
+    assert(bare.dispatchEvent(new Event('x')) === true, 'dispatch with no listeners');
+    bare.removeEventListener('x', fn);
+    bare.addEventListener('x', fn);
+    bare.dispatchEvent(new Event('x'));
+    bare.removeEventListener('x', fn);
+    bare.dispatchEvent(new Event('x'));
+    assertEqual(heard, 1, 'a bare EventTarget-derived object hears once');
+})();

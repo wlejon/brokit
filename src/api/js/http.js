@@ -126,7 +126,11 @@
 
     IncomingMessage.prototype._pushBody = function(u8) {
         if (this._encoding) {
-            var str = new TextDecoder(this._encoding === 'utf8' ? 'utf-8' : this._encoding).decode(u8);
+            // Node's encodings (hex, base64, ...) through Buffer; TextDecoder
+            // knows only the Encoding Standard's.
+            var B = globalThis.Buffer;
+            var str = (typeof B === 'function' && B._wrap) ? B._wrap(u8).toString(this._encoding)
+                : new TextDecoder(this._encoding === 'utf8' ? 'utf-8' : this._encoding).decode(u8);
             this.emit('data', str);
         } else {
             this.emit('data', toBuffer(u8));
