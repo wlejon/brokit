@@ -156,6 +156,22 @@
         this._search = '';
         this._hash = '';
 
+        // A non-special scheme not followed by '/' has an opaque path
+        // (mailto:a@b, javascript:..., data:..., urn:...): no host, the
+        // path kept as written, origin "null".
+        this._opaque = false;
+        if (schemeMatch && url.charAt(0) !== '/' && this._protocol !== 'file:' && _knownSchemes[this._protocol] === undefined) {
+            this._opaque = true;
+            var opHash = url.indexOf('#');
+            if (opHash !== -1) { this._hash = url.substring(opHash); url = url.substring(0, opHash); }
+            var opSearch = url.indexOf('?');
+            if (opSearch !== -1) { this._search = url.substring(opSearch); url = url.substring(0, opSearch); }
+            this._pathname = url;
+            this.searchParams = new URLSearchParams(this._search);
+            this.searchParams._url = this;
+            return;
+        }
+
         if (url.substring(0, 2) === '//') {
             url = url.substring(2);
             var authEnd = url.search(/[/?#]/);
@@ -247,16 +263,32 @@
         password: { get: function() { return this._password; }, set: function(v) { this._password = v; } },
         hostname: { get: function() { return this._hostname; }, set: function(v) { this._hostname = v; } },
         port:     { get: function() { return this._port; }, set: function(v) { this._port = v; } },
-        pathname: { get: function() { return this._pathname; }, set: function(v) { this._pathname = v; } },
+        pathname: {
+            get: function() { return this._pathname; },
+            set: function(v) {
+                v = String(v);
+                this._pathname = this._opaque || v.charAt(0) === '/' ? v : '/' + v;
+            }
+        },
         search:   {
             get: function() { return this._search; },
             set: function(v) {
+                v = String(v);
+                if (v.charAt(0) === '?') v = v.substring(1);
+                v = v === '' ? '' : '?' + v;
                 this._search = v;
                 this.searchParams = new URLSearchParams(v);
                 this.searchParams._url = this;
             }
         },
-        hash:     { get: function() { return this._hash; }, set: function(v) { this._hash = v; } },
+        hash:     {
+            get: function() { return this._hash; },
+            set: function(v) {
+                v = String(v);
+                if (v.charAt(0) === '#') v = v.substring(1);
+                this._hash = v === '' ? '' : '#' + v;
+            }
+        },
         host:     {
             get: function() { return this._port ? this._hostname + ':' + this._port : this._hostname; },
             set: function(v) {
@@ -265,9 +297,10 @@
                 else { this._hostname = v; this._port = ''; }
             }
         },
-        origin:   { get: function() { return this._protocol + '//' + this.host; } },
+        origin:   { get: function() { return this._opaque ? 'null' : this._protocol + '//' + this.host; } },
         href:     {
             get: function() {
+                if (this._opaque) return this._protocol + this._pathname + this._search + this._hash;
                 var s = this._protocol + '//';
                 if (this._username) {
                     s += this._username;
@@ -281,7 +314,7 @@
                 var u = new URL(v);
                 this._protocol = u._protocol; this._username = u._username;
                 this._password = u._password; this._hostname = u._hostname;
-                this._port = u._port; this._pathname = u._pathname;
+                this._port = u._port; this._pathname = u._pathname; this._opaque = u._opaque;
                 this._search = u._search; this._hash = u._hash;
                 this.searchParams = u.searchParams;
                 this.searchParams._url = this;

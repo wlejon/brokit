@@ -4,13 +4,28 @@
     function MessagePort() {
         EventTarget.call(this);
         this._otherPort = null;
-        this.onmessage = null;
+        this._onmessage = null;
         this.onmessageerror = null;
         this._started = false;
         this._queue = [];
     }
     MessagePort.prototype = Object.create(EventTarget.prototype);
     MessagePort.prototype.constructor = MessagePort;
+
+    // Setting onmessage starts the port, as in a browser (HTML's "message
+    // port's onmessage setter ... start()"): React's scheduler sets
+    // port1.onmessage and never calls start().
+    Object.defineProperty(MessagePort.prototype, 'onmessage', {
+        get: function() { return this._onmessage; },
+        set: function(fn) { this._onmessage = typeof fn === 'function' ? fn : null; if (this._onmessage) this.start(); },
+        enumerable: true, configurable: true,
+    });
+
+    // A posted message is a task, not a microtask: timers and rendering run
+    // between messages, as on the web.
+    function deliverLater(fn) {
+        if (typeof setTimeout === 'function') setTimeout(fn, 0); else queueMicrotask(fn);
+    }
 
     MessagePort.prototype.postMessage = function(data, transferOrOptions) {
         var other = this._otherPort;
@@ -42,7 +57,8 @@
         var msg = { data: clonedData, ports: transferredPorts };
         if (other._started) {
             var port = other;
-            queueMicrotask(function() {
+            deliverLater(function() {
+                if (!port._started) { port._queue.push(msg); return; }
                 var event = new MessageEvent('message', { data: msg.data, ports: msg.ports });
                 if (typeof port.onmessage === 'function') port.onmessage(event);
                 port.dispatchEvent(event);
@@ -61,7 +77,7 @@
         this._queue = [];
         for (var i = 0; i < queued.length; i++) {
             (function(msg) {
-                queueMicrotask(function() {
+                deliverLater(function() {
                     var event = new MessageEvent('message', { data: msg.data, ports: msg.ports || [] });
                     if (typeof port.onmessage === 'function') port.onmessage(event);
                     port.dispatchEvent(event);
