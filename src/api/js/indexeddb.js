@@ -482,7 +482,7 @@
         this.keyPath = null;
         this.autoIncrement = false;
         this._indexes = {};
-        this.indexNames = [];
+        this.indexNames = domStringList([]);
 
         if (db && db._storeMeta && db._storeMeta[storeName]) {
             var meta = db._storeMeta[storeName];
@@ -815,12 +815,27 @@
         return req;
     };
 
+    // A DOMStringList (objectStoreNames, indexNames): the names, with the
+    // list's contains() and item() beside the array's own members. The three.js
+    // editor guards createObjectStore with objectStoreNames.contains(), which
+    // was not a function, so its store was never made.
+    function domStringList(names) {
+        var list = names || [];
+        Object.defineProperty(list, 'contains', {
+            value: function(s) { return this.indexOf(String(s)) !== -1; }, configurable: true, writable: true
+        });
+        Object.defineProperty(list, 'item', {
+            value: function(i) { i = i >>> 0; return i < this.length ? this[i] : null; }, configurable: true, writable: true
+        });
+        return list;
+    }
+
     // ── IDBTransaction ───────────────────────────────────────────────────────
 
     function IDBTransaction(db, storeNames, mode) {
         this.db = db;
         this.mode = mode || 'readonly';
-        this.objectStoreNames = storeNames;
+        this.objectStoreNames = domStringList(storeNames.slice());
         this.error = null;
         this.oncomplete = null;
         this.onerror = null;
@@ -879,7 +894,7 @@
         this._storeMeta = {};
 
         var names = globalThis.__brokit_idb_store_names(name);
-        this.objectStoreNames = names || [];
+        this.objectStoreNames = domStringList(names);
         for (var i = 0; i < this.objectStoreNames.length; i++) {
             this._storeMeta[this.objectStoreNames[i]] = { indexes: {} };
         }
@@ -940,7 +955,7 @@
                             try { request.onupgradeneeded(event); } catch (e) {}
                         }
                         // Refresh store names after upgrade
-                        db.objectStoreNames = globalThis.__brokit_idb_store_names(db.name) || [];
+                        db.objectStoreNames = domStringList(globalThis.__brokit_idb_store_names(db.name));
                         for (var i = 0; i < db.objectStoreNames.length; i++) {
                             if (!db._storeMeta[db.objectStoreNames[i]]) {
                                 db._storeMeta[db.objectStoreNames[i]] = { indexes: {} };

@@ -84,6 +84,22 @@ struct FetchState {
 
 static thread_local FetchState g_fetchState;
 
+// addFetchUrlMount's origins and the directories they serve. An origin is
+// matched whole, up to the "/" after it.
+static thread_local std::vector<std::pair<std::string, std::string>> g_urlMounts;
+
+// The file a mounted URL names, or "" for a URL of no mounted origin.
+static std::string urlMountPath(const std::string& url) {
+    for (const auto& [origin, dir] : g_urlMounts) {
+        if (url.size() > origin.size() && url.compare(0, origin.size(), origin) == 0 && url[origin.size()] == '/') {
+            // fileUrlToPath percent-decodes and drops the query and fragment.
+            std::string path = fileUrlToPath("file:" + url.substr(origin.size()));
+            return dir + path;
+        }
+    }
+    return {};
+}
+
 void removePending(FetchState& s, FetchRequest* req) {
     for (auto it = s.pending.begin(); it != s.pending.end(); ++it) {
         if (*it == req) { s.pending.erase(it); return; }
@@ -539,8 +555,10 @@ static bronze::Value js_fetch(bronze::Value, std::span<const bronze::Value> args
                 return p.get();
             }
         } else {
-            // A local path or a file: URL: an fs Read, never network.
-            const std::string target = isFileUrl(url) ? fileUrlToPath(url) : url;
+            // A local path, a file: URL or a mounted URL origin: an fs
+            // Read, never network.
+            std::string target = isFileUrl(url) ? fileUrlToPath(url) : url;
+            if (std::string mounted = urlMountPath(url); !mounted.empty()) target = std::move(mounted);
             std::string resolved = resolveLocalPath(target);
             if (auto r = fsRefusal(resolved, FsAccess::Read); !r.empty())
                 return rejectedAccessPromise(r, kFsDeniedCode, absoluteFsPath(resolved));
@@ -755,6 +773,15 @@ void uninstallFetch()
         curl_multi_cleanup(s.multi);
         s.multi = nullptr;
     }
+}
+
+void addFetchUrlMount(const std::string& origin, const std::string& absPath)
+{
+    if (origin.empty() || absPath.empty()) return;
+    for (auto& m : g_urlMounts) {
+        if (m.first == origin) { m.second = absPath; return; }
+    }
+    g_urlMounts.emplace_back(origin, absPath);
 }
 
 } // namespace brokit::api

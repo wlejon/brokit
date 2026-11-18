@@ -30,8 +30,14 @@ openReq.onupgradeneeded = function(event) {
     assertEqual(db.name, 'test_brokit_idb', 'db name');
     assertEqual(db.version, 1, 'db version');
 
+    // objectStoreNames is a DOMStringList: contains() and item() (the
+    // three.js editor guards createObjectStore with contains()).
+    assertEqual(db.objectStoreNames.contains('users'), false, 'contains before the store exists');
     // Create object stores
     db.createObjectStore('users');
+    assertEqual(db.objectStoreNames.contains('users'), true, 'contains after createObjectStore');
+    assertEqual(db.objectStoreNames.item(0), 'users', 'item(0)');
+    assertEqual(db.objectStoreNames.item(5), null, 'item past the end is null');
     db.createObjectStore('settings');
 };
 
@@ -42,6 +48,8 @@ openReq.onsuccess = function(event) {
     assertEqual(db.version, 1, 'db version on success');
     assert(db.objectStoreNames.indexOf('users') !== -1, 'users store exists');
     assert(db.objectStoreNames.indexOf('settings') !== -1, 'settings store exists');
+    assertEqual(db.objectStoreNames.contains('settings'), true, 'contains on a reopened database');
+    assertEqual(Object.keys(db.objectStoreNames).indexOf('contains'), -1, 'contains is not enumerable');
 
     // ── put / get ────────────────────────────────────────────────────────
     var tx = db.transaction(['users'], 'readwrite');

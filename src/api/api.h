@@ -227,6 +227,13 @@ void addFsBasePath(const std::string& path);
 void addFsPrefixMount(const std::string& prefix, const std::string& absPath);
 void addFetchPrefixMount(const std::string& prefix, const std::string& absPath);
 
+/// Serve a URL origin (`bro://app`) from a directory for fetch: a fetch of
+/// "<origin>/<path>[?query][#fragment]" reads "<absPath>/<path>", the path
+/// percent-decoded and the query and fragment dropped, as a file: URL is.
+/// What a page resolves against its own location (`new URL('a.png',
+/// location.href)`) is fetchable that way. Per thread, like the other mounts.
+void addFetchUrlMount(const std::string& origin, const std::string& absPath);
+
 /// Resolve a path the same way fs.* does: /<prefix>/... mounts and absolute
 /// paths are returned as-is; a relative path is checked against registered fs
 /// base paths (most-recently-added first) and rewritten to the first existing
